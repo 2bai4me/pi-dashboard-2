@@ -273,6 +273,7 @@ def main():
             migrate_tasks(session, tasks_data, stats)
             migrate_history(session, tasks_data, stats)
             migrate_pricing(session, models_data, stats)
+            migrate_history_and_tokenusage(session, cfg, stats)  # v1.1: History + TokenUsage
             session.commit()
         except Exception as e:
             session.rollback()
@@ -295,3 +296,42 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# === Erweiterung 15.06.2026: History + TokenUsage migrieren ===
+def migrate_history_and_tokenusage(db, v1_data, stats):
+    """Migriert task.history[] -> task_history-Tabelle und generiert TokenUsage.
+
+    Beide Tabellen waren in v1 NICHT explizit vorhanden (History als JSON-Array
+    in Task, Tokens nirgends erfasst). In v2.0 sind sie dedizierte Tabellen.
+    """
+    from app.models.history import TaskHistory
+    from app.models.token_usage import TokenUsage
+    from app.services.pricing_service import get_current_pricing, calc_cost_from_snapshot
+    from decimal import Decimal
+    from datetime import datetime
+
+    history_count = 0
+    token_count = 0
+    for t in v1_data.get("tasks", []):
+        # History migrieren (falls vorhanden)
+        history_list = t.get("history", []) or []
+        for h in history_list:
+            entry = TaskHistory(
+                task_id=t["id"],
+                ts=datetime.fromisoformat(h["ts"].replace("Z", "+00:00")) if h.get("ts") else datetime.utcnow(),
+                event=h.get("event", "unknown"),
+                agent=h.get("agent"),
+                model=h.get("model"),
+                tokens_in=int(h.get("tokens_in", 0) or 0),
+                tokens_out=int(h.get("tokens_out", 0) or 0),
+                cost_usd=Decimal(str(h.get("cost_usd", 0) or 0)),
+                details=h.get("details", {}),
+            )
+            db.add(entry)
+            history_count += 1
+        # TokenUsage aus v1 gibt es nicht — leeres Array
+    db.commit()
+    stats["history_migrated"] = history_count
+    print(f"  History migriert: {history_count} Eintraege")
+    return history_count
