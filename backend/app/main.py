@@ -9,7 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, select, func as sqlfunc
 from sqlalchemy.orm import Session
@@ -272,6 +272,97 @@ async def index_usage(
             "recommendation": recommendation,
         })
     return {"indexes": out, "analyzed_at": datetime.utcnow().isoformat()}
+
+
+# === Cost-Endpoint (aggregiert, war in v1 mit JSON-Parsing) ===
+@app.get("/api/cost/summary")
+async def cost_summary(
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Aggregierte Token/Cost-Stats der letzten N Tage (default 30).
+
+    SQL-Aggregation (deutlich schneller als v1's JSON-Session-Parsing).
+    Liefert: total, by_model, by_provider, by_role, by_day, savings.
+    """
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    # Total
+    totals = db.execute(
+        select(
+            sqlfunc.coalesce(sqlfunc.sum(TokenUsage.tokens_in), 0),
+            sqlfunc.coalesce(sqlfunc.sum(TokenUsage.tokens_out), 0),
+            sqlfunc.coalesce(sqlfunc.sum(TokenUsage.cost_usd), 0.0),
+            sqlfunc.count(TokenUsage.id),
+        ).where(TokenUsage.recorded_at >= cutoff)
+    ).one()
+    # By model
+    by_model = db.execute(
+        select(
+            TokenUsage.model,
+            sqlfunc.sum(TokenUsage.tokens_in),
+            sqlfunc.sum(TokenUsage.tokens_out),
+            sqlfunc.sum(TokenUsage.cost_usd),
+            sqlfunc.count(TokenUsage.id),
+        ).where(TokenUsage.recorded_at >= cutoff)
+        .group_by(TokenUsage.model)
+    ).all()
+    # By provider
+    by_provider = db.execute(
+        select(
+            TokenUsage.provider,
+            sqlfunc.sum(TokenUsage.cost_usd),
+            sqlfunc.count(TokenUsage.id),
+        ).where(TokenUsage.recorded_at >= cutoff)
+        .group_by(TokenUsage.provider)
+    ).all()
+    # By role
+    by_role = db.execute(
+        select(
+            TokenUsage.role,
+            sqlfunc.sum(TokenUsage.cost_usd),
+            sqlfunc.count(TokenUsage.id),
+        ).where(TokenUsage.recorded_at >= cutoff)
+        .group_by(TokenUsage.role)
+    ).all()
+    # By day
+    by_day_rows = db.execute(
+        select(
+            sqlfunc.strftime("%Y-%m-%d", TokenUsage.recorded_at).label("day"),
+            sqlfunc.sum(TokenUsage.tokens_in),
+            sqlfunc.sum(TokenUsage.tokens_out),
+            sqlfunc.sum(TokenUsage.cost_usd),
+        ).where(TokenUsage.recorded_at >= cutoff)
+        .group_by("day")
+        .order_by("day")
+    ).all()
+    return {
+        "days": days,
+        "total": {
+            "tokens_in": int(totals[0]),
+            "tokens_out": int(totals[1]),
+            "cost_usd": float(totals[2]),
+            "calls": int(totals[3]),
+        },
+        "by_model": [
+            {"model": r[0], "tokens_in": int(r[1]), "tokens_out": int(r[2]),
+             "cost_usd": float(r[3]), "calls": int(r[4])}
+            for r in by_model
+        ],
+        "by_provider": [
+            {"provider": r[0], "cost_usd": float(r[1]), "calls": int(r[2])}
+            for r in by_provider
+        ],
+        "by_role": [
+            {"role": r[0] or "unknown", "cost_usd": float(r[1]), "calls": int(r[2])}
+            for r in by_role
+        ],
+        "by_day": [
+            {"day": r[0], "tokens_in": int(r[1]), "tokens_out": int(r[2]), "cost_usd": float(r[3])}
+            for r in by_day_rows
+        ],
+    }
 
 
 # === Backup-Endpoint (SQLite .backup API) ===
