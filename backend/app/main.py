@@ -31,6 +31,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pi-dashboard-2")
 
+# JSON-Logging Setup (Production-Ready) — toggle via LOG_FORMAT=json
+import os
+if os.getenv("LOG_FORMAT", "text").lower() == "json":
+    import json
+    class JsonFormatter(logging.Formatter):
+        def format(self, record):
+            return json.dumps({
+                "ts": datetime.utcnow().isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            })
+    for h in logging.root.handlers:
+        h.setFormatter(JsonFormatter())
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -101,6 +116,51 @@ async def health() -> dict:
         "version": "2.0.0-rc",
         "database": settings.DATABASE_URL.split("://")[0],
         "database_ok": db_ok,
+    }
+
+
+@app.get("/api/health/db-deep")
+async def health_db_deep(
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Tieferer Health-Check fuer Kubernetes-Probes.
+
+    Prueft: DB-Connection, alle erwarteten Tabellen, Indizes, Alembic-Version.
+    """
+    checks = {"database_connection": False, "tables_exist": False,
+              "indexes_count": 0, "alembic_version": None}
+    overall_ok = False
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database_connection"] = True
+        expected_tables = ["projects", "tasks", "task_history", "roles",
+                           "token_usage", "model_pricing", "brainstorm_entries",
+                           "requirement_docs", "review_pipelines",
+                           "implementation_steps", "event_log"]
+        for t in expected_tables:
+            exists = db.execute(text(
+                f"SELECT name FROM sqlite_master WHERE type='table' AND name=:t"
+            ), {"t": t}).first()
+            if not exists:
+                checks["tables_exist"] = False
+                break
+        else:
+            checks["tables_exist"] = True
+        checks["indexes_count"] = db.execute(text(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+        )).scalar() or 0
+        checks["alembic_version"] = db.execute(text(
+            "SELECT version_num FROM alembic_version"
+        )).scalar()
+        overall_ok = (checks["database_connection"] and checks["tables_exist"]
+                      and checks["indexes_count"] > 10)
+    except Exception as e:
+        logger.error(f"DB-Deep-Health failed: {e}")
+    return {
+        "status": "ok" if overall_ok else "degraded",
+        "checks": checks,
+        "checked_at": datetime.utcnow().isoformat(),
     }
 
 
