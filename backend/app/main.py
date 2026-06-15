@@ -271,3 +271,64 @@ async def index_usage(
             "recommendation": recommendation,
         })
     return {"indexes": out, "analyzed_at": datetime.utcnow().isoformat()}
+
+
+# === Backup-Endpoint (SQLite .backup API) ===
+@app.post("/api/kanban/backup")
+async def create_backup(
+    target_path: str = "database/pi_dashboard.backup.db",
+    _user: str = Depends(require_auth),
+):
+    """Erstellt einen SQLite-Hot-Backup via sqlite3 .backup()-API.
+
+    Format: Standard-SQLite-File, mit allen Tabellen, Indizes, Daten.
+    Ziel: ./database/pi_dashboard.backup.db (oder custom path).
+    """
+    import sqlite3
+    from pathlib import Path
+    # Aktuelle DB-Connection
+    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
+    src = sqlite3.connect(db_path)
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    dst = sqlite3.connect(str(target))
+    with dst:
+        src.backup(dst)
+    src.close()
+    dst.close()
+    size_mb = target.stat().st_size / (1024 * 1024)
+    return {
+        "ok": True,
+        "path": str(target),
+        "size_mb": round(size_mb, 3),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+# === Restore-Endpoint (ueberschreibt aktuelle DB) ===
+@app.post("/api/kanban/restore")
+async def restore_backup(
+    source_path: str = "database/pi_dashboard.backup.db",
+    confirm: bool = False,
+    _user: str = Depends(require_auth),
+):
+    """Stellt einen SQLite-Backup wieder her.
+
+    ACHTUNG: ueberschreibt die aktuelle DB! Nur mit confirm=true.
+    """
+    if not confirm:
+        return {"ok": False, "error": "confirm=true erforderlich (DESTRUKTIVE OPERATION)"}
+    from pathlib import Path
+    src = Path(source_path)
+    if not src.exists():
+        raise HTTPException(404, f"Backup-File nicht gefunden: {source_path}")
+    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
+    import shutil
+    shutil.copy2(str(src), db_path)
+    return {
+        "ok": True,
+        "restored_from": str(src),
+        "restored_to": db_path,
+        "size_mb": round(src.stat().st_size / (1024 * 1024), 3),
+        "restored_at": datetime.utcnow().isoformat(),
+    }
