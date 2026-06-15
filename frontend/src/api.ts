@@ -38,6 +38,7 @@ export const api = {
     return request<any>("GET", `/api/kanban/tasks${qs ? "?" + qs : ""}`)
   },
   getTask: (id: string) => request<any>("GET", `/api/kanban/tasks/${id}`),
+  updateTask: (id: string, data: any) => request<any>("PATCH", `/api/kanban/tasks/${id}`, data),
   createTask: (data: any) => request<any>("POST", "/api/kanban/tasks", data),
   setTaskStatus: (id: string, status: string) =>
     request<any>("PUT", `/api/kanban/tasks/${id}/status`, { status }),

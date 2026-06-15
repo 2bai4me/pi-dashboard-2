@@ -256,17 +256,22 @@ function BoardTab({ activeProject, setActiveProject }: { activeProject: string |
 
 // =================== TASKS ===================
 function TasksTab({ activeProject }: { activeProject: string | null }) {
-  const { data: tasksData } = useQuery({
+  const { data: tasksData, refetch } = useQuery({
     queryKey: ["tasks", "all", activeProject],
     queryFn: () => api.listTasks({ project_id: activeProject || undefined }),
     enabled: true,
   })
   const tasks = (tasksData as any)?.items || []
+  const [editingTask, setEditingTask] = useState<any>(null)
+  const updateMut = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: any }) => api.updateTask(id, data),
+    onSuccess: () => refetch(),
+  })
   return (
     <div>
       <div className="page-header">
-        <h1>Tasks</h1>
-        <p>{tasks.length} Tasks</p>
+        <h1>Tasks ({tasks.length})</h1>
+        <p>Klick auf Title zum Bearbeiten</p>
       </div>
       <table className="data-table">
         <thead>
@@ -278,7 +283,7 @@ function TasksTab({ activeProject }: { activeProject: string | null }) {
           {tasks.map((t: any) => (
             <tr key={t.id}>
               <td className="mono text-xs">{t.id.slice(0, 8)}</td>
-              <td>{t.title}</td>
+              <td style={{ cursor: "pointer" }} onClick={() => setEditingTask(t)}>{t.title}</td>
               <td><span className="badge badge-gray">{t.status}</span></td>
               <td className="mono">{t.priority}</td>
               <td className="text-xs">{t.category}</td>
