@@ -1,21 +1,29 @@
 """Pi Dashboard 2.0 — FastAPI Main-App.
 
-v2.0-beta: Vollstaendige Router-Implementation (Projects, Tasks, Models, Roles)
+v2.0-rc: Vollstaendige Router + Analytics + Index-Audit
 Alle Daten werden in SQL gespeichert (SQLite/PostgreSQL via SQLAlchemy 2.0).
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from datetime import datetime
+
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import text, select, func as sqlfunc
+from sqlalchemy.orm import Session
 
 from .config import settings
-from .db.base import init_db, engine
+from .db.base import init_db, engine, SessionLocal, get_db
+from .auth import require_auth
 from .services.role_service import RoleService
+from .models.task import Task
+from .models.history import TaskHistory
+from .models.token_usage import TokenUsage
+from .models.pricing import ModelPricing
 
-# Logging-Setup
+# Logging
 logging.basicConfig(
     level=settings.LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -31,8 +39,6 @@ async def lifespan(app: FastAPI):
     try:
         init_db()
         logger.info("Database initialized.")
-        # Seed default roles
-        from .db.base import SessionLocal
         with SessionLocal() as db:
             added = RoleService.seed_defaults(db)
             if added:
@@ -48,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pi Dashboard 2.0",
     description="Hermes-Style Web-Dashboard fuer den lokalen PI Coding Agent — SQL-basiert",
-    version="2.0.0-beta",
+    version="2.0.0-rc",
     lifespan=lifespan,
 )
 
@@ -61,9 +67,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === Routers einbinden ===
+# === Routers ===
 from .routers import projects, tasks, models, roles  # noqa: E402
-
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
@@ -83,7 +88,7 @@ async def health() -> dict:
         logger.error(f"DB-Health failed: {e}")
     return {
         "status": "ok" if db_ok else "degraded",
-        "version": "2.0.0-beta",
+        "version": "2.0.0-rc",
         "database": settings.DATABASE_URL.split("://")[0],
         "database_ok": db_ok,
     }
@@ -92,30 +97,20 @@ async def health() -> dict:
 @app.get("/api/version")
 async def version() -> dict:
     return {
-        "version": "2.0.0-beta",
-        "phase": "Backend-Endpoints auf SQL (15.06.2026)",
-        "predecessor": "1.x (JSON-basiert)",
-        "next_phase": "v2.0-rc — Frontend-Anbindung + Performance-Tests",
+        "version": "2.0.0-rc",
+        "phase": "Index-Audit + Performance-Optimierung (15.06.2026)",
+        "predecessor": "2.0.0-beta",
+        "next_phase": "v2.0-stable — Migration v1 + Production-Readiness",
     }
 
 
-# === Analytics-Endpoints (Bonus: zeigen SQL-Staerke) ===
-from sqlalchemy.orm import Session  # noqa: E402
-from fastapi import Depends  # noqa: E402
-from sqlalchemy import select, func as sqlfunc  # noqa: E402
-from .db.base import get_db  # noqa: E402
-from .auth import require_auth as _require_auth  # noqa: E402
-from .models.task import Task  # noqa: E402
-from .models.history import TaskHistory  # noqa: E402
-from .models.token_usage import TokenUsage  # noqa: E402
-
-
+# === Analytics: Summary ===
 @app.get("/api/analytics/summary")
 async def analytics_summary(
     db: Session = Depends(get_db),
-    _user: str = Depends(_require_auth),
+    _user: str = Depends(require_auth),
 ):
-    """Globale Analytics — das ist was SQL kann, JSON nicht."""
+    """Globale Analytics — SQL-Aggregation."""
     total_tasks = db.execute(select(sqlfunc.count(Task.id))).scalar()
     total_history = db.execute(select(sqlfunc.count(TaskHistory.id))).scalar()
     total_token_rows = db.execute(select(sqlfunc.count(TokenUsage.id))).scalar()
@@ -128,12 +123,10 @@ async def analytics_summary(
     total_out = db.execute(
         select(sqlfunc.coalesce(sqlfunc.sum(TokenUsage.tokens_out), 0))
     ).scalar() or 0
-    # Status-Distribution
     status_dist = db.execute(
         select(Task.status, sqlfunc.count(Task.id).label("cnt"))
         .group_by(Task.status)
     ).all()
-    # Cost by Provider
     cost_by_prov = db.execute(
         select(TokenUsage.provider, sqlfunc.sum(TokenUsage.cost_usd).label("cost"))
         .group_by(TokenUsage.provider)
@@ -150,3 +143,64 @@ async def analytics_summary(
         "status_distribution": {s: c for s, c in status_dist},
         "cost_by_provider": {p: float(c) for p, c in cost_by_prov if p},
     }
+
+
+# === Analytics: Index-Audit (welche DB-Indizes werden genutzt?) ===
+@app.post("/api/analytics/analyze")
+async def run_analyze(
+    _user: str = Depends(require_auth),
+):
+    """Fuehrt ANALYZE auf der DB aus — sammelt sqlite_stat1 fuer EXPLAIN-Ausgaben."""
+    with engine.connect() as conn:
+        conn.execute(text("ANALYZE"))
+        conn.commit()
+    return {"ok": True, "message": "ANALYZE ausgefuehrt"}
+
+
+@app.get("/api/analytics/index-usage")
+async def index_usage(
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Liefert Index-Usage-Statistiken + Drop-Empfehlungen."""
+    with engine.connect() as conn:
+        conn.execute(text("ANALYZE"))
+        conn.commit()
+
+    rows = db.execute(text('''
+        SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx
+    ''')).fetchall()
+
+    out = []
+    for tbl, idx, stat_str in rows:
+        parts = stat_str.split()
+        if not parts:
+            continue
+        try:
+            total_rows = int(parts[0])
+        except (ValueError, IndexError):
+            continue
+        if len(parts) >= 2:
+            try:
+                avg_per_key = float(parts[1])
+            except ValueError:
+                avg_per_key = total_rows
+        else:
+            avg_per_key = total_rows
+        selectivity = round(avg_per_key / total_rows, 3) if total_rows > 0 else 0
+        if selectivity < 0.1:
+            recommendation = "excellent"
+        elif selectivity < 0.3:
+            recommendation = "good"
+        elif selectivity < 0.7:
+            recommendation = "marginal"
+        else:
+            recommendation = "poor"
+        out.append({
+            "table": tbl,
+            "index": idx,
+            "rows": total_rows,
+            "selectivity": selectivity,
+            "recommendation": recommendation,
+        })
+    return {"indexes": out, "analyzed_at": datetime.utcnow().isoformat()}
