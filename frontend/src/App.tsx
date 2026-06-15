@@ -167,11 +167,15 @@ function BoardTab({ activeProject, setActiveProject }: { activeProject: string |
   const qc = useQueryClient()
   const { data: projects } = useQuery({ queryKey: ["projects"], queryFn: () => api.listProjects() })
   const projectId = activeProject || ((projects as any)?.items?.[0]?.id) || null
+  const [offset, setOffset] = useState(0)
+  const PAGE = 50
   const { data: tasksData } = useQuery({
-    queryKey: ["tasks", projectId],
-    queryFn: () => api.listTasks({ project_id: projectId || undefined }),
+    queryKey: ["tasks", projectId, offset],
+    queryFn: () => api.listTasks({ project_id: projectId || undefined, limit: PAGE, offset }),
     enabled: !!projectId,
   })
+  const total = (tasksData as any)?.total || 0
+  const hasMore = offset + PAGE < total
 
   // SSE Live-Updates: invalidate Query bei Events
   useEffect(() => {
