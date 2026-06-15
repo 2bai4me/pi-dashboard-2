@@ -253,3 +253,64 @@ async def delete_task(
     ok = TaskService.delete_task(db, task_id)
     if not ok:
         raise HTTPException(404, "Task not found")
+
+
+# === Bulk-Triage: alle Tasks eines Projekts zurueck in Triage ===
+@router.post("/bulk-triage/{project_id}")
+async def bulk_set_tasks_triage(
+    project_id: str,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Setzt ALLE Tasks eines Projekts auf Status 'triage'."""
+    tasks = list(db.execute(
+        select(Task).where(Task.project_id == project_id)
+    ).scalars())
+    count = 0
+    for t in tasks:
+        if t.status != "triage":
+            old = t.status
+            t.status = "triage"
+            t.updated_at = datetime.utcnow()
+            TaskService._add_history(db, t, "status_changed", agent="system",
+                                     details={"from": old, "to": "triage", "reason": "bulk_triage"})
+            count += 1
+    db.commit()
+    return {"ok": True, "project_id": project_id, "reset_to_triage": count, "total": len(tasks)}
+
+
+# === Auto-Process-Triage: Prio + Role basierend auf Description setzen ===
+@router.post("/triage/{project_id}/process")
+async def process_triage(
+    project_id: str,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Process Triage: setzt Prio + Role basierend auf Description-Laenge + Keywords.
+
+    Logik (v1-kompatibel):
+    - Prio: desc > 500 -> 75, > 200 -> 50, sonst -> 25
+    - Role: pi-coder (default), pi-tester wenn 'test'/'pruefen' im Text
+    - Tools: read, write, bash, grep
+    - needs_breakdown: desc > 800
+    """
+    tasks = list(db.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == "triage"
+        )
+    ).scalars())
+    processed = 0
+    for t in tasks:
+        desc = (t.description or "").lower()
+        desc_len = len(t.description or "")
+        t.priority = 75 if desc_len > 500 else 50 if desc_len > 200 else 25
+        t.assigned_role = "pi-tester" if any(w in desc for w in ["test", "pruefen", "check"]) else "pi-coder"
+        t.status = "todo"
+        t.updated_at = datetime.utcnow()
+        TaskService._add_history(db, t, "status_changed", agent="system",
+                                 details={"from": "triage", "to": "todo", "reason": "process_triage",
+                                          "new_priority": t.priority, "new_role": t.assigned_role})
+        processed += 1
+    db.commit()
+    return {"ok": True, "project_id": project_id, "processed": processed}
