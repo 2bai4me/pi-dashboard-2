@@ -18,6 +18,7 @@ from .config import settings
 from .db.base import init_db, engine, SessionLocal, get_db
 from .auth import require_auth
 from .services.role_service import RoleService
+from .scheduler import start_scheduler, stop_scheduler
 from .models.task import Task
 from .models.history import TaskHistory
 from .models.token_usage import TokenUsage
@@ -43,11 +44,19 @@ async def lifespan(app: FastAPI):
             added = RoleService.seed_defaults(db)
             if added:
                 logger.info(f"Seeded {added} default roles.")
+        # Auto-Backup-Scheduler starten
+        try:
+            from .scheduler import start_scheduler
+            start_scheduler()
+        except Exception as e:
+            logger.warning(f"Backup-Scheduler konnte nicht starten: {e}")
     except Exception as e:
         logger.error(f"Init failed: {e}")
         raise
     yield
     logger.info("Pi Dashboard 2.0 shutting down.")
+    from .scheduler import stop_scheduler
+    stop_scheduler()
     engine.dispose()
 
 
