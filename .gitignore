@@ -1,0 +1,90 @@
+# ──── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+
+# ──── Node / Frontend ───────────────────────────────────────────
+node_modules/
+dist/
+build/
+.vite/
+.parcel-cache/
+.next/
+.nuxt/
+*.local
+
+# ──── IDE / Editor ──────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ──── Secrets / Config (lokal) ─────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.json
+
+# ──── Logs / Runtime ───────────────────────────────────────────
+*.log
+logs/
+*.log.*
+runtime/
+.cache/
+tmp/
+temp/
+
+# ──── Pi-Agent-Daten (lokal pro User, nicht im Repo) ───────────
+.pi-agent-data/
+data/
+sessions/
+
+# ──── Tests / Coverage ─────────────────────────────────────────
+coverage/
+.nyc_output/
+junit.xml
+test-results/
+
+# ──── Database (lokal, nicht im Repo) ─────────────────────────
+# SQLite-Dateien enthalten User-Daten
+*.db
+*.sqlite
+*.sqlite3
+database/*.db
+database/*.sqlite
+# Aber: Migration-Scripts + Schema-Dumps sind OK
+!database/migrations/
+
+# ──── OS-spezifisch ────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# ──── Alembic ─────────────────────────────────────────────────
+# alembic.ini wird committed, aber lokale Migration-Logs nicht
+*.log.lck
