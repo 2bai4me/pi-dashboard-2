@@ -98,10 +98,6 @@ class TaskRead(TaskBase):
     emergency: bool = False
     pricing_snapshot: Optional[Dict[str, Any]] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
-    # Sub-Tasks (rekursiv, 1 Level)
-    child_count: int = 0
-    children_done: int = 0
-
     model_config = ConfigDict(from_attributes=True)
 
 

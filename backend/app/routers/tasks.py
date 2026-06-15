@@ -22,7 +22,7 @@ from .. import events as _events
 router = APIRouter(prefix="/api/kanban/tasks", tags=["tasks"])
 
 
-@router.get("", response_model=TaskList)
+@router.get("")  # kein response_model -> spart doppeltes Pydantic-Encoding
 async def list_tasks(
     project_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
@@ -33,12 +33,33 @@ async def list_tasks(
 ):
     tasks = TaskService.list_tasks(db, project_id=project_id, status=status)
     paginated = tasks[offset:offset + limit]
-    return TaskList(
-        items=[TaskRead.model_validate(t) for t in paginated],
-        total=len(tasks),
-        limit=limit,
-        offset=offset,
-    )
+    # Performance: direkter dict-Build statt model_validate (Pydantic-Overhead)
+    items = []
+    for t in paginated:
+        items.append({
+            "id": t.id, "title": t.title, "description": t.description or "",
+            "status": t.status, "priority": t.priority, "category": t.category,
+            "assigned_role": t.assigned_role or "",
+            "success_criteria": t.success_criteria or [],
+            "tags": t.tags or [],
+            "project_id": t.project_id or "",
+            "parent_id": t.parent_id or "",
+            "assigned_subagent": t.assigned_subagent or "",
+            "iteration_count": t.iteration_count,
+            "order": t.order,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+            "claimed_at": t.claimed_at.isoformat() if t.claimed_at else None,
+            "emergency": t.emergency,
+            "pricing_snapshot": t.pricing_snapshot,
+            "meta": t.meta or {},
+        })
+    return {
+        "items": items,
+        "total": len(tasks),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("", response_model=TaskRead, status_code=201)
