@@ -30,12 +30,24 @@ class TaskService:
 
     @staticmethod
     def list_tasks(db: Session, project_id: Optional[str] = None,
-                   status: Optional[str] = None) -> List[Task]:
+                   status: Optional[str] = None,
+                   with_history: bool = False,
+                   with_tokens: bool = False) -> List[Task]:
+        """Listet Tasks OHNE history/token_usages (default, schnell).
+
+        Fuer History oder Token-Usage: with_history=True / with_tokens=True
+        (nutzt joinedload + selectinload fuer N+1-Vermeidung).
+        """
+        from sqlalchemy.orm import selectinload
         stmt = select(Task).order_by(Task.priority.desc(), Task.created_at.asc())
         if project_id:
             stmt = stmt.where(Task.project_id == project_id)
         if status:
             stmt = stmt.where(Task.status == status)
+        if with_history:
+            stmt = stmt.options(selectinload(Task.history_entries))
+        if with_tokens:
+            stmt = stmt.options(selectinload(Task.token_usages))
         return list(db.execute(stmt).scalars())
 
     @staticmethod

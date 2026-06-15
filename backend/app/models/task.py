@@ -109,10 +109,10 @@ class Task(Base):
         "Task", remote_side=[id], backref="subtasks"
     )
     history_entries: Mapped[List["TaskHistory"]] = relationship(
-        "TaskHistory", back_populates="task", cascade="all, delete-orphan", lazy="selectin"
+        "TaskHistory", back_populates="task", cascade="all, delete-orphan", lazy="noload"
     )
     token_usages: Mapped[List["TokenUsage"]] = relationship(
-        "TokenUsage", back_populates="task", cascade="all, delete-orphan", lazy="selectin"
+        "TokenUsage", back_populates="task", cascade="all, delete-orphan", lazy="noload"
     )
 
     # === Indizes ===
