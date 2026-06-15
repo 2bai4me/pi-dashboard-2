@@ -13,6 +13,7 @@ from ..schemas.project import (
 )
 from ..services.project_service import ProjectService
 from ..services.role_service import RoleService
+from .. import events as _events
 
 router = APIRouter(prefix="/api/kanban/projects", tags=["projects"])
 
@@ -98,6 +99,9 @@ async def set_project_mode(
     p = ProjectService.set_mode(db, project_id, req.mode, note=req.note)
     if not p:
         raise HTTPException(404, "Project not found")
+    await _events.publish_event(project_id, "project_mode_changed",
+                                {"project_id": project_id, "new_mode": p.mode,
+                                 "completion_report_generated": p.mode == "completed"})
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
                               ["id", "name", "description", "status", "mode", "category",

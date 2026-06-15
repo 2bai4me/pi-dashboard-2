@@ -145,6 +145,73 @@ async def analytics_summary(
     }
 
 
+# === SSE: Server-Sent Events fuer Live-Updates (v1 hatte das schon) ===
+import asyncio
+import json as _json
+from collections import defaultdict
+from sse_starlette.sse import EventSourceResponse
+
+# In-Memory Event-Bus (pro project_id) — wird von Routers befuellt
+_event_queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
+
+
+async def publish_event(project_id: str, event_type: str, data: dict):
+    """Veroeffentlicht ein Event an alle Listener dieses Projekts."""
+    if not project_id:
+        return
+    event = {
+        "type": event_type,
+        "ts": datetime.utcnow().isoformat(),
+        "project_id": project_id,
+        "data": data,
+    }
+    for q in _event_queues.get(project_id, []):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass  # Slow consumer: skip
+
+
+@app.get("/api/kanban/events/{project_id}")
+async def kanban_events(
+    project_id: str,
+    _user: str = Depends(require_auth),
+):
+    """SSE-Stream fuer Live-Updates eines Projekts.
+
+    Events: task_created, task_updated, task_status_changed,
+    task_priority_changed, project_mode_changed, project_completed.
+    """
+    async def event_generator():
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        _event_queues[project_id].append(queue)
+        try:
+            # Initial-Event: Verbindung steht
+            yield {
+                "event": "connected",
+                "data": _json.dumps({"project_id": project_id, "ts": datetime.utcnow().isoformat()}),
+            }
+            while True:
+                # Auf naechstes Event warten
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Keepalive-Comment
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                yield {
+                    "event": event["type"],
+                    "data": _json.dumps(event, default=str),
+                }
+        finally:
+            try:
+                _event_queues[project_id].remove(queue)
+            except ValueError:
+                pass
+
+    return EventSourceResponse(event_generator())
+
+
 # === Analytics: Index-Audit (welche DB-Indizes werden genutzt?) ===
 @app.post("/api/analytics/analyze")
 async def run_analyze(

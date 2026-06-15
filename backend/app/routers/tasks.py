@@ -13,6 +13,7 @@ from ..schemas.task import (
     TaskHistoryEntry, TaskWithStats,
 )
 from ..services.task_service import TaskService
+from .. import events as _events
 
 router = APIRouter(prefix="/api/kanban/tasks", tags=["tasks"])
 
@@ -48,6 +49,8 @@ async def create_task(
         status=req.status, priority=req.priority, category=req.category,
         parent_id=req.parent_id, assigned_role=req.assigned_role,
     )
+    await _events.publish_event(t.project_id or "", "task_created",
+                        {"task_id": t.id, "title": t.title, "status": t.status})
     return TaskRead.model_validate(t)
 
 
@@ -91,6 +94,8 @@ async def set_task_status(
     t = TaskService.set_status(db, task_id, req.status)
     if not t:
         raise HTTPException(404, "Task not found")
+    await _events.publish_event(t.project_id or "", "task_status_changed",
+                        {"task_id": t.id, "new_status": t.status, "priority": t.priority})
     return TaskRead.model_validate(t)
 
 
@@ -105,6 +110,8 @@ async def set_task_priority(
     t = TaskService.set_priority(db, task_id, req.priority)
     if not t:
         raise HTTPException(404, "Task not found")
+    await _events.publish_event(t.project_id or "", "task_priority_changed",
+                        {"task_id": t.id, "new_priority": t.priority, "emergency": t.emergency})
     return TaskRead.model_validate(t)
 
 
@@ -141,6 +148,14 @@ async def report_usage(
     )
     if not result:
         raise HTTPException(404, "Task not found")
+    # SSE-Event mit Cost-Update
+    if result.get("task_id"):
+        t = TaskService.get_task(db, result["task_id"])
+        if t:
+            await _events.publish_event(t.project_id or "", "task_usage_reported",
+                                {"task_id": t.id, "cost_usd": result.get("cost_usd"),
+                                 "tokens_in": result.get("tokens_in"),
+                                 "tokens_out": result.get("tokens_out")})
     return result
 
 
