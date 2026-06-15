@@ -146,69 +146,51 @@ async def analytics_summary(
     }
 
 
-# === SSE: Server-Sent Events fuer Live-Updates (v1 hatte das schon) ===
+# === SSE: Server-Sent Events fuer Live-Updates (SQLite-basiert, Multi-Process-safe) ===
 import asyncio
 import json as _json
-from collections import defaultdict
 from sse_starlette.sse import EventSourceResponse
-
-# In-Memory Event-Bus (pro project_id) — wird von Routers befuellt
-_event_queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
-
-
-async def publish_event(project_id: str, event_type: str, data: dict):
-    """Veroeffentlicht ein Event an alle Listener dieses Projekts."""
-    if not project_id:
-        return
-    event = {
-        "type": event_type,
-        "ts": datetime.utcnow().isoformat(),
-        "project_id": project_id,
-        "data": data,
-    }
-    for q in _event_queues.get(project_id, []):
-        try:
-            q.put_nowait(event)
-        except asyncio.QueueFull:
-            pass  # Slow consumer: skip
+from . import events as _events
+from fastapi import Query as _Query
 
 
 @app.get("/api/kanban/events/{project_id}")
 async def kanban_events(
     project_id: str,
+    last_event_id: int = _Query(0, ge=0, description="Letzte gesehene Event-ID fuer Resume"),
     _user: str = Depends(require_auth),
 ):
-    """SSE-Stream fuer Live-Updates eines Projekts.
+    """SSE-Stream mit SQLite-Long-Polling (Multi-Process-safe).
 
-    Events: task_created, task_updated, task_status_changed,
-    task_priority_changed, project_mode_changed, project_completed.
+    Events: task_created, task_status_changed, task_priority_changed,
+    task_usage_reported, project_mode_changed.
     """
+    _events.ensure_table()
+
     async def event_generator():
-        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        _event_queues[project_id].append(queue)
+        yield {
+            "event": "connected",
+            "data": _json.dumps({
+                "project_id": project_id,
+                "ts": datetime.utcnow().isoformat(),
+                "last_event_id": last_event_id,
+            }),
+        }
+        cur_id = last_event_id
         try:
-            # Initial-Event: Verbindung steht
-            yield {
-                "event": "connected",
-                "data": _json.dumps({"project_id": project_id, "ts": datetime.utcnow().isoformat()}),
-            }
             while True:
-                # Auf naechstes Event warten
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    # Keepalive-Comment
-                    yield {"event": "ping", "data": "{}"}
-                    continue
-                yield {
-                    "event": event["type"],
-                    "data": _json.dumps(event, default=str),
-                }
-        finally:
-            try:
-                _event_queues[project_id].remove(queue)
-            except ValueError:
-                pass
+                events = await asyncio.to_thread(
+                    _events.get_events_since, project_id, cur_id, 100
+                )
+                for ev in events:
+                    cur_id = ev["id"]
+                    yield {
+                        "event": ev["type"],
+                        "data": _json.dumps(ev, default=str),
+                    }
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
 
     return EventSourceResponse(event_generator())
 

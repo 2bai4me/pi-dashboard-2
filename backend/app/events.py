@@ -1,47 +1,122 @@
-"""Event-Bus fuer SSE (Server-Sent Events).
+"""Event-Bus fuer SSE (Server-Sent Events) — SQLite-basiert.
 
 Wird von Routers (projekt + task) befuellt und von main.py
-fuer den SSE-Endpoint konsumiert. Separate Datei um circular
-imports zu vermeiden.
+fuer den SSE-Endpoint konsumiert.
+
+Funktioniert Multi-Process / Multi-Worker:
+- publish_event schreibt in DB-Tabelle `event_log`
+- subscribe pollt die Tabelle (Long-Polling mit Watermark)
+- Polling-Intervall: 0.5s (konfigurierbar)
+
+Vorteile gegenueber In-Memory:
+- Multi-Process/Multi-Worker-safe
+- Events ueberleben Server-Restart
+- Audit-Trail: alle Events sind in DB protokolliert
 """
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+import json
+import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
-# In-Memory Event-Bus (pro project_id) — wird von Routers befuellt
-_event_queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
+from sqlalchemy import Column, String, Text, DateTime, Integer, Index
+from sqlalchemy.sql import func
+from sqlalchemy.orm import Session
+
+from .db.base import Base, SessionLocal
 
 
+# === Event-Log-Tabelle (persistent) ===
+class EventLog(Base):  # type: ignore
+    """Alle veroeffentlichten Events werden hier persistent gespeichert."""
+    __tablename__ = "event_log"
+
+    id: Column = Column(Integer, primary_key=True, autoincrement=True)
+    project_id: Column = Column(String(32), nullable=False, index=True)
+    event_type: Column = Column(String(64), nullable=False)
+    payload: Column = Column(Text, nullable=False)  # JSON mit data
+    ts: Column = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_eventlog_project_ts", "project_id", "ts"),
+    )
+
+
+# Sicherstellen dass die Tabelle existiert (wird bei Bedarf erstellt)
+def ensure_table():
+    from .db.base import engine
+    EventLog.__table__.create(bind=engine, checkfirst=True)
+
+
+# === Public API ===
 async def publish_event(project_id: str, event_type: str, data: dict[str, Any]) -> None:
-    """Veroeffentlicht ein Event an alle Listener dieses Projekts."""
+    """Veroeffentlicht ein Event (persistent in DB)."""
     if not project_id:
         return
-    event = {
-        "type": event_type,
-        "ts": datetime.utcnow().isoformat(),
-        "project_id": project_id,
-        "data": data,
-    }
-    for q in list(_event_queues.get(project_id, [])):
-        try:
-            q.put_nowait(event)
-        except asyncio.QueueFull:
-            pass
+    payload = json.dumps(data, default=str, ensure_ascii=False)
+    # DB-Insert (synchron, in eigenem Thread damit Event-Loop nicht blockiert)
+    def _insert():
+        with SessionLocal() as db:
+            ev = EventLog(project_id=project_id, event_type=event_type, payload=payload)
+            db.add(ev)
+            db.commit()
+    await asyncio.to_thread(_insert)
 
 
-def subscribe(project_id: str) -> asyncio.Queue:
-    """Erzeugt eine neue Queue fuer einen SSE-Listener."""
-    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-    _event_queues[project_id].append(queue)
-    return queue
+def get_events_since(project_id: str, since_id: int = 0, limit: int = 100) -> list[dict]:
+    """Holt alle Events eines Projekts seit einer bestimmten Event-ID."""
+    ensure_table()
+    with SessionLocal() as db:
+        rows = db.execute(
+            EventLog.__table__.select().where(
+                EventLog.project_id == project_id,
+                EventLog.id > since_id,
+            ).order_by(EventLog.id).limit(limit)
+        ).fetchall()
+        return [
+            {"id": r.id, "type": r.event_type, "ts": r.ts.isoformat(),
+             "project_id": r.project_id, "data": json.loads(r.payload)}
+            for r in rows
+        ]
 
 
-def unsubscribe(project_id: str, queue: asyncio.Queue) -> None:
-    """Entfernt eine Queue (Cleanup bei SSE-Disconnect)."""
-    try:
-        _event_queues[project_id].remove(queue)
-    except (ValueError, KeyError):
-        pass
+async def subscribe(project_id: str, last_event_id: int = 0) -> "EventStream":
+    """Erzeugt einen Long-Polling-Stream fuer ein Projekt.
+
+    Polling-Intervall: 0.3s (kompromiss zwischen Latenz und DB-Last).
+    """
+    ensure_table()
+    return EventStream(project_id, last_event_id)
+
+
+class EventStream:
+    """Async-Iterator ueber Events. Long-Polling-Implementierung."""
+
+    def __init__(self, project_id: str, last_event_id: int = 0):
+        self.project_id = project_id
+        self.last_event_id = last_event_id
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> dict:
+        if self._closed:
+            raise StopAsyncIteration
+        # Long-Polling: warte bis neue Events verfuegbar sind
+        for _ in range(60):  # max 60 Versuche * 0.5s = 30s timeout
+            events = await asyncio.to_thread(
+                get_events_since, self.project_id, self.last_event_id, 100
+            )
+            if events:
+                self.last_event_id = events[-1]["id"]
+                return events
+            await asyncio.sleep(0.5)
+        # Timeout: yield empty list (oder Stop?)
+        return []
+
+    def close(self):
+        self._closed = True
+
