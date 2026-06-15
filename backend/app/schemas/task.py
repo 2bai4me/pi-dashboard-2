@@ -98,6 +98,9 @@ class TaskRead(TaskBase):
     emergency: bool = False
     pricing_snapshot: Optional[Dict[str, Any]] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
+    # Sub-Tasks (rekursiv, 1 Level)
+    child_count: int = 0
+    children_done: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -120,6 +123,21 @@ class TaskStats(BaseModel):
     duration_s: int
     history_count: int
     pricing_snapshot: Optional[Dict[str, Any]] = None
+
+
+class SubTaskCreate(BaseModel):
+    """POST /api/kanban/tasks/{id}/subtasks — Sub-Tasks anlegen."""
+    title: str = Field(..., min_length=1, max_length=500)
+    description: Optional[str] = None
+    priority: int = Field(50, ge=0, le=100)
+    category: str = "new_request"
+    assigned_role: Optional[str] = None
+    success_criteria: List[str] = Field(default_factory=list)
+
+
+class SubTaskCreateList(BaseModel):
+    """Wrapper fuer POST subtasks Body (Pydantic-ForwardRef Workaround)."""
+    subtasks: List[SubTaskCreate]
 
 
 class TaskWithStats(TaskRead):

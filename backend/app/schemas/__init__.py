@@ -7,6 +7,7 @@ from .task import (
     TaskRead, TaskCreate, TaskUpdate, TaskList,
     TaskStatusUpdate, TaskPriorityUpdate, TaskDispatchUpdate,
     TaskTokenReport, TaskWithStats, TaskStats, TaskHistoryEntry,
+    SubTaskCreate, SubTaskCreateList,
 )
 from .role import RoleRead, RoleCreate, RoleUpdate, RoleList
 from .pricing import (
@@ -22,6 +23,7 @@ __all__ = [
     "TaskRead", "TaskCreate", "TaskUpdate", "TaskList",
     "TaskStatusUpdate", "TaskPriorityUpdate", "TaskDispatchUpdate",
     "TaskTokenReport", "TaskWithStats", "TaskStats", "TaskHistoryEntry",
+    "SubTaskCreate", "SubTaskCreateList",
     # Role
     "RoleRead", "RoleCreate", "RoleUpdate", "RoleList",
     # Pricing
