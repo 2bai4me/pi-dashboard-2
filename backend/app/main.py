@@ -68,11 +68,12 @@ app.add_middleware(
 )
 
 # === Routers ===
-from .routers import projects, tasks, models, roles  # noqa: E402
+from .routers import projects, tasks, models, roles, brainstorm  # noqa: E402
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
 app.include_router(roles.router)
+app.include_router(brainstorm.router)
 
 
 # === Health-Check ===
