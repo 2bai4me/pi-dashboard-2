@@ -40,7 +40,7 @@ export default function App() {
       </aside>
 
       <main className="main">
-        {tab === "projects" && <ProjectsTab activeProject={activeProject} setActiveProject={setActiveProject} />}
+        {tab === "projects" && <ProjectsTab activeProject={activeProject} setActiveProject={setActiveProject} setTab={setTab} />}
         {tab === "board" && <BoardTab activeProject={activeProject} setActiveProject={setActiveProject} />}
         {tab === "tasks" && <TasksTab activeProject={activeProject} />}
         {tab === "analytics" && <AnalyticsTab />}
@@ -52,7 +52,7 @@ export default function App() {
 }
 
 // =================== PROJECTS ===================
-function ProjectsTab({ activeProject, setActiveProject }: { activeProject: string | null; setActiveProject: (id: string) => void }) {
+function ProjectsTab({ activeProject, setActiveProject, setTab }: { activeProject: string | null; setActiveProject: (id: string) => void; setTab: (t: Tab) => void }) {
   const qc = useQueryClient()
   const { data: projects, isLoading } = useQuery({
     queryKey: ["projects"],

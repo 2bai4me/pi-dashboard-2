@@ -28,10 +28,12 @@ export const api = {
     request<any>("GET", `/api/kanban/projects/${id}/completion-report`),
 
   // Tasks
-  listTasks: (params?: { project_id?: string; status?: string }) => {
+  listTasks: (params?: { project_id?: string; status?: string; limit?: number; offset?: number }) => {
     const q = new URLSearchParams()
     if (params?.project_id) q.set("project_id", params.project_id)
     if (params?.status) q.set("status", params.status)
+    if (params?.limit) q.set("limit", String(params.limit))
+    if (params?.offset) q.set("offset", String(params.offset))
     const qs = q.toString()
     return request<any>("GET", `/api/kanban/tasks${qs ? "?" + qs : ""}`)
   },

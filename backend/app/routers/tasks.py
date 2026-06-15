@@ -21,11 +21,20 @@ router = APIRouter(prefix="/api/kanban/tasks", tags=["tasks"])
 async def list_tasks(
     project_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500, description="Max Anzahl Tasks (default 100, max 500)"),
+    offset: int = Query(0, ge=0, description="Offset fuer Pagination"),
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
     tasks = TaskService.list_tasks(db, project_id=project_id, status=status)
-    return TaskList(items=[TaskRead.model_validate(t) for t in tasks], total=len(tasks))
+    # Pagination anwenden
+    paginated = tasks[offset:offset + limit]
+    return TaskList(
+        items=[TaskRead.model_validate(t) for t in paginated],
+        total=len(tasks),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("", response_model=TaskRead, status_code=201)

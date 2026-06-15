@@ -103,9 +103,11 @@ class TaskRead(TaskBase):
 
 
 class TaskList(BaseModel):
-    """Liste von Tasks."""
+    """Liste von Tasks (paginiert)."""
     items: List[TaskRead]
     total: int
+    limit: int = 100
+    offset: int = 0
 
 
 class TaskStats(BaseModel):
