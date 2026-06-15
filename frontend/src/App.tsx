@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { api } from "./api"
 
@@ -172,6 +172,26 @@ function BoardTab({ activeProject, setActiveProject }: { activeProject: string |
     queryFn: () => api.listTasks({ project_id: projectId || undefined }),
     enabled: !!projectId,
   })
+
+  // SSE Live-Updates: invalidate Query bei Events
+  useEffect(() => {
+    if (!projectId) return
+    const es = new EventSource(`/api/kanban/events/${projectId}`)
+    const handler = () => {
+      qc.invalidateQueries({ queryKey: ["tasks", projectId] })
+    }
+    es.addEventListener("task_created", handler)
+    es.addEventListener("task_status_changed", handler)
+    es.addEventListener("task_priority_changed", handler)
+    es.addEventListener("task_usage_reported", handler)
+    return () => {
+      es.removeEventListener("task_created", handler)
+      es.removeEventListener("task_status_changed", handler)
+      es.removeEventListener("task_priority_changed", handler)
+      es.removeEventListener("task_usage_reported", handler)
+      es.close()
+    }
+  }, [projectId, qc])
 
   const setStatus = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => api.setTaskStatus(id, status),
