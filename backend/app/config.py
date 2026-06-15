@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # === Migration ===
     V1_DATA_PATH: Path = Path(os.getenv("PI_AGENT_DIR", str(Path.home() / ".pi" / "agent"))) / "kanban"
 
+    # === Rate-Limiting (Production-Ready) ===
+    # Beispiel: RATE_LIMIT_PER_MINUTE=60 setzt 60 Req/Minute pro IP
+    RATE_LIMIT_PER_MINUTE: int = 0  # 0 = disabled (dev), production: 60-600
+
     # === Logging ===
     LOG_LEVEL: str = "INFO"
 

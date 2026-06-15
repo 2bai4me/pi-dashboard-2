@@ -82,7 +82,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS (Whitelist aus .env via CORS_ORIGINS env-var)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -90,6 +90,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate-Limiting (Production-Ready via slowapi)
+if settings.RATE_LIMIT_PER_MINUTE > 0:  # type: ignore
+    try:
+        from slowapi import Limiter, _rate_limit_exceeded_handler
+        from slowapi.util import get_remote_address
+        from slowapi.middleware import SlowAPIMiddleware
+        from slowapi.errors import RateLimitExceeded
+        from fastapi.responses import JSONResponse
+        limiter = Limiter(key_func=get_remote_address, default_limits=[f"{settings.RATE_LIMIT_PER_MINUTE}/minute"])
+        app.state.limiter = limiter
+        app.add_middleware(SlowAPIMiddleware)
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        logger.info(f"Rate-Limiting aktiviert: {settings.RATE_LIMIT_PER_MINUTE}/minute pro IP")
+    except ImportError:
+        logger.warning("slowapi nicht installiert, Rate-Limiting deaktiviert")
 
 # === Routers ===
 from .routers import projects, tasks, models, roles, brainstorm  # noqa: E402
