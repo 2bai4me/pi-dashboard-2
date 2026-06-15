@@ -62,4 +62,5 @@ export const api = {
 
   // Analytics
   getAnalytics: () => request<any>("GET", "/api/analytics/summary"),
+  getCostSummary: (days: number = 30) => request<any>("GET", `/api/cost/summary?days=${days}`),
 }

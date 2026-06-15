@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { api } from "./api"
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line } from "recharts"
 
 type Tab = "projects" | "board" | "tasks" | "analytics" | "roles" | "pricing"
 
@@ -430,4 +431,43 @@ function RolesTab() {
       </div>
     </div>
   )
+}
+
+function CostDashboardTab() {
+  const [days, setDays] = useState(30);
+  const { data, isLoading } = useQuery({
+    queryKey: ["cost-dashboard", days],
+    queryFn: () => api.getCostSummary(days),
+  });
+  if (isLoading) return <div>Lade...</div>;
+  if (!data) return <div>Keine Daten</div>;
+  const total = data.total;
+  const providerData = data.by_provider.map((p) => ({ name: p.provider, cost: p.cost_usd }));
+  const roleData = data.by_role.map((r) => ({ name: r.role || "unknown", cost: r.cost_usd }));
+  const modelData = data.by_model.map((m) => ({ name: m.model, cost: m.cost_usd, calls: m.calls }));
+  const dayData = data.by_day.map((d) => ({ day: d.day, cost: d.cost_usd }));
+  return (
+    <div>
+      <h1>Cost-Dashboard</h1>
+      <p>Letzte {days} Tage</p>
+      <p>Total: ${total.cost_usd.toFixed(4)} | Calls: {total.calls}</p>
+      {providerData.length > 0 && (
+        <div>
+          <h3>Provider</h3>
+          <ul>{providerData.map((p) => <li key={p.name}>{p.name}: ${p.cost.toFixed(4)}</li>)}</ul>
+        </div>
+      )}
+      {dayData.length > 0 && (
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={dayData}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="day" />
+            <YAxis />
+            <Tooltip />
+            <Line dataKey="cost" stroke="#2ea043" />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
+    </div>
+  );
 }
