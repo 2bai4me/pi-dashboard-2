@@ -13,7 +13,7 @@ from .task import JSONType
 
 
 class Role(Base):
-    """Eine Rolle (Sub-Agent pi-coder/pi-tester/etc. oder Org CIO/CEO-digital).
+    """Eine Rolle (Sub-Agent pi-coder/pi-tester/etc. oder Org CIO/CEO-digital/CMO/CFO).
 
     Wird aus swarm-spawner/index.ts (TS-Definition) + ORG_ROLES (Python) initialisiert.
     """
@@ -26,6 +26,7 @@ class Role(Base):
     name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
     role_type: Mapped[str] = mapped_column(String(32), default="sub_agent", nullable=False)  # sub_agent | org
+    emoji: Mapped[Optional[str]] = mapped_column(String(8))  # 👑 🏗️ 📢 💰 💻 🧪 👁️ 🔧
 
     # === LLM-Config ===
     provider: Mapped[Optional[str]] = mapped_column(String(64))

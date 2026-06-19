@@ -11,6 +11,7 @@ class RoleBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     description: Optional[str] = None
     role_type: str = "sub_agent"  # sub_agent | org
+    emoji: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
     system_prompt: Optional[str] = None
@@ -26,6 +27,7 @@ class RoleCreate(RoleBase):
 
 class RoleUpdate(BaseModel):
     description: Optional[str] = None
+    emoji: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
     system_prompt: Optional[str] = None
@@ -44,5 +46,18 @@ class RoleRead(RoleBase):
 
 
 class RoleList(BaseModel):
+    """Liste von Rollen (alle Typen)."""
+    items: List[RoleRead]
+    total: int
+
+
+class OrgRoleList(BaseModel):
+    """Liste von Org-Rollen (CEO-digital, CIO, CMO, CFO)."""
+    items: List[RoleRead]
+    total: int
+
+
+class SubAgentList(BaseModel):
+    """Liste von Sub-Agents (pi-coder, pi-tester, pi-reviewer, pi-fixer)."""
     items: List[RoleRead]
     total: int

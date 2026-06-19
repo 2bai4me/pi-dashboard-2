@@ -52,6 +52,10 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     """Erstellt alle Tabellen (nur für Dev — in Prod via Alembic)."""
     # Import aller Models, damit sie bei Base.metadata registriert sind
-    from ..models import project, task, history, role, token_usage, pricing  # noqa: F401
+    from ..models import project, task, history, transition, sop, role, token_usage, pricing  # noqa: F401
+    from ..models import improvement  # noqa: F401  # User-Direktive 17.06.2026 (Self-Improvement)
+    from ..models import agent_question  # noqa: F401  # User-Direktive 17.06.2026 (User<->Agent Interaktionstool)
+    from ..models import board_operator  # noqa: F401  # User-Direktive 17.06.2026 (Live-Board Watchdog)
+    from ..models import task_draft  # noqa: F401  # User-Direktive 18.06.2026 (Iterativer Task-Refinement-Workflow)
 
     Base.metadata.create_all(bind=engine)

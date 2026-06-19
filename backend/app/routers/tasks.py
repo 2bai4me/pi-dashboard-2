@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Optional, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -17,6 +18,7 @@ from ..schemas.task import (
 )
 from ..services.task_service import TaskService
 from ..models.task import Task
+from ..utils.status_labels import display_status, translate_history_details
 from .. import events as _events
 
 router = APIRouter(prefix="/api/kanban/tasks", tags=["tasks"])
@@ -38,7 +40,9 @@ async def list_tasks(
     for t in paginated:
         items.append({
             "id": t.id, "title": t.title, "description": t.description or "",
-            "status": t.status, "priority": t.priority, "category": t.category,
+            "status": t.status,
+            "status_display": display_status(t.status),
+            "priority": t.priority, "category": t.category,
             "assigned_role": t.assigned_role or "",
             "success_criteria": t.success_criteria or [],
             "tags": t.tags or [],
@@ -84,14 +88,24 @@ async def get_task(
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
+    # User-Direktive 18.06.2026: Fuzzy-Suche (LIKE) fuer teilweise task_ids
     t = TaskService.get_task(db, task_id)
+    if not t and len(task_id) < 12:
+        # Versuche LIKE-Suche
+        from ..models.task import Task
+        candidates = list(db.execute(
+            select(Task).where(Task.id.like(f"{task_id}%")).limit(1)
+        ).scalars())
+        if candidates:
+            t = candidates[0]
+            task_id = t.id  # Volle ID fuer stats-Berechnung
     if not t:
         raise HTTPException(404, "Task not found")
     stats = TaskService.task_stats(db, task_id)
-    return TaskWithStats(
-        **TaskRead.model_validate(t).model_dump(),
-        stats=TaskStats(**stats),
-    )
+    # === User-Direktive 18.06.2026: status_display (z.B. 'todo' -> 'GO') ===
+    task_dump = TaskRead.model_validate(t).model_dump()
+    task_dump["status_display"] = display_status(t.status)
+    return TaskWithStats(**task_dump, stats=TaskStats(**stats))
 
 
 @router.patch("/{task_id}", response_model=TaskRead)
@@ -107,6 +121,91 @@ async def update_task(
     return TaskRead.model_validate(t)
 
 
+# ─────────────── CIO-Triage-Endpoints (Schritt 0, User-Direktive 16.06.2026) ───────────────
+
+@router.put("/{task_id}/task-type", response_model=TaskRead)
+async def set_task_type(
+    task_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Setzt den Task-Typ (vom CIO in Schritt 0 klassifiziert).
+
+    Erlaubte Werte: new_request | change | ticket | bugfix
+    """
+    task_type = body.get("task_type")
+    if task_type and task_type not in ("new_request", "change", "ticket", "bugfix"):
+        raise HTTPException(400, f"Invalid task_type: {task_type}")
+    t = TaskService.update_task(db, task_id, task_type=task_type)
+    if not t:
+        raise HTTPException(404, "Task not found")
+    return TaskRead.model_validate(t)
+
+
+@router.put("/{task_id}/implementation-plan", response_model=TaskRead)
+async def set_implementation_plan(
+    task_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Setzt den strukturierten Implementierungs-Plan (vom CIO in Schritt 0 ergaenzt).
+
+    Body: { "implementation_plan": { "files": [...], "routes": [...], "api_changes": [...], "notes": "..." } }
+    """
+    plan = body.get("implementation_plan")
+    if plan is not None and not isinstance(plan, dict):
+        raise HTTPException(400, "implementation_plan must be an object")
+    t = TaskService.update_task(db, task_id, implementation_plan=plan)
+    if not t:
+        raise HTTPException(404, "Task not found")
+    return TaskRead.model_validate(t)
+
+
+@router.put("/{task_id}/standards-check", response_model=TaskRead)
+async def set_standards_check(
+    task_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Setzt das Ergebnis der OpenBrain-Standardvorgaben-Pruefung (CIO bewertet).
+
+    Body: { "standards_check": { "checked_at": "...", "matches": [...], "missing": [...], "notes": "..." } }
+    """
+    check = body.get("standards_check")
+    if check is not None and not isinstance(check, dict):
+        raise HTTPException(400, "standards_check must be an object")
+    t = TaskService.update_task(db, task_id, standards_check=check)
+    if not t:
+        raise HTTPException(404, "Task not found")
+    return TaskRead.model_validate(t)
+
+
+@router.put("/{task_id}/subagent-readiness", response_model=TaskRead)
+async def set_subagent_readiness(
+    task_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Setzt die Subagent-Readiness-Bewertung (CIO prueft).
+
+    Body: { "subagent_readiness": { "model": "...", "branch": "...", "context_files": [...], "ready": true } }
+    """
+    readiness = body.get("subagent_readiness")
+    if readiness is not None and not isinstance(readiness, dict):
+        raise HTTPException(400, "subagent_readiness must be an object")
+    t = TaskService.update_task(db, task_id, subagent_readiness=readiness)
+    if not t:
+        raise HTTPException(404, "Task not found")
+    return TaskRead.model_validate(t)
+    if not t:
+        raise HTTPException(404, "Task not found")
+    return TaskRead.model_validate(t)
+
+
 @router.put("/{task_id}/status", response_model=TaskRead)
 async def set_task_status(
     task_id: str,
@@ -114,12 +213,152 @@ async def set_task_status(
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
-    t = TaskService.set_status(db, task_id, req.status)
+    """Setzt Task-Status SOFORT neu (ohne 5s-Wartezeit im API-Call).
+
+    Fruehere Variante: change_status_with_delay(delay_s=5.0) hat den API-Call
+    fuer 5 Sekunden blockiert -> Browser hat das als "Fehler" interpretiert.
+
+    Jetzt: set_status_sync + Background-Task fuer Auto-Claim/Watchdog.
+    So bekommt der User sofort Feedback (Task wandert sichtbar in neue Spalte).
+
+    NEU (User-Direktive 17.06.2026): Wenn der neue Status "triage" ist UND das
+    Projekt eine default_sop_id hat, wird automatisch eine neue SOP-Instance
+    gestartet (z.B. wenn User per Drag&Drop den Task zurueck in Triage schiebt).
+    """
+    # SOFORTIGE Status-Aenderung (synchron, kein 5s-Wait im API-Call)
+    t = TaskService.set_status_sync(
+        db, task_id, req.status,
+        agent="user", reason="api_set_status", delay_s=0.0,
+    )
     if not t:
         raise HTTPException(404, "Task not found")
+    # Background-Task fuer spaetere Auto-Claim-Logik (nach 5s)
+    if req.status == "todo":
+        try:
+            TaskService._schedule_background_delay(
+                db, t, t.status, req.status, "user", "api_set_status", {}, 5.0
+            )
+        except Exception:
+            pass
     await _events.publish_event(t.project_id or "", "task_status_changed",
                                 {"task_id": t.id, "new_status": t.status, "priority": t.priority})
-    return TaskRead.model_validate(t)
+
+    # === NEU: Bei status=in_progress + assigned_subagent -> Sub-Agent spawnen (User-Direktive 19.06.2026) ===
+    if t.status == "in_progress" and (t.assigned_subagent or t.assigned_role):
+        import logging
+        spawn_logger = logging.getLogger("pi-dashboard-2")
+        try:
+            from ..services.sub_agent import _spawn_sub_agent
+            spawn_result = await _spawn_sub_agent(t, db)
+            if spawn_result:
+                spawn_logger.info(
+                    f"Sub-Agent fuer Task {t.id[:8]} gestartet via set_status: "
+                    f"PID {spawn_result.get('pid')}, Rolle {spawn_result.get('role')}"
+                )
+        except Exception as spawn_err:
+            spawn_logger.error(
+                f"Sub-Agent-Spawn fehlgeschlagen fuer Task {t.id[:8]}: {spawn_err}"
+            )
+
+    # === NEU: Bei status=triage -> default SOP neu starten ===
+    sop_instance_id = None
+    if t.status == "triage" and t.project_id:
+        try:
+            import secrets
+            from ..models.project import Project
+            from ..models.sop import SOPInstance
+            proj = db.get(Project, t.project_id)
+            if proj and proj.default_sop_id:
+                # Pruefen ob schon eine laufende Instance existiert
+                existing = db.execute(
+                    select(SOPInstance).where(
+                        SOPInstance.task_id == t.id,
+                        SOPInstance.status.in_(["running", "pending", "waiting_sub_sop"]),
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    sop_instance_id = existing.id
+                else:
+                    # Erste Step der SOP holen (Fix User-Direktive 18.06.2026:
+                    # current_step_id=None fuehrte zu "Instance is completed" Fehler)
+                    from ..models.sop import SOPStep
+                    first_step = db.execute(
+                        select(SOPStep).where(SOPStep.sop_id == proj.default_sop_id)
+                        .order_by(SOPStep.step_order).limit(1)
+                    ).scalar_one_or_none()
+                    # Neue SOP-Instance starten
+                    new_inst = SOPInstance(
+                        id=secrets.token_hex(6),  # explizite ID vergeben (NOT NULL constraint)
+                        sop_id=proj.default_sop_id,
+                        task_id=t.id,
+                        project_id=t.project_id,
+                        current_step_id=first_step.id if first_step else None,
+                        status="running",
+                    )
+                    db.add(new_inst)
+                    db.commit()
+                    db.refresh(new_inst)
+                    sop_instance_id = new_inst.id
+                    # History-Eintrag
+                    from ..models.history import TaskHistory
+                    th = TaskHistory(
+                        task_id=t.id,
+                        event="sop_restarted",
+                        agent="system",
+                        details={"sop_id": proj.default_sop_id, "instance_id": new_inst.id, "reason": "status_reset_to_triage"},
+                    )
+                    db.add(th)
+                    db.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger("pi-dashboard-2").warning(f"SOP-Restart fehlgeschlagen: {e}")
+            db.rollback()
+
+    # Response mit sop_instance_id (als JSON-Dict, nicht Pydantic-Model)
+    import logging
+    import json as json_lib
+    logger = logging.getLogger("pi-dashboard-2")
+    logger.info(f"[Drag&Drop] task={task_id} status={t.status} sop_instance_id={sop_instance_id}")
+    # success_criteria und tags sind in der DB als JSON-Strings gespeichert -> parsen
+    sc_val = t.success_criteria
+    if isinstance(sc_val, str):
+        try: sc_val = json_lib.loads(sc_val)
+        except Exception: sc_val = []
+    tags_val = t.tags
+    if isinstance(tags_val, str):
+        try: tags_val = json_lib.loads(tags_val)
+        except Exception: tags_val = []
+    # Build full dict with all required fields (umgeht Pydantic-Validierung)
+    resp_dict = {
+        "id": t.id,
+        "title": t.title or "",
+        "description": t.description or "",
+        "status": t.status,
+        "priority": t.priority or 50,
+        "category": t.category,
+        "assigned_role": t.assigned_role,
+        "success_criteria": sc_val or [],
+        "tags": tags_val or [],
+        "project_id": t.project_id,
+        "parent_id": t.parent_id,
+        "assigned_subagent": t.assigned_subagent,
+        "iteration_count": t.iteration_count or 0,
+        "order": t.order or 0,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        "claimed_at": t.claimed_at.isoformat() if t.claimed_at else None,
+        "emergency": t.emergency or False,
+        "pricing_snapshot": t.pricing_snapshot,
+        "meta": t.meta or {},
+        "task_type": t.task_type,
+        "implementation_plan": t.implementation_plan,
+        "standards_check": t.standards_check,
+        "subagent_readiness": t.subagent_readiness,
+    }
+    if sop_instance_id:
+        resp_dict["sop_instance_id"] = sop_instance_id
+        logger.info(f"[Drag&Drop] Response mit sop_instance_id={sop_instance_id}")
+    return resp_dict
 
 
 @router.put("/{task_id}/priority", response_model=TaskRead)
@@ -190,6 +429,142 @@ async def get_task_stats(
     return TaskStats(**stats)
 
 
+@router.get("/{task_id}/sop-status", response_model=dict)
+async def get_task_sop_status(
+    task_id: str,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """SOP-Status fuer einen Task: aktueller Step, Verantwortlicher, naechster Step, Fortschritt.
+
+    User-Direktive 18.06.2026: Das TaskDetailPanel soll anzeigen, in welchem
+    SOP-Step der Task gerade ist, wer dafuer verantwortlich ist und was als
+    naechstes passiert. Diese Daten kommen aus der SOP-Instance + SOP-Definition.
+
+    Response:
+    {
+        "task_id": "...",
+        "sop_id": "7c86692be939",
+        "sop_name": "Standard-Workflow Development",
+        "instance_id": "...",
+        "instance_status": "running" | "completed" | None,
+        "current_step": {
+            "id": "13199b7c2b40",
+            "order": 1,
+            "name": "Worker Assignment",
+            "agent": "CIO",
+            "phase": "Task",
+            "action": "assign_worker"
+        } | None,
+        "next_step": {
+            "id": "bd79e783d050",
+            "order": 2,
+            "name": "Worker Implementation",
+            "agent": "pi-coder"
+        } | None,
+        "total_steps": 6,
+        "completed_steps": 1,
+        "progress_pct": 17,  # 1/6 * 100
+        "all_steps": [
+            {"order": 0, "name": "CIO Triage Review", "agent": "CIO"},
+            ...
+        ]
+    }
+    """
+    from ..models.sop import SOP, SOPStep, SOPInstance
+
+    t = db.get(Task, task_id)
+    if not t:
+        raise HTTPException(404, "Task not found")
+
+    # Aktuelle Instance finden (neueste laufende oder completed)
+    instances = list(db.execute(
+        select(SOPInstance)
+        .where(SOPInstance.task_id == task_id)
+        .order_by(SOPInstance.started_at.desc())
+    ).scalars())
+    instance = next(
+        (i for i in instances if i.status in ("running", "completed")),
+        None
+    )
+    if not instance:
+        return {
+            "task_id": task_id,
+            "sop_id": None,
+            "sop_name": None,
+            "instance_id": None,
+            "instance_status": None,
+            "current_step": None,
+            "next_step": None,
+            "total_steps": 0,
+            "completed_steps": 0,
+            "progress_pct": 0,
+            "all_steps": [],
+            "note": "Keine SOP-Instance vorhanden. Task wurde noch nicht in eine SOP eingebunden.",
+        }
+
+    sop = db.get(SOP, instance.sop_id)
+    if not sop:
+        raise HTTPException(500, f"SOP {instance.sop_id} nicht gefunden")
+
+    # Alle Steps sortiert
+    all_steps_db = list(db.execute(
+        select(SOPStep)
+        .where(SOPStep.sop_id == instance.sop_id)
+        .order_by(SOPStep.step_order)
+    ).scalars())
+    all_steps = [
+        {"order": s.step_order, "id": s.id, "name": s.name, "agent": s.agent, "phase": s.phase}
+        for s in all_steps_db
+    ]
+
+    # Aktueller Step
+    current_step = None
+    completed_count = 0
+    if instance.current_step_id and instance.status == "running":
+        cur = next((s for s in all_steps_db if s.id == instance.current_step_id), None)
+        if cur:
+            current_step = {
+                "id": cur.id,
+                "order": cur.step_order,
+                "name": cur.name,
+                "agent": cur.agent,
+                "phase": cur.phase,
+                "action": cur.action,
+            }
+            completed_count = cur.step_order
+    elif instance.status == "completed":
+        # Instance ist fertig -> alle Steps erfuellt
+        completed_count = len(all_steps_db)
+
+    # Naechster Step
+    next_step = None
+    if current_step and current_step["order"] + 1 < len(all_steps_db):
+        nxt = all_steps_db[current_step["order"] + 1]
+        next_step = {
+            "id": nxt.id,
+            "order": nxt.step_order,
+            "name": nxt.name,
+            "agent": nxt.agent,
+        }
+
+    progress_pct = int(completed_count / max(len(all_steps_db), 1) * 100)
+
+    return {
+        "task_id": task_id,
+        "sop_id": instance.sop_id,
+        "sop_name": sop.name if sop else None,
+        "instance_id": instance.id,
+        "instance_status": instance.status,
+        "current_step": current_step,
+        "next_step": next_step,
+        "total_steps": len(all_steps_db),
+        "completed_steps": completed_count,
+        "progress_pct": progress_pct,
+        "all_steps": all_steps,
+    }
+
+
 @router.get("/{task_id}/history", response_model=dict)
 async def get_task_history(
     task_id: str,
@@ -198,13 +573,28 @@ async def get_task_history(
     _user: str = Depends(require_auth),
 ):
     from ..models.history import TaskHistory
-    history = list(db.execute(
-        select(TaskHistory).where(TaskHistory.task_id == task_id)
-        .order_by(TaskHistory.ts.desc()).limit(limit)
-    ).scalars())
+    # User-Direktive 18.06.2026: Fuzzy-Suche (LIKE) fuer teilweise task_ids
+    if len(task_id) < 12:
+        history = list(db.execute(
+            select(TaskHistory).where(TaskHistory.task_id.like(f"{task_id}%"))
+            .order_by(TaskHistory.ts.desc()).limit(limit)
+        ).scalars())
+    else:
+        history = list(db.execute(
+            select(TaskHistory).where(TaskHistory.task_id == task_id)
+            .order_by(TaskHistory.ts.desc()).limit(limit)
+        ).scalars())
+    # === User-Direktive 18.06.2026: details-Mapping (z.B. 'todo' -> 'GO') ===
+    # Das DB-Audit-Log bleibt unveraendert (interne Identitaet), aber die
+    # Response hat zusaetzlich 'details_mapped' mit Display-Namen.
+    items = []
+    for h in history:
+        entry = TaskHistoryEntry.model_validate(h).model_dump()
+        entry["details_mapped"] = translate_history_details(entry.get("details", {}))
+        items.append(entry)
     return {
         "task_id": task_id,
-        "history": [TaskHistoryEntry.model_validate(h) for h in history],
+        "history": items,
         "stats": TaskService.task_stats(db, task_id),
     }
 
@@ -248,8 +638,8 @@ async def aggregate_subtasks(
     statuses = [s.status for s in subs]
     if all(s == "done" for s in statuses):
         new_status = "done"
-    elif any(s == "block" for s in statuses):
-        new_status = "block"
+    elif any(s == "warten" for s in statuses):
+        new_status = "warten"
     elif any(s == "in_progress" for s in statuses):
         new_status = "in_progress"
     elif all(s == "review" for s in statuses):
@@ -260,8 +650,13 @@ async def aggregate_subtasks(
     parent.updated_at = datetime.utcnow()
     TaskService._add_history(db, parent, "subtasks_aggregated", agent="system",
                              details={"new_status": new_status, "sub_count": len(subs)})
-    db.commit()
-    db.refresh(parent)
+    # Task-Transition-Record + 5s Background-Delay (User-Direktive 16.06.2026)
+    TaskService._do_set_status_sync_body(
+        db, parent, old_status=parent.status, new_status=new_status,
+        agent="system", reason="subtasks_aggregated",
+        details={"new_status": new_status, "sub_count": len(subs)},
+        delay_s=5.0,
+    )
     return TaskRead.model_validate(parent)
 
 
@@ -274,6 +669,182 @@ async def delete_task(
     ok = TaskService.delete_task(db, task_id)
     if not ok:
         raise HTTPException(404, "Task not found")
+
+
+# === NewTask-AI-Validation (User-Direktive 17.06.2026) ===
+# Prueft die User-Beschreibung und stellt Rueckfragen, damit der Task moeglichst
+# ohne weitere Rueckfragen durch den Triage-Prozess laeuft.
+class TaskValidationRequest(BaseModel):
+    title: str
+    description: str
+    category: Optional[str] = None
+    priority: Optional[int] = None
+    project_id: Optional[str] = None
+
+
+class TaskValidationResponse(BaseModel):
+    ok: bool
+    score: int  # 0-100, wie gut der Task bereits beschrieben ist
+    quality_issues: List[str]  # Was fehlt oder unklar ist
+    suggested_criteria: List[str]  # 1-3 vorgeschlagene Erfolgskriterien (NICHT mehr)
+    suggested_title: Optional[str] = None  # Verbesserter Titel-Vorschlag
+    suggested_category: Optional[str] = None
+    suggested_priority: Optional[int] = None
+    refinement_questions: List[str]  # Rueckfragen zur Verbesserung
+    ready_to_create: bool  # True, wenn der Task ohne weitere Rueckfragen erstellt werden kann
+
+
+@router.post("/validate-with-llm", response_model=TaskValidationResponse)
+async def validate_task_with_llm(req: TaskValidationRequest):
+    """Laesst die KI die Task-Beschreibung pruefen und Verbesserungen vorschlagen.
+
+    Ziel: Bestmoegliche Task-Description, damit der Task nach Triage OHNE
+    weitere Rueckfragen durch den Prozess laeuft.
+    """
+    import json
+    import logging
+    from ..services.llm_service import chat_completion
+
+    logger = logging.getLogger("pi-dashboard-2")
+
+    # Wenn title/description zu kurz sind, direkt ablehnen
+    if not req.title or len(req.title) < 5:
+        return TaskValidationResponse(
+            ok=False,
+            score=0,
+            quality_issues=["Titel ist zu kurz oder fehlt"],
+            suggested_criteria=[],
+            suggested_title=req.title,
+            suggested_category=req.category,
+            suggested_priority=req.priority,
+            refinement_questions=["Was ist der genaue Titel der Aufgabe? (min 5 Zeichen)"],
+            ready_to_create=False,
+        )
+
+    if not req.description or len(req.description) < 50:
+        return TaskValidationResponse(
+            ok=False,
+            score=20,
+            quality_issues=["Description ist zu kurz (min 50 Zeichen)"],
+            suggested_criteria=[],
+            suggested_title=req.title,
+            suggested_category=req.category,
+            suggested_priority=req.priority,
+            refinement_questions=[
+                "Beschreibe die Aufgabe genauer: Was soll gemacht werden?",
+                "Welche Akzeptanzkriterien gibt es?",
+            ],
+            ready_to_create=False,
+        )
+
+    # LLM-Call: Pruefe die Task-Beschreibung
+    system_prompt = """Du bist ein erfahrener PI-CIO, der neue Tasks prueft, BEVOR sie in die Triage gehen. Deine Aufgabe ist es, die User-Beschreibung zu analysieren und sicherzustellen, dass der Task moeglichst ohne Rueckfragen durch den Triage-Prozess laufen kann.
+
+**Pruefe diese 5 Dimensionen:**
+1. **Vollstaendigkeit**: Sind Title + Description ausreichend detailliert?
+2. **Klarheit**: Ist klar, WAS erreicht werden soll und WIE?
+3. **Akzeptanzkriterien**: Sind 1-3 testbare Kriterien erkennbar oder ableitbar? (NICHT mehr als 3, weil der Worker sonst ueberfordert ist)
+4. **Rollen**: Welche Worker-Rollen (pi-coder, pi-tester, etc.) sind noetig?
+5. **Stabilitaet/Sicherheit**: Sind negative Effekte auf Stabilitaet oder Security erkennbar?
+
+**Antwort-Format (STRIKTES JSON, nichts anderes):**
+```json
+{
+  "score": 0-100,
+  "quality_issues": ["Liste der Probleme, leer wenn alles OK"],
+  "suggested_criteria": ["Kriterium 1", "Kriterium 2"],
+  "suggested_title": "Verbesserter Titel-Vorschlag (oder gleich wie Original)",
+  "suggested_category": "bugfix|new_request|change|...",
+  "suggested_priority": 1-100,
+  "refinement_questions": ["Frage 1", "Frage 2"],
+  "ready_to_create": true/false
+}
+```
+
+**Wichtig:**
+- Score >= 80 = ready_to_create=true
+- MAXIMAL 1-3 Kriterien, jede MESSBAR und TESTBAR (NICHT mehr als 3!)
+- Anstatt 'Login funktioniert' lieber 'User kann sich mit OAuth2-Provider einloggen, Tests gruen'
+- Anstatt 'Code ist sauber' lieber 'Coverage > 80%'
+- Sprache: Deutsch
+"""
+
+    user_prompt = f"""**Task-Titel:** {req.title}
+
+**Task-Description:**
+{req.description}
+
+**Aktuelle Kategorie:** {req.category or '(nicht gesetzt)'}
+**Aktuelle Prioritaet:** {req.priority or '(nicht gesetzt)'}
+**Aktuelles Projekt-ID:** {req.project_id or '(nicht gesetzt)'}
+
+Pruefe diesen Task und schlage Verbesserungen vor."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        result = await chat_completion(
+            messages=messages,
+            model="minimax-m3",
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        # Content extrahieren
+        if isinstance(result, dict):
+            content = result.get("content", result.get("text", str(result)))
+        else:
+            content = str(result)
+
+        # JSON extrahieren
+        import re
+        # Versuche direkt
+        try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+            if m:
+                data = json.loads(m.group(1))
+            else:
+                start = content.find("{")
+                end = content.rfind("}")
+                if start >= 0 and end > start:
+                    data = json.loads(content[start : end + 1])
+                else:
+                    data = {}
+
+        return TaskValidationResponse(
+            ok=data.get("ready_to_create", False),
+            score=data.get("score", 50),
+            quality_issues=data.get("quality_issues", []),
+            suggested_criteria=data.get("suggested_criteria", []),
+            suggested_title=data.get("suggested_title", req.title),
+            suggested_category=data.get("suggested_category", req.category),
+            suggested_priority=data.get("suggested_priority", req.priority),
+            refinement_questions=data.get("refinement_questions", []),
+            ready_to_create=data.get("ready_to_create", False),
+        )
+    except Exception as e:
+        logger.error(f"LLM-Validation fehlgeschlagen: {e}")
+        # Fallback: Task kann erstellt werden
+        return TaskValidationResponse(
+            ok=True,
+            score=50,
+            quality_issues=["LLM-Validation fehlgeschlagen"],
+            suggested_criteria=[
+                f"Task '{req.title}' ist vollstaendig implementiert",
+                "Bestehende Unit-Tests laufen alle gruen",
+                "Doku wurde aktualisiert",
+                "Code-Review wurde durchgefuehrt",
+            ],
+            suggested_title=req.title,
+            suggested_category=req.category,
+            suggested_priority=req.priority,
+            refinement_questions=[],
+            ready_to_create=True,
+        )
 
 
 # === Bulk-Triage: alle Tasks eines Projekts zurueck in Triage ===
@@ -295,8 +866,14 @@ async def bulk_set_tasks_triage(
             t.updated_at = datetime.utcnow()
             TaskService._add_history(db, t, "status_changed", agent="system",
                                      details={"from": old, "to": "triage", "reason": "bulk_triage"})
+            # Task-Transition-Record + 5s Background-Delay (User-Direktive 16.06.2026)
+            TaskService._do_set_status_sync_body(
+                db, t, old_status=old, new_status="triage",
+                agent="system", reason="bulk_triage",
+                details={"from": old, "to": "triage"},
+                delay_s=5.0,
+            )
             count += 1
-    db.commit()
     return {"ok": True, "project_id": project_id, "reset_to_triage": count, "total": len(tasks)}
 
 
@@ -307,11 +884,12 @@ async def process_triage(
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
-    """Process Triage: setzt Prio + Role basierend auf Description-Laenge + Keywords.
+    """Process Triage: setzt Prio basierend auf Description-Laenge.
 
-    Logik (v1-kompatibel):
+    Logik (User-Direktive 18.06.2026):
     - Prio: desc > 500 -> 75, > 200 -> 50, sonst -> 25
-    - Role: pi-coder (default), pi-tester wenn 'test'/'pruefen' im Text
+    - Role: NICHT mehr setzen! Die SOP-Engine (Step 0/1/2/3) setzt assigned_role
+      pro Step. Waehrend Triage ist assigned_role = None (CIO bewertet).
     - Tools: read, write, bash, grep
     - needs_breakdown: desc > 800
     """
@@ -325,13 +903,23 @@ async def process_triage(
     for t in tasks:
         desc = (t.description or "").lower()
         desc_len = len(t.description or "")
+        old_status = t.status
         t.priority = 75 if desc_len > 500 else 50 if desc_len > 200 else 25
-        t.assigned_role = "pi-tester" if any(w in desc for w in ["test", "pruefen", "check"]) else "pi-coder"
+        # assigned_role wird NICHT mehr hier gesetzt. SOP-Engine (Step 0 = CIO,
+        # Step 1 = CIO, Step 2 = pi-coder, Step 3 = pi-tester) setzt ihn pro Step.
         t.status = "todo"
         t.updated_at = datetime.utcnow()
         TaskService._add_history(db, t, "status_changed", agent="system",
-                                 details={"from": "triage", "to": "todo", "reason": "process_triage",
+                                 details={"from": old_status, "to": "todo", "reason": "process_triage",
                                           "new_priority": t.priority, "new_role": t.assigned_role})
+        # Task-Transition-Record + 5s Background-Delay (User-Direktive 16.06.2026)
+        TaskService._do_set_status_sync_body(
+            db, t, old_status=old_status, new_status="todo",
+            agent="system", reason="process_triage",
+            details={"from": old_status, "to": "todo",
+                     "new_priority": t.priority, "new_role": t.assigned_role},
+            delay_s=5.0,
+        )
         processed += 1
     db.commit()
     return {"ok": True, "project_id": project_id, "processed": processed}

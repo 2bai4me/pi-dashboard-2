@@ -50,6 +50,7 @@ class TaskHistory(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     event: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    session_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     agent: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     model: Mapped[Optional[str]] = mapped_column(String(128))
 

@@ -27,6 +27,7 @@ class ProjectUpdate(BaseModel):
     mode: Optional[str] = None
     category: Optional[str] = None
     completion_report: Optional[str] = None
+    default_sop_id: Optional[str] = None  # User-Direktive 15.06.2026: Standard-SOP-Auswahl im UI
 
 
 class ProjectModeUpdate(BaseModel):
@@ -63,6 +64,7 @@ class ProjectRead(ProjectBase):
     updated_at: datetime
     closed_at: Optional[datetime] = None
     completion_report: Optional[str] = None
+    default_sop_id: Optional[str] = None  # User-Direktive 15.06.2026
     task_count: int = 0
     tasks_done: int = 0
     tasks_in_progress: int = 0

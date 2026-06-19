@@ -11,6 +11,30 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BACKEND_ROOT.parent
 
 
+# === JSON Config Paths (Module-Level Helpers) ===
+def get_models_json_path() -> Path:
+    """Pfad zur models.json (Provider/Modell-Konfiguration)."""
+    s = Settings()
+    candidates = [
+        BACKEND_ROOT / "models.json",
+        s.PI_AGENT_DIR / "models.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # default
+
+
+def get_auth_json_path() -> Path:
+    """Pfad zur auth.json (API-Keys)."""
+    return Settings().PI_AGENT_DIR / "auth.json"
+
+
+def get_settings_json_path() -> Path:
+    """Pfad zur settings.json (enabled models, default model)."""
+    return Settings().PI_AGENT_DIR / "settings.json"
+
+
 class Settings(BaseSettings):
     """Konfiguration via .env (im Backend-Root)."""
 
@@ -43,6 +67,12 @@ class Settings(BaseSettings):
     # === OpenBrain ===
     OPENBRAIN_URL: str = ""
     OPENBRAIN_ACCESS_KEY: str = ""
+
+    # === MiniMax / TTS ===
+    MINIMAX_API_KEY: str = ""
+    MINIMAX_TTS_API_URL: str = "https://api.minimax.io/v1/t2a_v2"
+    MINIMAX_TTS_VOICE_ID: str = "English_Insightful_Speaker"
+    MINIMAX_TTS_MODEL: str = "speech-2.8-hd"
 
     # === CORS ===
     CORS_ORIGINS: list[str] = [

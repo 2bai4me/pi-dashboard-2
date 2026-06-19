@@ -8,10 +8,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskBase(BaseModel):
+    """Pydantic-Schema-Basis fuer Task.
+
+    Standard-Defaults (User-Direktive 15.06.2026, Skill kanban-operator + SOP
+    'task-creation-default'):
+      - status   = 'triage'  (neue Tasks starten IMMER in Triage)
+      - priority = 1         (CIO bewertet im Triage-Prozess, hebt Prio an)
+      - category = 'new_request'
+    """
     title: str = Field(..., min_length=1, max_length=500)
     description: Optional[str] = None
     status: str = "triage"
-    priority: int = Field(50, ge=0, le=100)
+    priority: int = Field(1, ge=0, le=100)
     category: str = "new_request"  # ITIL: new_request | ticket | change
     assigned_role: Optional[str] = None
     success_criteria: List[str] = Field(default_factory=list)
@@ -80,6 +88,8 @@ class TaskHistoryEntry(BaseModel):
     tokens_out: int = 0
     cost_usd: float = 0.0
     details: Dict[str, Any] = Field(default_factory=dict)
+    # === User-Direktive 18.06.2026: Display-Mapping (z.B. 'todo' -> 'GO') ===
+    # details_mapped: Dict[str, Any] wird vom Router befuellt (translate_history_details)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -98,6 +108,11 @@ class TaskRead(TaskBase):
     emergency: bool = False
     pricing_snapshot: Optional[Dict[str, Any]] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
+    # === CIO-Triage-Felder (User-Direktive 16.06.2026, Schritt 0) ===
+    task_type: Optional[str] = None
+    implementation_plan: Optional[Dict[str, Any]] = None
+    standards_check: Optional[Dict[str, Any]] = None
+    subagent_readiness: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -139,3 +154,5 @@ class SubTaskCreateList(BaseModel):
 class TaskWithStats(TaskRead):
     """Task + Stats (für Sidebar-Anzeige)."""
     stats: TaskStats
+    # === User-Direktive 18.06.2026: Display-Mapping ===
+    status_display: Optional[str] = None  # z.B. 'GO' statt 'todo'

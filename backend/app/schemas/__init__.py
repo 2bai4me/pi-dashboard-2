@@ -9,10 +9,18 @@ from .task import (
     TaskTokenReport, TaskWithStats, TaskStats, TaskHistoryEntry,
     SubTaskCreate, SubTaskCreateList,
 )
+from .transition import (
+    TaskTransitionRead, TaskTransitionList, ProjectTransitionTimeline,
+)
 from .role import RoleRead, RoleCreate, RoleUpdate, RoleList
 from .pricing import (
     ModelPricingRead, PricingUpdateRequest, PricingRefreshResult,
     ModelInfo, ProviderInfo,
+)
+from .agent_question import (
+    AgentQuestionCreate, AgentQuestionAnswer,
+    AgentQuestionRead, AgentQuestionDetail, AgentQuestionList,
+    AgentQuestionAttachmentRead,
 )
 
 __all__ = [
@@ -24,9 +32,15 @@ __all__ = [
     "TaskStatusUpdate", "TaskPriorityUpdate", "TaskDispatchUpdate",
     "TaskTokenReport", "TaskWithStats", "TaskStats", "TaskHistoryEntry",
     "SubTaskCreate", "SubTaskCreateList",
+    # Transition
+    "TaskTransitionRead", "TaskTransitionList", "ProjectTransitionTimeline",
     # Role
     "RoleRead", "RoleCreate", "RoleUpdate", "RoleList",
     # Pricing
     "ModelPricingRead", "PricingUpdateRequest", "PricingRefreshResult",
     "ModelInfo", "ProviderInfo",
+    # AgentQuestion (User <-> Agent Interaktion)
+    "AgentQuestionCreate", "AgentQuestionAnswer",
+    "AgentQuestionRead", "AgentQuestionDetail", "AgentQuestionList",
+    "AgentQuestionAttachmentRead",
 ]

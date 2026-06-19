@@ -46,6 +46,12 @@ class Project(Base):
     # === Completion-Report (JSON, nur bei mode=completed) ===
     completion_report: Mapped[Optional[str]] = mapped_column(Text)
 
+    # === Default-SOP (User-Direktive 15.06.2026) ===
+    # Welche SOP soll fuer den Prozessdurchlauf genutzt werden?
+    # Wird vom User im UI ausgewaehlt (Dropdown neben Mode-Switcher).
+    # Die Rule-Engine (SOP-Funktion) liest dieses Feld spaeter aus.
+    default_sop_id: Mapped[Optional[str]] = mapped_column(String(32))
+
     # === Relations ===
     tasks: Mapped[List["Task"]] = relationship(
         "Task", back_populates="project", cascade="all, delete-orphan", lazy="selectin"
@@ -57,6 +63,7 @@ class Project(Base):
         Index("idx_projects_mode", "mode"),
         Index("idx_projects_category", "category"),
         Index("idx_projects_created_at", "created_at"),
+        Index("idx_projects_default_sop", "default_sop_id"),
     )
 
     def __repr__(self) -> str:

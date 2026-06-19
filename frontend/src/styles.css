@@ -151,3 +151,15 @@ table.data-table tr:hover { background: var(--bg-muted); }
 
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+/* === Warte-Animationen fuer 5s-Status-Delay (User-Direktive 16.06.2026) === */
+@keyframes pulse-wait {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(1.02); }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.2; }
+}
+.pulse-wait { animation: pulse-wait 1s ease-in-out infinite; }
+.live-pulse-wait { animation: pulse-wait 1.5s ease-in-out infinite; }

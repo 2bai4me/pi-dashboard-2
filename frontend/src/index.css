@@ -1,7 +1,8 @@
-@import "tailwindcss";
+/* Tailwind v4 deaktiviert — siehe vite.config.ts.
+   Das Projekt nutzt ausschliesslich Custom-CSS-Klassen aus dieser Datei. */
 
-/* ─── Hermes-Style Dark Theme (Tailwind v4) ───────────────────── */
-@theme {
+/* ─── Hermes-Style Dark Theme (CSS Custom Properties) ─────────── */
+:root {
   --color-hermes-bg: #0e1217;
   --color-hermes-surface: #161b22;     /* Card/Sidebar */
   --color-hermes-surface-2: #1c2333;   /* Card hover */
@@ -13,6 +14,7 @@
   --color-hermes-accent-orange: #d29922;
   --color-hermes-danger: #f85149;
   --color-hermes-muted: #21262d;
+  --color-hermes-bg-secondary: #161b22; /* fehlte: gleich wie surface */
   --font-hermes: "Inter", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
 }
@@ -457,6 +459,12 @@ textarea.input {
 .id-badge.id-badge-board {
   font-size: 10px;
   margin-right: 2px;
+  /* Volle 12-Zeichen-Task-ID sichtbar lassen (User-Direktive 18.06.2026) */
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .id-badge.id-badge-child {
   font-size: 9px;
@@ -1015,3 +1023,53 @@ textarea.input {
 .toast-success { border-left: 3px solid var(--color-hermes-accent); }
 .toast-error   { border-left: 3px solid var(--color-hermes-danger); }
 .toast-info    { border-left: 3px solid var(--color-hermes-accent-blue); }
+
+/* ─── Safety-Reset (zuletzt geladen, höchste Priorität) ──────────
+   Stellt sicher, dass keine globalen Browser/User-Agent-Resets oder
+   Bibliotheken (z.B. lucide-react) die Komponenten-Styles überschreiben.
+   Wir setzen border/background/border-radius explizit zurück, damit
+   .card, .btn, .input, .badge, .project-card etc. zuverlässig sichtbar sind.
+*/
+.card, .project-card, .stat-card, .btn, .badge, .id-badge,
+.subtask-item, .success-criterion, .description-box,
+.data-table, .data-table td, .data-table th,
+.sop-dropdown-trigger, .sop-dropdown-menu, .sop-dropdown-item,
+.mode-dropdown-trigger, .mode-dropdown-menu, .mode-dropdown-item,
+.detail-panel, .detail-panel-header, .modal, .toast,
+.board-column, .board-column-header, .board-column-body, .board-column-empty,
+.board-column-count, .board-scrollbar, .sidebar, .sidebar-header,
+.sidebar-link, .triage-bar, .task-card, .subtab, .subtab-bar,
+.project-card-name, .project-card-desc, .project-card-meta,
+.workspace-header, .workspace-breadcrumb,
+.priority-slider, .priority-marks, .input, .select, textarea.input {
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--color-hermes-border);
+  box-sizing: border-box;
+}
+
+.btn, .id-badge, .subtab, .sop-dropdown-trigger, .sop-dropdown-item,
+.mode-dropdown-trigger, .mode-dropdown-item {
+  background-color: var(--color-hermes-surface);
+}
+
+.card, .project-card, .stat-card, .btn, .badge, .id-badge,
+.subtask-item, .success-criterion, .description-box,
+.sop-dropdown-trigger, .sop-dropdown-menu, .sop-dropdown-item,
+.mode-dropdown-trigger, .mode-dropdown-menu, .mode-dropdown-item,
+.modal, .toast, .board-column, .board-column-header, .board-scrollbar,
+.sidebar, .triage-bar, .task-card, .input, .select, textarea.input,
+.board-column-count {
+  border-radius: 6px;
+}
+
+.btn, .id-badge, .subtab, .sop-dropdown-trigger, .sop-dropdown-item,
+.mode-dropdown-trigger, .mode-dropdown-item {
+  color: var(--color-hermes-text);
+}
+
+/* Verhindere dass lucide-react oder Browser-Defaults h1-h6 in body überschreiben */
+h1, h2, h3, h4, h5, h6 { font-weight: 600; }
+
+/* p-Tags in Karten/Headern auf margin 0 */
+.page-header p, .card > p { margin: 0; }

@@ -50,12 +50,17 @@ class ProjectService:
 
     @staticmethod
     def update_project(db: Session, project_id: str, **fields) -> Optional[Project]:
+        # Felder, die explizit auf null gesetzt werden duerfen (z.B. SOP-Auswahl aufheben)
+        # Standardmaessig werden None-Werte ignoriert, um versehentliche Loeschungen zu vermeiden.
+        NULLABLE_FIELDS = {"default_sop_id"}
         p = db.get(Project, project_id)
         if not p:
             return None
         for k, v in fields.items():
             if v is not None and hasattr(p, k):
                 setattr(p, k, v)
+            elif k in NULLABLE_FIELDS and v is None and hasattr(p, k):
+                setattr(p, k, None)  # explizit null fuer nullable Felder
         p.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(p)

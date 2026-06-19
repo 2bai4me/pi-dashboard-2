@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from ..db.base import get_db
 from ..auth import require_auth
-from ..config import settings
+from ..config import settings, get_models_json_path, get_auth_json_path, get_settings_json_path
 from ..models.pricing import ModelPricing
 from ..schemas.pricing import (
     ModelPricingRead, PricingUpdateRequest, PricingRefreshResult,
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/models", tags=["models"])
 # === Helpers ===
 def _read_models_json() -> Dict[str, Any]:
     """Liest models.json (Provider + Modelle, ohne Preise)."""
-    p = settings.models_json
+    p = get_models_json_path()
     if not p.exists():
         return {"providers": {}}
     try:
@@ -47,7 +47,7 @@ async def list_providers(
 ):
     cfg = _read_models_json()
     auth = {}
-    auth_path = settings.auth_json
+    auth_path = get_auth_json_path()
     if auth_path.exists():
         try:
             auth = json.loads(auth_path.read_text(encoding="utf-8"))
@@ -72,7 +72,7 @@ async def list_models(
     _user: str = Depends(require_auth),
 ):
     cfg = _read_models_json()
-    s = settings.settings_json
+    s = get_settings_json_path()
     settings_data = {}
     if s.exists():
         try:

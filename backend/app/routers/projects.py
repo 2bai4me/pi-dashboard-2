@@ -30,6 +30,7 @@ async def list_projects(
         items.append(ProjectRead(
             id=p.id, name=p.name, description=p.description,
             status=p.status, mode=p.mode, category=p.category,
+            default_sop_id=p.default_sop_id,
             created_at=p.created_at, updated_at=p.updated_at,
             closed_at=p.closed_at, completion_report=p.completion_report,
             **stats,
@@ -47,7 +48,7 @@ async def create_project(
                                        mode=req.mode, category=req.category)
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
-                              ["id", "name", "description", "status", "mode", "category",
+                              ["id", "name", "description", "status", "mode", "category", "default_sop_id",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 
@@ -63,7 +64,7 @@ async def get_project(
         raise HTTPException(404, "Project not found")
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
-                              ["id", "name", "description", "status", "mode", "category",
+                              ["id", "name", "description", "status", "mode", "category", "default_sop_id",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 
@@ -78,9 +79,13 @@ async def update_project(
     p = ProjectService.update_project(db, project_id, **req.model_dump(exclude_unset=True))
     if not p:
         raise HTTPException(404, "Project not found")
+    # Bug-Fix (User-Direktive 18.06.2026): db.expire_all() damit LIST-Endpoint nach
+    # PATCH die neuen Felder sieht (z.B. default_sop_id). Sonst liefert SQLAlchemy
+    # Identity-Map das gecachte Object ohne die Updates.
+    db.expire_all()
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
-                              ["id", "name", "description", "status", "mode", "category",
+                              ["id", "name", "description", "status", "mode", "category", "default_sop_id",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 
@@ -104,7 +109,7 @@ async def set_project_mode(
                                  "completion_report_generated": p.mode == "completed"})
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
-                              ["id", "name", "description", "status", "mode", "category",
+                              ["id", "name", "description", "status", "mode", "category", "default_sop_id",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 
@@ -122,7 +127,7 @@ async def set_project_category(
         raise HTTPException(404, "Project not found")
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
-                              ["id", "name", "description", "status", "mode", "category",
+                              ["id", "name", "description", "status", "mode", "category", "default_sop_id",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 

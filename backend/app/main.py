@@ -59,12 +59,32 @@ async def lifespan(app: FastAPI):
             added = RoleService.seed_defaults(db)
             if added:
                 logger.info(f"Seeded {added} default roles.")
+        # Session-IDs fuer die Background-Prozesse initialisieren
+        try:
+            from .services.session_helper import init_session_id
+            init_session_id(force_type="server")
+        except Exception as e:
+            logger.warning(f"Session-ID-Init fehlgeschlagen: {e}")
         # Auto-Backup-Scheduler starten
         try:
             from .scheduler import start_scheduler
             start_scheduler()
         except Exception as e:
             logger.warning(f"Backup-Scheduler konnte nicht starten: {e}")
+        # Board-Operator-Watchdog starten (User-Direktive 17.06.2026)
+        try:
+            from .services.board_operator_service import start_watchdog
+            await start_watchdog()
+            logger.info("Board-Operator-Watchdog gestartet (Live-Mode-Handler)")
+        except Exception as e:
+            logger.warning(f"Board-Operator-Watchdog konnte nicht starten: {e}")
+        # Worker-Loop starten (User-Direktive 17.06.2026: automatische Task-Bearbeitung)
+        try:
+            from .services.worker_loop import start_worker_loop
+            await start_worker_loop()
+            logger.info("Worker-Loop gestartet (automatische Task-Bearbeitung via LLM)")
+        except Exception as e:
+            logger.warning(f"Worker-Loop konnte nicht starten: {e}")
     except Exception as e:
         logger.error(f"Init failed: {e}")
         raise
@@ -72,6 +92,18 @@ async def lifespan(app: FastAPI):
     logger.info("Pi Dashboard 2.0 shutting down.")
     from .scheduler import stop_scheduler
     stop_scheduler()
+    # Watchdog stoppen (alle Operator-Tasks)
+    try:
+        from .services.board_operator_service import stop_watchdog
+        await stop_watchdog()
+    except Exception as e:
+        logger.warning(f"Watchdog-Stop fehlgeschlagen: {e}")
+    # Worker-Loop stoppen
+    try:
+        from .services.worker_loop import stop_worker_loop
+        await stop_worker_loop()
+    except Exception as e:
+        logger.warning(f"Worker-Loop-Stop fehlgeschlagen: {e}")
     engine.dispose()
 
 
@@ -108,12 +140,34 @@ if settings.RATE_LIMIT_PER_MINUTE > 0:  # type: ignore
         logger.warning("slowapi nicht installiert, Rate-Limiting deaktiviert")
 
 # === Routers ===
-from .routers import projects, tasks, models, roles, brainstorm  # noqa: E402
+# Modul-Architektur: Jeder Router kapselt eine fachliche Domäne
+# - projects/tasks/roles:    Kern-Domäne (Projekte, Tasks, Rollen)
+# - models/roles:            LLM-Modell-Verwaltung + Berechtigungen
+# - brainstorm/workflow:     Requirements-Engineering + State-Machine
+# - selfimprovement/sops:    Meta-Governance (SOP-Engine, Self-Improve)
+# - architecture_rules:      Standardvorgaben für Schritt 0
+# - process_template:        BPMN-Templates für Task-Aggregation
+# - agent_questions:         User<->Agent Interaktionstool
+# - subagents/task_drafts:   SubAgent-Konfig + iterativer Task-Refinement
+# - board_operators/test_runner: Live-Watchdog + Test-Navigator
+from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, task_drafts, tts  # noqa: E402
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
 app.include_router(roles.router)
 app.include_router(brainstorm.router)
+app.include_router(workflow.router)
+app.include_router(selfimprovement.router)
+app.include_router(transitions.router)
+app.include_router(sops.router)
+app.include_router(process_template.router)
+app.include_router(architecture_rules.router)  # User-Direktive 16.06.2026: Standardvorgaben für Schritt 0
+app.include_router(agent_questions.router)  # User-Direktive 17.06.2026: User<->Agent Interaktionstool
+app.include_router(subagents.router)  # User-Direktive 18.06.2026: SubAgent-Konfiguration (Modell pro Rolle)
+app.include_router(task_drafts.router)  # User-Direktive 18.06.2026: Iterativer Task-Refinement-Workflow (KI+User)
+app.include_router(board_operators.router)  # User-Direktive 17.06.2026: Live-Board Watchdog-Instanzen
+app.include_router(test_runner.router)  # User-Direktive 17.06.2026: Navigator-Service fuer Test-Aktionen
+app.include_router(tts.router)  # MiniMax Text-to-Audio V2
 
 
 # === Health-Check ===
@@ -153,7 +207,9 @@ async def health_db_deep(
         expected_tables = ["projects", "tasks", "task_history", "roles",
                            "token_usage", "model_pricing", "brainstorm_entries",
                            "requirement_docs", "review_pipelines",
-                           "implementation_steps", "event_log"]
+                           "implementation_steps", "event_log",
+                           "agent_questions", "agent_question_attachments",
+                           "board_operators"]
         for t in expected_tables:
             exists = db.execute(text(
                 f"SELECT name FROM sqlite_master WHERE type='table' AND name=:t"
@@ -180,6 +236,10 @@ async def health_db_deep(
     }
 
 
+# Version-Lifecycle (Task aadf7b23d059):
+#   v2.0.0-beta  →  v2.0.0-rc  →  v2.0.0-stable
+# Aktuelle Phase: Release-Candidate (Index-Audit + Performance-Optimierung)
+# Naechste Phase: Stable-Release mit v1-Migration + Production-Readiness
 @app.get("/api/version")
 async def version() -> dict:
     return {
