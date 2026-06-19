@@ -108,6 +108,18 @@ async def _set_status_with_delay(db: Session, task: Task, new_status: str,
     task.updated_at = transition_at
     details = {"from": old_status, "to": new_status, "reason": reason, **extra}
 
+    # Session-ID ermitteln (PFLICHT: Performance-Tabelle muss Session zuordnen koennen)
+    from ..services.session_helper import get_session_id
+    _transition_session_id = get_session_id()
+    if not _transition_session_id:
+        # Fallback + Log: sollte nie passieren, da session_helper auto-init
+        import logging as _logging
+        _logging.getLogger("pi-dashboard-2").warning(
+            f"[session-id] TaskTransition ohne session_id fuer Task {task.id[:8]} "
+            f"{old_status!r}->{new_status!r} reason={reason!r}. session_helper lieferte leer."
+        )
+        _transition_session_id = "session-unknown"
+
     # Transition-Record anlegen
     tr = TaskTransition(
         task_id=task.id, project_id=task.project_id,
@@ -117,6 +129,7 @@ async def _set_status_with_delay(db: Session, task: Task, new_status: str,
         completed_at=None,
         delay_s=delay_seconds,
         duration_ms=None,
+        session_id=_transition_session_id,
         agent=agent, reason=reason, details=details,
     )
     db.add(tr)
@@ -1233,7 +1246,12 @@ def assign_worker(task_id: str, body: AssignBody, db: Session = Depends(get_db),
 # ------------------------------------------------------------ PHASE 3: GO -> IN_PROGRESS (Worker starts) ------------------------------------------------------------
 
 class StartBody(BaseModel):
-    agent: str = "system"
+    # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    # Default-Agent: statt "system" verwenden wir den tatsaechlichen
+    # Worker-Agent des Tasks. Das stellt sicher, dass die Performance-Tabelle
+    # den Coding-Agent (z.B. "pi-coder") anzeigt und nicht "system".
+    # Fallback auf "system" nur, wenn der Task keinen assigned_agent hat.
+    agent: Optional[str] = None
 
 @router.post("/tasks/{task_id}/start")
 async def start_task(task_id: str, body: StartBody, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
@@ -1242,8 +1260,20 @@ async def start_task(task_id: str, body: StartBody, db: Session = Depends(get_db
     if t.status != "todo":
         raise HTTPException(400, f"Task is in status '{t.status}', expected 'todo'")
     t.claimed_at = datetime.utcnow()
-    await _set_status_with_delay(db, t, "in_progress", body.agent, "worker_started", delay_s=5.0)
-    return {"ok": True, "task_id": task_id, "new_status": "in_progress", "worker": t.assigned_role, "delay_s": 5.0}
+    # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    # Agent-Aufloesung: Reihenfolge
+    #   1) body.agent (explizit vom Caller)
+    #   2) t.assigned_subagent (z.B. "pi-coder", von SOP-Engine gesetzt)
+    #   3) t.assigned_role (Worker-Rolle aus SOP)
+    #   4) Fallback: "system"
+    agent = (
+        body.agent
+        or t.assigned_subagent
+        or t.assigned_role
+        or "system"
+    )
+    await _set_status_with_delay(db, t, "in_progress", agent, "worker_started", delay_s=5.0)
+    return {"ok": True, "task_id": task_id, "new_status": "in_progress", "worker": t.assigned_role, "agent": agent, "delay_s": 5.0}
 
 
 # ------------------------------------------------------------ PHASE 4: IN_PROGRESS -> REVIEW (Worker done) ------------------------------------------------------------

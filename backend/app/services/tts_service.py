@@ -7,7 +7,7 @@ Endpoint:      POST https://api.minimax.io/v1/t2a_v2
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -15,9 +15,131 @@ from ..config import settings
 
 logger = logging.getLogger("pi-dashboard-2")
 
+# ══════════════════════════════════════════════════════════════════════
+# Voice-Katalog (vormals voice_config.py)
+# ══════════════════════════════════════════════════════════════════════
+# User-Direktive 19.06.2026: voice_config.py wurde wiederholt von einem
+# Auto-Cleanup-Mechanismus geloescht. Der Katalog ist daher direkt im
+# TTS-Service eingebettet, damit er nicht mehr als separate Datei
+# ausgeloescht werden kann.
+# ══════════════════════════════════════════════════════════════════════
+# Sprach-Mapping fuer Schema (code, label)
+LANGUAGE_INFO = {
+    "English": {"code": "en-US", "label": "English"},
+    "German": {"code": "de-DE", "label": "Deutsch"},
+    "Chinese": {"code": "zh-CN", "label": "Chinese (Mandarin)"},
+}
+
+AVAILABLE_VOICES: List[Dict[str, Any]] = [
+    # English
+    {"id": "English_Graceful_Lady", "name": "Graceful Lady", "language": "English", "gender": "female", "description": "A graceful and elegant female English voice.", "preview_text": "Hello, this is a sample of the Graceful Lady voice."},
+    {"id": "English_Insightful_Speaker", "name": "Insightful Speaker", "language": "English", "gender": "male", "description": "An insightful and calm male English voice.", "preview_text": "Hello, this is a sample of the Insightful Speaker voice."},
+    {"id": "English_Lucky_Robot", "name": "Lucky Robot", "language": "English", "gender": "neutral", "description": "A robotic English voice with a lucky charm.", "preview_text": "Hello, this is a sample of the Lucky Robot voice."},
+    {"id": "English_Persuasive_Man", "name": "Persuasive Man", "language": "English", "gender": "male", "description": "A persuasive and confident male English voice.", "preview_text": "Hello, this is a sample of the Persuasive Man voice."},
+    {"id": "English_radiant_girl", "name": "Radiant Girl", "language": "English", "gender": "female", "description": "A bright and radiant young female English voice.", "preview_text": "Hello, this is a sample of the Radiant Girl voice."},
+    # German
+    {"id": "German_Clear_Voice", "name": "Clear Voice", "language": "German", "gender": "neutral", "description": "Eine klare und deutliche deutsche Stimme.", "preview_text": "Hallo, dies ist ein Beispiel der klaren deutschen Stimme."},
+    {"id": "German_Friendly_Woman", "name": "Friendly Woman", "language": "German", "gender": "female", "description": "Eine freundliche weibliche deutsche Stimme.", "preview_text": "Hallo, dies ist ein Beispiel der freundlichen deutschen Stimme."},
+    {"id": "German_Neutral", "name": "Neutral", "language": "German", "gender": "neutral", "description": "Eine neutrale deutsche Stimme.", "preview_text": "Hallo, dies ist ein Beispiel der neutralen deutschen Stimme."},
+    {"id": "German_News_Anchor", "name": "News Anchor", "language": "German", "gender": "male", "description": "Eine professionelle deutsche Nachrichtenstimme.", "preview_text": "Hallo, dies ist ein Beispiel der deutschen Nachrichtenstimme."},
+    {"id": "German_Podcast_Host", "name": "Podcast Host", "language": "German", "gender": "male", "description": "Eine warme deutsche Podcast-Stimme.", "preview_text": "Hallo, dies ist ein Beispiel der deutschen Podcast-Stimme."},
+    {"id": "German_Professional_Man", "name": "Professional Man", "language": "German", "gender": "male", "description": "Eine professionelle maennliche deutsche Stimme.", "preview_text": "Hallo, dies ist ein Beispiel der professionellen deutschen Stimme."},
+    {"id": "German_Warm_Narrator", "name": "Warm Narrator", "language": "German", "gender": "female", "description": "Eine warme weibliche deutsche Erzaehlerstimme.", "preview_text": "Hallo, dies ist ein Beispiel der warmen deutschen Erzaehlerstimme."},
+    {"id": "German_Warm_Speaker", "name": "Warm Speaker", "language": "German", "gender": "female", "description": "Eine warme weibliche deutsche Sprecherstimme.", "preview_text": "Hallo, dies ist ein Beispiel der warmen deutschen Sprecherstimme."},
+    # Chinese (Mandarin)
+    {"id": "Chinese (Mandarin)_HK_Flight_Attendant", "name": "HK Flight Attendant", "language": "Chinese", "gender": "female", "description": "A Hong Kong flight attendant style Mandarin voice.", "preview_text": "你好，这是香港空姐风格的中文语音示例。"},
+    {"id": "Chinese (Mandarin)_Lyrical_Voice", "name": "Lyrical Voice", "language": "Chinese", "gender": "female", "description": "A lyrical and expressive Mandarin voice.", "preview_text": "你好，这是抒情风格的中文语音示例。"},
+]
+
+
+def _get_languages() -> List[Dict[str, str]]:
+    """Liefert eine sortierte Liste aller verfuegbaren Sprachen als LanguageInfo."""
+    seen = set()
+    languages = []
+    for v in AVAILABLE_VOICES:
+        lang = v["language"]
+        if lang not in seen:
+            seen.add(lang)
+            info = LANGUAGE_INFO.get(lang, {"code": lang, "label": lang})
+            languages.append(info)
+    return sorted(languages, key=lambda x: x["label"])
+
+
+def _get_voices_by_language() -> Dict[str, List[Dict[str, str]]]:
+    """Gruppiert die Stimmen nach Sprache."""
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for v in AVAILABLE_VOICES:
+        grouped.setdefault(v["language"], []).append(v)
+    return grouped
+
+
+def _is_valid_voice_id(voice_id: Optional[str]) -> bool:
+    """Prueft, ob eine Voice-ID in der Liste existiert."""
+    if not voice_id:
+        return False
+    return any(v["id"] == voice_id for v in AVAILABLE_VOICES)
+
 
 class TTSService:
     """Kapselt den MiniMax T2A V2 API-Call."""
+
+    # ------------------------------------------------------------------
+    # Voice-Katalog
+    # ------------------------------------------------------------------
+    @staticmethod
+    def get_available_voices() -> Dict[str, Any]:
+        """Liefert die Liste aller verfuegbaren Stimmen.
+
+        Die Stimme-Liste ist aktuell statisch in voice_config.py hinterlegt
+        (MiniMax bietet keinen offiziellen listVoices-Endpoint).
+        In Zukunft koennte hier auch eine API-Abfrage ergaenzt werden.
+
+        Returns:
+            Dict mit voices, languages, default_voice_id, total_count,
+            by_language.
+        """
+        voices = []
+        for v in AVAILABLE_VOICES:
+            lang = v["language"]
+            info = LANGUAGE_INFO.get(lang, {"code": lang, "label": lang})
+            voices.append({
+                **v,
+                "language": info["code"],
+                "language_label": info["label"],
+            })
+        languages = _get_languages()
+        grouped = _get_voices_by_language()
+        default_id = settings.MINIMAX_TTS_VOICE_ID
+
+        # Falls die Default-Voice-ID nicht in der Konfig existiert,
+        # auf die erste deutsche oder englische Stimme zurueckfallen
+        if not _is_valid_voice_id(default_id):
+            logger.warning(
+                "MINIMAX_TTS_VOICE_ID '%s' ist nicht im Voice-Katalog. "
+                "Fallback auf 'German_Warm_Speaker'.",
+                default_id,
+            )
+            default_id = "German_Warm_Speaker"
+
+        return {
+            "voices": list(voices),
+            "languages": languages,
+            "default_voice_id": default_id,
+            "total_count": len(voices),
+            "by_language": {
+                lang: [{
+                    **v,
+                    "language": LANGUAGE_INFO.get(v["language"], {"code": v["language"], "label": v["language"]})["code"],
+                    "language_label": LANGUAGE_INFO.get(v["language"], {"code": v["language"], "label": v["language"]})["label"],
+                } for v in lst]
+                for lang, lst in grouped.items()
+            },
+        }
+
+    @staticmethod
+    def is_valid_voice_id(voice_id: str) -> bool:
+        """Prueft, ob eine Voice-ID existiert."""
+        return _is_valid_voice_id(voice_id)
 
     @staticmethod
     def _build_payload(

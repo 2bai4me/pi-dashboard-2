@@ -127,6 +127,38 @@
         }
       ],
       "pricing": {}
+    },
+    "kimi-coding": {
+      "api": "https://api.moonshot.ai/v1",
+      "baseUrl": "https://api.moonshot.ai/v1",
+      "displayName": "Kimi Coding (Moonshot)",
+      "apiKey": "",
+      "models": [
+        {
+          "id": "kimi-for-coding",
+          "name": "Kimi for Coding",
+          "contextWindow": 128000,
+          "reasoning": true
+        },
+        {
+          "id": "k2p7",
+          "name": "Kimi k2p7",
+          "contextWindow": 128000,
+          "reasoning": true
+        },
+        {
+          "id": "kimi-k2-thinking",
+          "name": "Kimi K2 Thinking",
+          "contextWindow": 128000,
+          "reasoning": true
+        }
+      ],
+      "pricing": {
+        "default": {
+          "input_per_1m": 0.0,
+          "output_per_1m": 0.0
+        }
+      }
     }
   }
 }

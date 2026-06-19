@@ -286,12 +286,21 @@ class TaskService:
                         bg_t.claimed_at = processing_started_at
                         auto_claim_triggered = True
                     if auto_claim_triggered:
-                        # assigned_role wird NICHT hier gesetzt. SOP-Engine verwaltet das.
+                        # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+                        # Wenn die SOP-Engine noch keine assigned_role gesetzt hat,
+                        # setzen wir hier explizit pi-coder, damit Auto-Claim-Records
+                        # (History + Transition) den echten Coding-Agent zeigen.
+                        if not bg_t.assigned_role and not bg_t.assigned_subagent:
+                            bg_t.assigned_role = "pi-coder"
                         take_pricing_snapshot(bg_t, db=bg_db)
+                        # Agent aus dem Task ableiten, damit die Auto-Claim-Records
+                        # den echten Coding-Agent zeigen (z.B. pi-coder), nicht "system".
+                        auto_claim_agent = TaskService._resolve_auto_claim_agent(bg_t) or "system"
                         TaskService._add_history(
-                            bg_db, bg_t, "auto_claim", agent="system",
+                            bg_db, bg_t, "auto_claim", agent=auto_claim_agent,
                             details={"reason": "post_sync_transition_auto_claim",
                                      "assigned_role": bg_t.assigned_role,
+                                     "assigned_subagent": bg_t.assigned_subagent,
                                      "delay_respected_s": delay_seconds,
                                      "triggered_via": new_status}
                         )
@@ -299,8 +308,9 @@ class TaskService:
                         TaskService._log_transition(
                             bg_db, bg_t,
                             from_status="todo", to_status="in_progress",
-                            agent="system", reason="auto_claim",
+                            agent=auto_claim_agent, reason="auto_claim",
                             details={"assigned_role": bg_t.assigned_role,
+                                     "assigned_subagent": bg_t.assigned_subagent,
                                      "trigger": "post_sync_transition_auto_claim"},
                             delay_s=0.0,
                             transition_at=processing_started_at,
@@ -313,9 +323,15 @@ class TaskService:
                         bg_t.emergency = True
                         bg_t.emergency_at = processing_started_at
                         take_pricing_snapshot(bg_t, db=bg_db)
+                        # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+                        # Watchdog-Agent aus dem Task ableiten, damit der
+                        # Watchdog-Record den zustaendigen Worker-Agent zeigt.
+                        watchdog_agent = TaskService._resolve_auto_claim_agent(bg_t) or "system"
                         TaskService._add_history(
-                            bg_db, bg_t, "watchdog_triggered", agent="system",
-                            details={"reason": "post_sync_priority>=90", "priority": bg_t.priority}
+                            bg_db, bg_t, "watchdog_triggered", agent=watchdog_agent,
+                            details={"reason": "post_sync_priority>=90", "priority": bg_t.priority,
+                                     "assigned_role": bg_t.assigned_role,
+                                     "assigned_subagent": bg_t.assigned_subagent}
                         )
 
                     # Transition-Record finalisieren
@@ -486,6 +502,16 @@ class TaskService:
         if session_id is None:
             from .session_helper import get_or_create_session_id
             session_id = get_or_create_session_id()
+        # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+        # Wenn der Caller "system" als Agent uebergibt, versuche den echten
+        # Coding-Agent aus dem Task zu lesen, damit die History/Transition-
+        # Eintraege den tatsaechlich zustaendigen Agent zeigen (z.B. "pi-coder")
+        # und nicht "system". Fallback auf "system" nur, wenn kein Agent
+        # ermittelt werden kann.
+        if agent == "system" and t is not None:
+            resolved = TaskService._resolve_auto_claim_agent(t)
+            if resolved:
+                agent = resolved
         h = TaskHistory(
             task_id=t.id, event=event, agent=agent, model=model,
             session_id=session_id,
@@ -496,6 +522,32 @@ class TaskService:
         db.add(h)
         db.flush()
         return h if return_entry else None
+
+    # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    @staticmethod
+    def _resolve_auto_claim_agent(t: Task) -> Optional[str]:
+        """Ermittelt den Coding-Agent fuer Auto-Claim-Records.
+
+        Reihenfolge der Aufloesung:
+          1) task.assigned_subagent (konkreter Sub-Agent, der den Task bearbeitet)
+          2) task.assigned_role     (Worker-Rolle aus der SOP-Engine, z.B. pi-coder)
+          3) Fallback: None (-> Caller verwendet "system")
+
+        Wird von _add_history, _log_transition und _schedule_background_delay
+        konsistent verwendet, damit die Performance-Tabelle den richtigen
+        Agent anzeigt (nicht immer "system").
+
+        Returns: agent-Name als String, oder None wenn nichts ermittelt werden kann.
+        """
+        if t is None:
+            return None
+        # assigned_subagent (konkreter Worker-Prozess) hat Vorrang
+        if getattr(t, "assigned_subagent", None):
+            return t.assigned_subagent
+        # assigned_role (Worker-Rolle aus SOP)
+        if getattr(t, "assigned_role", None):
+            return t.assigned_role
+        return None
 
     # === Transition-Logging (User-Direktive 15.06.2026) ===
     @staticmethod
@@ -519,6 +571,14 @@ class TaskService:
         - duration_ms (Verarbeitungsdauer)
         """
         from .session_helper import get_session_id
+        # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+        # Agent-Aufloesung: wenn der Caller "system" uebergibt, versuche
+        # den echten Coding-Agent aus dem Task zu lesen, damit der
+        # Performance-Tabellen-Eintrag den richtigen Agent anzeigt.
+        if agent == "system":
+            resolved = TaskService._resolve_auto_claim_agent(t)
+            if resolved:
+                agent = resolved
         tr = TaskTransition(
             task_id=t.id,
             project_id=t.project_id,
@@ -631,11 +691,20 @@ class TaskService:
             t.claimed_at = processing_started_at
             auto_claim_triggered = True
         if auto_claim_triggered:
-            # assigned_role wird NICHT hier gesetzt. SOP-Engine verwaltet das.
+            # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+            # Wenn die SOP-Engine noch keine assigned_role gesetzt hat,
+            # setzen wir hier explizit pi-coder, damit Auto-Claim-Records
+            # den echten Coding-Agent zeigen.
+            if not t.assigned_role and not t.assigned_subagent:
+                t.assigned_role = "pi-coder"
             take_pricing_snapshot(t, db=db)
-            TaskService._add_history(db, t, "auto_claim", agent="system",
+            # Auto-Claim-Agent aus dem Task ableiten (assigned_subagent/assigned_role),
+            # damit die Performance-Tabelle den echten Coding-Agent anzeigt.
+            auto_claim_agent = TaskService._resolve_auto_claim_agent(t) or "system"
+            TaskService._add_history(db, t, "auto_claim", agent=auto_claim_agent,
                                      details={"reason": "post_transition_auto_claim",
                                               "assigned_role": t.assigned_role,
+                                              "assigned_subagent": t.assigned_subagent,
                                               "delay_respected_s": delay_seconds,
                                               "triggered_via": new_status})
 
@@ -663,8 +732,13 @@ class TaskService:
             t.emergency = True
             t.emergency_at = processing_started_at
             take_pricing_snapshot(t, db=db)
-            TaskService._add_history(db, t, "watchdog_triggered", agent="system",
-                                     details={"reason": "post_transition_priority>=90"})
+            # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+            # Watchdog-Agent aus dem Task ableiten.
+            watchdog_agent = TaskService._resolve_auto_claim_agent(t) or "system"
+            TaskService._add_history(db, t, "watchdog_triggered", agent=watchdog_agent,
+                                     details={"reason": "post_transition_priority>=90",
+                                              "assigned_role": t.assigned_role,
+                                              "assigned_subagent": t.assigned_subagent})
         elif t.priority < 90 and t.emergency:
             t.emergency = False
 
@@ -694,10 +768,16 @@ class TaskService:
             tr.duration_ms = duration_ms
             # Falls der Status durch Auto-Claim doch geaendert wurde: zusaetzlicher Eintrag
             if t.status != new_status:
+                # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+                # Agent aus dem Task ableiten, damit der zusaetzliche Auto-Claim-Record
+                # den echten Coding-Agent enthaelt (nicht "system").
+                fallback_agent = TaskService._resolve_auto_claim_agent(t) or "system"
                 TaskService._log_transition(
                     db, t, from_status=new_status, to_status=t.status,
-                    agent="system", reason="auto_claim_after_delay",
-                    details={"parent_transition_id": tr.id},
+                    agent=fallback_agent, reason="auto_claim_after_delay",
+                    details={"parent_transition_id": tr.id,
+                             "assigned_subagent": t.assigned_subagent,
+                             "assigned_role": t.assigned_role},
                     delay_s=0.0,
                     transition_at=processing_started_at,
                     processing_at=processing_started_at,

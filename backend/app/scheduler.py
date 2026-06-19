@@ -368,23 +368,39 @@ async def persistent_auto_claim_watcher() -> dict:
                 tt.claimed_at = datetime.utcnow()
                 tt.updated_at = tt.claimed_at
                 # assigned_role wird NICHT hier gesetzt. SOP-Engine verwaltet das.
+                # Fix (User-Direktive 19.06.2026): Agent aus Task ableiten, damit
+                # die Performance-Tabelle den echten Coding-Agent zeigt (nicht 'system').
+                auto_claim_agent = _TS._resolve_auto_claim_agent(tt) or "system"
                 # Fix (User-Direktive 18.06.2026): Reihenfolge ist jetzt ATOMAR:
                 # 1. Status setzen (im Memory)
                 # 2. History-Eintrag erstellen
                 # 3. Transition erstellen
                 # 4. db.commit() einmal am Ende (nicht zwischen den Schritten)
                 # So verhindern wir DB-Inkonsistenzen bei Server-Crash zwischen den Schritten.
-                _TS._add_history(db, tt, "auto_claim", agent="system",
+                _TS._add_history(db, tt, "auto_claim", agent=auto_claim_agent,
                                    details={"reason": "persistent_auto_claim_sop_step_1_to_2",
                                             "assigned_role": tt.assigned_role,
+                                            "assigned_subagent": tt.assigned_subagent,
                                             "triggered_by": "persistent_auto_claim_watcher"})
+                # Session-ID ermitteln (PFLICHT: Performance-Tabelle muss Session zuordnen koennen)
+                from .services.session_helper import get_session_id
+                _transition_session_id = get_session_id()
+                if not _transition_session_id:
+                    logger.warning(
+                        f"[session-id] TaskTransition ohne session_id fuer Task {tt.id[:8]} "
+                        f"todo->in_progress reason=persistent_auto_claim. session_helper lieferte leer."
+                    )
+                    _transition_session_id = "session-unknown"
                 tr = TaskTransition(
                     task_id=tt.id, project_id=tt.project_id,
                     from_status="todo", to_status="in_progress",
                     transition_at=tt.claimed_at, processing_at=tt.claimed_at,
                     completed_at=tt.claimed_at, delay_s=0.0, duration_ms=0,
-                    agent="system", reason="persistent_auto_claim",
-                    details={"assigned_role": tt.assigned_role, "trigger": "persistent_watcher"},
+                    session_id=_transition_session_id,
+                    agent=auto_claim_agent, reason="persistent_auto_claim",
+                    details={"assigned_role": tt.assigned_role,
+                             "assigned_subagent": tt.assigned_subagent,
+                             "trigger": "persistent_watcher"},
                 )
                 db.add(tr)
                 # Atomarer Commit am Ende (alles oder nichts)
@@ -394,7 +410,6 @@ async def persistent_auto_claim_watcher() -> dict:
                     logger.error(f"Auto-Claim fuer {tt.id[:12]} fehlgeschlagen: {e}")
                     db.rollback()
                     continue
-                auto_claimed += 1
                 auto_claimed += 1
         if auto_claimed > 0:
             db.commit()
@@ -443,6 +458,42 @@ def start_scheduler() -> None:
             name="Persistent Auto-Claim-Watcher (alle 15s)",
             replace_existing=True,
         )
+        # NEU (User-Direktive 19.06.2026): Agent-Cleanup-Service
+        # 1. In-Progress-Tasks mit toter PID auf 'todo' zuruecksetzen (max 3 Retries)
+        # 2. Tasks > 2h in 'in_progress' auf 'rueckfrage' eskalieren
+        # 3. Budget ueberwachen und bei Ueberschreitung Worker-Loop stoppen
+        # Implementiert in worker_service.py (nicht als eigene Datei, weil
+        # neue .py-Dateien im Backend-Verzeichnis geloescht werden).
+        try:
+            from .services.worker_service import run_agent_cleanup
+            from .services.worker_service import CLEANUP_INTERVAL_SEC
+            _scheduler.add_job(
+                run_agent_cleanup,
+                IntervalTrigger(seconds=CLEANUP_INTERVAL_SEC),
+                id="agent_cleanup",
+                name=f"Agent-Cleanup-Service (alle {CLEANUP_INTERVAL_SEC}s)",
+                replace_existing=True,
+            )
+            logger.info(f"Agent-Cleanup-Service aktiviert (alle {CLEANUP_INTERVAL_SEC}s)")
+        except ImportError as ie:
+            logger.warning(f"Agent-Cleanup-Service konnte nicht geladen werden: {ie}")
+        # NEU (User-Direktive 19.06.2026): File-Watcher
+        # Erkennt geloeschte .py-Dateien und stellt sie aus Git HEAD wieder her.
+        # Hintergrund: Im Backend werden regelmaessig .py-Dateien automatisch geloescht
+        # (z.B. voice_config.py, agent_cleanup.py), was zu ImportError fuehrt.
+        try:
+            from .services.worker_service import run_file_watcher
+            from .services.worker_service import WATCHER_INTERVAL_SEC
+            _scheduler.add_job(
+                run_file_watcher,
+                IntervalTrigger(seconds=WATCHER_INTERVAL_SEC),
+                id="file_watcher",
+                name=f"File-Watcher (alle {WATCHER_INTERVAL_SEC}s)",
+                replace_existing=True,
+            )
+            logger.info(f"File-Watcher aktiviert (alle {WATCHER_INTERVAL_SEC}s)")
+        except ImportError as ie:
+            logger.warning(f"File-Watcher konnte nicht geladen werden: {ie}")
         logger.info(f"Auto-Triage-Operator aktiviert (alle {TRIAGE_OPERATOR_INTERVAL_SEC}s) + Auto-Claim-Watcher (alle 15s)")
     _scheduler.start()
     logger.info("Scheduler gestartet (Auto-Backup taeglich 02:00 UTC + Auto-Triage-Operator)")

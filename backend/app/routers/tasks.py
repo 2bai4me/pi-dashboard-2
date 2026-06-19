@@ -20,6 +20,15 @@ from ..services.task_service import TaskService
 from ..models.task import Task
 from ..utils.status_labels import display_status, translate_history_details
 from .. import events as _events
+import os
+
+_DEFAULT_DISPATCH_MODEL = os.environ.get(
+    "CODE_AGENT_MODEL", "minimax-m3"
+)
+_DEFAULT_DISPATCH_PROVIDER = os.environ.get(
+    "CODE_AGENT_PROVIDER", "minimax-direct"
+)
+_DEFAULT_DISPATCH_FULL = f"{_DEFAULT_DISPATCH_PROVIDER}/{os.environ.get('CODE_AGENT_MODEL', 'minimax-m3')}"
 
 router = APIRouter(prefix="/api/kanban/tasks", tags=["tasks"])
 
@@ -385,7 +394,7 @@ async def report_dispatch(
 ):
     result = TaskService.report_dispatch(
         db, task_id, role=req.role or "subagent", status=req.status or "dispatched",
-        model=req.model or "minimax/minimax-m3",
+        model=req.model or _DEFAULT_DISPATCH_FULL,
         agent_pid=req.agent_pid, reason=req.reason,
         tokens_in=req.tokens_in, tokens_out=req.tokens_out,
     )

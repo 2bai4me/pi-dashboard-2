@@ -37,6 +37,7 @@ const NAV_ITEMS = [
     { to: "/system", label: "System", icon: Server },
     { to: "/kanban", label: "Projekte", icon: LayoutDashboard },
     { to: "/sops", label: "SOP", icon: BookOpen },
+    { to: "/raci", label: "Config", icon: FileCode2 },
     { to: "/performance", label: "Performance", icon: Activity },
     { to: "/selfimprovment", label: "Selfimprovment", icon: FileCode2 },
   ]},
@@ -68,7 +69,6 @@ const NAV_ITEMS = [
     { to: "/api-keys", label: "API Keys", icon: Key },
     { to: "/openbrain", label: "OpenBrain", icon: Brain },
     { to: "/brain-graph", label: "Brain Graph", icon: Workflow },
-    { to: "/raci", label: "RACI & Workflow", icon: FileCode2 },
   ]},
 ];
 

@@ -13,6 +13,13 @@ class TaskTransitionRead(BaseModel):
     project_id: Optional[str] = None
     from_status: str
     to_status: str
+    # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    # Display-Namen fuer die UI (z.B. "todo" -> "GO", "in_progress" -> "In Progress").
+    # Das DB-Feld bleibt unveraendert (status-Label), aber die API liefert
+    # zusaetzlich die Anzeige-Namen, damit das Performance-Frontend die
+    # user-freundlichen Texte rendern kann.
+    from_status_display: Optional[str] = None
+    to_status_display: Optional[str] = None
     transition_at: datetime
     processing_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

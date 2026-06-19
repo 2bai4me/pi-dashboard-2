@@ -477,12 +477,18 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
   }
 
   const tasksByStatus = useMemo(() => {
+    // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    // DB-Status "todo" entspricht der Anzeige-Spalte "GO" (siehe status_labels.py).
+    // Wir mappen daher den DB-Key "todo" auf die Spalte "go".
     const m: Record<string, any[]> = {
       triage: [], go: [], in_progress: [], review: [],
       rueckfrage: [], warten: [], done: [],
     }
     for (const t of tasks) {
-      if (m[t.status]) m[t.status].push(t)
+      // Normalisierung: DB-Key -> Spalten-Key
+      let colKey = t.status
+      if (t.status === "todo") colKey = "go"
+      if (m[colKey]) m[colKey].push(t)
       // Fallback: alte 'block'-Tasks werden als 'rueckfrage' angezeigt
       else if (t.status === "block") m.rueckfrage.push(t)
     }
@@ -723,8 +729,11 @@ function TaskWaitingBadge({ taskId }: { taskId: string }) {
   }, [pending?.id, pending?.processing_at])
 
   if (!pending) return null
-  const from = pending.from_status || "—"
-  const to = pending.to_status || "—"
+  // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+  // Display-Namen vom Backend verwenden, damit der User "GO → In Progress"
+  // sieht statt "todo → in_progress".
+  const from = pending.from_status_display || pending.from_status || "—"
+  const to = pending.to_status_display || pending.to_status || "—"
   return (
     <div
       style={{
@@ -904,7 +913,11 @@ function TasksView({ projectId, onSelectTask, onUserInputClick }: {
 
   // Filter anwenden (nur auf Parents, Children werden unter Parent mit angezeigt)
   const filteredTasks = tasks.filter((t: any) => {
-    if (phaseFilter.size > 0 && !phaseFilter.has(t.status)) return false
+    // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    // DB-Status "todo" entspricht der Anzeige-Spalte "GO" (siehe status_labels.py).
+    // Daher normalisieren wir den Status-Key, damit der Filter korrekt funktioniert.
+    const normalizedStatus = t.status === "todo" ? "go" : t.status
+    if (phaseFilter.size > 0 && !phaseFilter.has(normalizedStatus)) return false
     if (agentFilter && t.assigned_role !== agentFilter) return false
     return true
   })

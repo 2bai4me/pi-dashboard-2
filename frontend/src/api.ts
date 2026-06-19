@@ -178,8 +178,11 @@ export const api = {
   wfAssign: (taskId: string, agent: string = "CIO", worker: string) =>
     request<any>("POST", `/api/workflow/tasks/${taskId}/assign`, { agent, worker }),
   // GO → IN_PROGRESS (Worker startet)
-  wfStart: (taskId: string, agent: string = "system") =>
-    request<any>("POST", `/api/workflow/tasks/${taskId}/start`, { agent }),
+  // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+  // agent ist optional — das Backend loest den Agent aus dem Task auf
+  // (assigned_subagent, assigned_role, Fallback "system").
+  wfStart: (taskId: string, agent?: string | null) =>
+    request<any>("POST", `/api/workflow/tasks/${taskId}/start`, { agent: agent ?? null }),
   // IN_PROGRESS → REVIEW (Worker done)
   wfSubmitReview: (taskId: string, agent: string = "system", note?: string) =>
     request<any>("POST", `/api/workflow/tasks/${taskId}/submit-review`, { agent, note }),
@@ -397,6 +400,7 @@ export const api = {
       return request<any>("GET", `/api/operators/${q}`)
     },
     listActive: () => request<any>("GET", "/api/operators/active"),
+    listActiveAgents: () => request<any>("GET", "/api/operators/agents/active"),
     get: (boardId: string) => request<any>("GET", `/api/operators/${boardId}`),
     start: (boardId: string) => request<any>("POST", `/api/operators/${boardId}/start`),
     stop: (boardId: string, reason: string = "user_request") =>

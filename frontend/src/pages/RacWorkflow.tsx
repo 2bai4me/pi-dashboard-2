@@ -217,7 +217,7 @@ export default function RacWorkflow() {
       <div className="page-header">
         <div className="workspace-header">
           <FileCode2 size={22} color="var(--color-hermes-accent-blue)" />
-          <h1>RACI &amp; Standard-Workflow</h1>
+          <h1>Config</h1>
         </div>
         <p>
           Verantwortlichkeiten &amp; Abläufe bei der Softwareentwicklung — aus dem

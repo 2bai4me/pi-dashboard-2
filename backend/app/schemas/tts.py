@@ -1,7 +1,7 @@
 """TTS Schemas — MiniMax Text-to-Audio V2."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -69,3 +69,46 @@ class TTSResponse(BaseModel):
     word_count: int = 0
     trace_id: Optional[str] = None
     status_msg: str = "success"
+
+
+# === Voice-Konfiguration Schemas (User-Direktive 19.06.2026) ===
+
+class VoiceInfoSchema(BaseModel):
+    """Beschreibung einer TTS-Stimme (siehe voice_config.py)."""
+
+    id: str = Field(..., description="Eindeutige Voice-ID fuer API-Calls.")
+    name: str = Field(..., description="Anzeigename der Stimme.")
+    language: str = Field(..., description="Sprachcode (z.B. 'de-DE').")
+    language_label: str = Field(..., description="Anzeigename der Sprache.")
+    gender: str = Field(..., description="Geschlecht: male/female/neutral/child.")
+    description: str = Field(..., description="Kurze Beschreibung der Stimme.")
+    preview_text: str = Field(..., description="Beispiel-Text zum Vorhoeren.")
+
+
+class LanguageInfo(BaseModel):
+    """Eine verfuegbare Sprache."""
+
+    code: str = Field(..., description="Sprachcode (z.B. 'de-DE').")
+    label: str = Field(..., description="Anzeigename der Sprache.")
+
+
+class VoiceListResponse(BaseModel):
+    """GET /api/tts/voices — Liste aller verfuegbaren Stimmen."""
+
+    voices: List[VoiceInfoSchema] = Field(
+        ...,
+        description="Liste aller verfuegbaren Stimmen.",
+    )
+    languages: List[LanguageInfo] = Field(
+        ...,
+        description="Verfuegbare Sprachen (gruppiert).",
+    )
+    default_voice_id: str = Field(
+        ...,
+        description="Default-Stimme aus .env (MINIMAX_TTS_VOICE_ID).",
+    )
+    total_count: int = Field(..., description="Anzahl Stimmen gesamt.")
+    by_language: dict = Field(
+        ...,
+        description="Stimmen gruppiert nach Sprache: { 'de-DE': [...], 'en-US': [...], ... }",
+    )

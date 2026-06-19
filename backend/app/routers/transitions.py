@@ -35,12 +35,18 @@ router = APIRouter(prefix="/api/performance", tags=["performance"])
 
 def _to_read(t: TaskTransition) -> TaskTransitionRead:
     """Konvertiert ORM-Objekt in Pydantic-Schema."""
+    # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+    # Display-Namen ableiten (z.B. "todo" -> "GO"), damit die UI die
+    # user-freundlichen Texte rendern kann.
+    from ..utils.status_labels import display_status
     return TaskTransitionRead(
         id=t.id,
         task_id=t.task_id,
         project_id=t.project_id,
         from_status=t.from_status,
         to_status=t.to_status,
+        from_status_display=display_status(t.from_status) if t.from_status else None,
+        to_status_display=display_status(t.to_status) if t.to_status else None,
         transition_at=t.transition_at,
         processing_at=t.processing_at,
         completed_at=t.completed_at,

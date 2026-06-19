@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { api } from "../api"
-import { Power, Pause, CheckCircle2, ChevronDown, BookOpen, X as XIcon } from "lucide-react"
+import { Power, Pause, CheckCircle2, ChevronDown, BookOpen, X as XIcon, Bot, Users, Server, Activity, Clock, Hash, X } from "lucide-react"
 import { useState, useRef, useEffect } from "react"
 
 // Mapping: User-Labels <-> Project.mode
@@ -20,6 +20,9 @@ export function BoardModeSwitcher({ project }: { project: { id: string; mode?: s
 
       {/* Mode-Dropdown (live / Warten / Abgeschlossen) */}
       <ModeDropdown project={project} />
+
+      {/* Aktive Agenten/Subagenten Badge + Dialog (Task 44c7229af57e) */}
+      <ActiveAgentsBadge />
     </div>
   )
 }
@@ -101,6 +104,204 @@ function ModeDropdown({ project }: { project: { id: string; mode?: string } }) {
           })}
         </div>
       )}
+    </div>
+  )
+}
+
+// ─────────────── Active Agents Badge + Dialog (Task 44c7229af57e) ───────────────
+function ActiveAgentsBadge() {
+  const [open, setOpen] = useState(false)
+  const { data, isLoading } = useQuery({
+    queryKey: ["active-agents"],
+    queryFn: () => api.operators.listActiveAgents(),
+    refetchInterval: 3000,
+    refetchOnWindowFocus: true,
+  })
+
+  const total = data?.total ?? 0
+
+  return (
+    <>
+      <button
+        className="mode-dropdown-trigger"
+        onClick={() => setOpen(true)}
+        title={`${total} aktive Agenten/Subagenten. Klick fuer Details.`}
+        style={{
+          color: total > 0 ? "var(--color-hermes-accent)" : "var(--color-hermes-text-secondary)",
+          fontWeight: 600,
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 4,
+        }}
+      >
+        <Bot size={11} />
+        <span>{total}</span>
+      </button>
+
+      {open && <ActiveAgentsDialog data={data} isLoading={isLoading} onClose={() => setOpen(false)} />}
+    </>
+  )
+}
+
+function ActiveAgentsDialog({ data, isLoading, onClose }: { data?: any; isLoading: boolean; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose()
+    }
+    function onClick(e: MouseEvent) {
+      if (dialogRef.current && !dialogRef.current.contains(e.target as Node)) onClose()
+    }
+    document.addEventListener("keydown", onKey)
+    document.addEventListener("mousedown", onClick)
+    return () => {
+      document.removeEventListener("keydown", onKey)
+      document.removeEventListener("mousedown", onClick)
+    }
+  }, [onClose])
+
+  const items: any[] = data?.items || []
+
+  const grouped: Record<string, any[]> = {
+    board_operator: [],
+    sub_agent: [],
+    worker_loop: [],
+    in_progress_task: [],
+    scheduler_job: [],
+  }
+  for (const item of items) {
+    if (grouped[item.type]) grouped[item.type].push(item)
+    else grouped[item.type] = [item]
+  }
+
+  const typeLabel: Record<string, string> = {
+    board_operator: "Board-Operatoren",
+    sub_agent: "Sub-Agenten (swarm-spawner)",
+    worker_loop: "Worker-Loop",
+    in_progress_task: "In-Progress-Tasks",
+    scheduler_job: "Scheduler-Jobs",
+  }
+
+  const typeIcon: Record<string, any> = {
+    board_operator: Activity,
+    sub_agent: Bot,
+    worker_loop: Server,
+    in_progress_task: Users,
+    scheduler_job: Clock,
+  }
+
+  return (
+    <div
+      className="modal-backdrop"
+      style={{ zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+    >
+      <div
+        ref={dialogRef}
+        className="modal"
+        style={{ maxWidth: 720, width: "90vw", maxHeight: "80vh", overflow: "auto", padding: 20 }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Bot size={18} color="var(--color-hermes-accent)" />
+            <h3 style={{ margin: 0, fontSize: 16 }}>Aktive Agenten & Subagenten</h3>
+          </div>
+          <button className="btn btn-sm" onClick={onClose} title="Schliessen">
+            <X size={14} />
+          </button>
+        </div>
+
+        {isLoading ? (
+          <div style={{ color: "var(--color-hermes-text-secondary)", textAlign: "center", padding: 20 }}>
+            Lade Agenten-Status...
+          </div>
+        ) : items.length === 0 ? (
+          <div style={{ color: "var(--color-hermes-text-secondary)", textAlign: "center", padding: 20 }}>
+            Keine aktiven Agenten/Subagenten.
+          </div>
+        ) : (
+          <div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+              {Object.entries(data?.by_type || {}).map(([key, count]: [string, any]) => (
+                <span key={key} className="badge badge-gray" style={{ fontSize: 11 }}>
+                  {typeLabel[key] || key}: {count}
+                </span>
+              ))}
+            </div>
+
+            {Object.entries(grouped).map(([type, groupItems]) => {
+              if (groupItems.length === 0) return null
+              const Icon = typeIcon[type] || Bot
+              return (
+                <div key={type} style={{ marginBottom: 16 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, fontWeight: 600, fontSize: 13 }}>
+                    <Icon size={14} color="var(--color-hermes-accent-blue)" />
+                    {typeLabel[type] || type}
+                    <span className="badge badge-blue" style={{ fontSize: 10 }}>{groupItems.length}</span>
+                  </div>
+                  <table className="data-table" style={{ fontSize: 11 }}>
+                    <thead>
+                      <tr>
+                        <th>Agent</th>
+                        <th>Session-ID</th>
+                        <th>Task-ID</th>
+                        <th>Status / Info</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {groupItems.map((item: any, idx: number) => (
+                        <tr key={idx}>
+                          <td>
+                            <div style={{ fontWeight: 500 }}>{item.agent}</div>
+                            {item.role && item.role !== item.agent && (
+                              <div style={{ fontSize: 9, color: "var(--color-hermes-text-secondary)" }}>{item.role}</div>
+                            )}
+                          </td>
+                          <td className="mono" style={{ fontSize: 10, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {item.session_id || "—"}
+                          </td>
+                          <td className="mono" style={{ fontSize: 10 }}>
+                            {item.task_id ? item.task_id.slice(0, 12) : "—"}
+                          </td>
+                          <td style={{ fontSize: 10 }}>
+                            <span className={`badge badge-${item.status === "running" ? "green" : "orange"}`} style={{ fontSize: 9 }}>
+                              {item.status}
+                            </span>
+                            {item.uptime_s !== undefined && (
+                              <div style={{ color: "var(--color-hermes-text-secondary)", marginTop: 2 }}>
+                                {Math.floor(item.uptime_s / 60)}m {item.uptime_s % 60}s
+                              </div>
+                            )}
+                            {item.last_heartbeat_age_s !== undefined && (
+                              <div style={{ color: "var(--color-hermes-text-secondary)", marginTop: 2 }}>
+                                Heartbeat: {item.last_heartbeat_age_s}s
+                              </div>
+                            )}
+                            {item.title && (
+                              <div style={{ color: "var(--color-hermes-text-secondary)", marginTop: 2, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {item.title}
+                              </div>
+                            )}
+                            {item.pid && (
+                              <div style={{ color: "var(--color-hermes-text-secondary)", marginTop: 2 }}>
+                                PID: {item.pid}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            })}
+
+            <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", textAlign: "right", marginTop: 8 }}>
+              Letzte Aktualisierung: {data?.checked_at ? new Date(data.checked_at).toLocaleString("de-DE") : "—"}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 logger = logging.getLogger("pi-dashboard-2.worker-loop")
 
@@ -18,6 +19,37 @@ WORKER_MAX_CONCURRENT = int(os.getenv("WORKER_MAX_CONCURRENT", "1"))
 
 _worker_task = None
 _worker_stop = False
+# === Budget-Override (gesetzt vom Agent-Cleanup-Service, User-Direktive 19.06.2026) ===
+# Wenn True: Worker-Loop ueberspringt ALLE Iterationen, bis das Flag zurueckgesetzt wird.
+# Zweck: Schutz gegen unkontrollierte Kosten. Wird vom agent_cleanup.py alle 60s
+# basierend auf TokenUsage-Aggregation gesetzt.
+_budget_exceeded: bool = False
+
+
+def is_budget_exceeded() -> bool:
+    """Gibt zurueck, ob das Budget-Limit aktuell ueberschritten ist.
+
+    Wird von worker_loop_iteration() geprueft, bevor ein Task geclaimt wird.
+    """
+    return _budget_exceeded
+
+
+def set_budget_exceeded(value: bool) -> None:
+    """Setzt das Budget-Override-Flag (vom Agent-Cleanup-Service aufgerufen).
+
+    Bei True: Worker-Loop pausiert bis zum naechsten Cleanup-Run.
+    Bei False: Worker-Loop laeuft normal weiter.
+    """
+    global _budget_exceeded
+    if value and not _budget_exceeded:
+        logger.warning(
+            "BUDGET EXCEEDED: Worker-Loop pausiert. "
+            "Wird durch Agent-Cleanup-Service zurueckgesetzt, "
+            "sobald Budget wieder unter Critical-Threshold."
+        )
+    elif not value and _budget_exceeded:
+        logger.info("Budget-Override aufgehoben: Worker-Loop laeuft wieder.")
+    _budget_exceeded = value
 
 
 async def worker_loop_iteration() -> dict:
@@ -27,6 +59,13 @@ async def worker_loop_iteration() -> dict:
 
     # Worker-Loop hat eine eigene Session-ID
     init_session_id(force_type="worker")
+
+    # === Budget-Guard (User-Direktive 19.06.2026) ===
+    # Wenn der Agent-Cleanup-Service das Flag gesetzt hat, KEINE neuen Tasks
+    # claimen. Bestehende laufende Tasks laufen aus, neue werden uebersprungen.
+    if is_budget_exceeded():
+        logger.debug("Worker-Loop: Budget-Override aktiv, ueberspringe Iteration")
+        return {"claimed": False, "skipped": True, "reason": "budget_exceeded"}
 
     # 1) Naechsten Task holen
     try:
@@ -64,6 +103,15 @@ async def _worker_loop_main() -> None:
                 logger.info(
                     f"Worker-Loop: Task {result.get('task_id', '?')[:12]} -> ok={result.get('ok')}"
                 )
+            elif result.get("skipped") and result.get("reason") == "budget_exceeded":
+                # Budget-Override aktiv — logge nur einmal pro 5 Minuten
+                if not hasattr(_worker_loop_main, "_last_budget_log") or \
+                   (time.time() - _worker_loop_main._last_budget_log) > 300:
+                    logger.info(
+                        "Worker-Loop pausiert (Budget-Override aktiv, "
+                        "wird durch Agent-Cleanup-Service ueberwacht)"
+                    )
+                    _worker_loop_main._last_budget_log = time.time()
         except Exception as e:
             logger.error(f"Worker-Loop-Iteration fehlgeschlagen: {e}")
         # Naechste Iteration

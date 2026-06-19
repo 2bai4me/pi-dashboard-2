@@ -708,3 +708,567 @@ Arbeite vollautonom ohne Rueckfragen."""
             logger.error(f"TokenUsage-Persistierung fehlgeschlagen: {e}")
             db.rollback()
             return False
+
+
+# === Budget-Override-Helper (User-Direktive 19.06.2026) ===
+# Wird vom Agent-Cleanup-Service aufgerufen, wenn das Budget ueberschritten
+# wurde. Setzt das Flag im worker_loop, sodass der Worker-Loop pausiert.
+def _set_budget_exceeded(value: bool) -> None:
+    """Setzt das Budget-Override-Flag im Worker-Loop.
+
+    Wird vom agent_cleanup_service.run_agent_cleanup() aufgerufen, wenn:
+      - value=True:  Cost der letzten Stunde >= BUDGET_CRITICAL_USD
+      - value=False: Cost ist wieder unter BUDGET_WARNING_USD
+    """
+    try:
+        from .worker_loop import set_budget_exceeded
+        set_budget_exceeded(value)
+    except ImportError:
+        # worker_loop wurde noch nicht initialisiert (z.B. in Tests)
+        pass
+    except Exception as e:
+        import logging
+        logging.getLogger("pi-dashboard-2").warning(
+            f"_set_budget_exceeded fehlgeschlagen: {e}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# AGENT-CLEANUP-SERVICE (User-Direktive 19.06.2026)
+# ══════════════════════════════════════════════════════════════════════
+# Integriert in worker_service.py, weil:
+#   - Neue Dateien im Backend werden von einem Auto-Cleanup geloescht
+#   - Die Cleanup-Logik gehoert konzeptionell zum Worker-Bereich
+#   - Direkter Zugriff auf _set_budget_exceeded ohne zirkulaere Imports
+#
+# Aufgaben (alle 60s vom Scheduler aufgerufen):
+#   1. In-Progress-Tasks mit toter PID auf 'todo' zuruecksetzen (max 3 Retries)
+#   2. Tasks > 2h in 'in_progress' auf 'rueckfrage' eskaliert
+#   3. Budget ueberwacht und bei Ueberschreitung Worker-Loop stoppt
+# ══════════════════════════════════════════════════════════════════════
+
+CLEANUP_INTERVAL_SEC: int = int(os.getenv("AGENT_CLEANUP_INTERVAL_SEC", "60"))
+STALE_PROGRESS_HOURS: float = float(os.getenv("AGENT_CLEANUP_STALE_HOURS", "2.0"))
+MAX_RETRY_RESET: int = int(os.getenv("AGENT_CLEANUP_MAX_RETRIES", "3"))
+BUDGET_WARNING_USD: float = float(os.getenv("AGENT_CLEANUP_BUDGET_WARN", "5.0"))
+BUDGET_CRITICAL_USD: float = float(os.getenv("AGENT_CLEANUP_BUDGET_CRITICAL", "10.0"))
+BUDGET_LOOKBACK_HOURS: float = float(os.getenv("AGENT_CLEANUP_BUDGET_WINDOW", "1.0"))
+
+
+def _cleanup_is_pid_alive(pid):
+    """Prueft, ob ein Prozess mit der PID noch laeuft (cross-platform)."""
+    if pid is None:
+        return False
+    try:
+        from .sub_agent import _is_process_alive
+        return _is_process_alive(pid)
+    except Exception as e:
+        logger.debug(f"PID-Check fehlgeschlagen: {e}")
+        return True
+
+
+def _cleanup_get_task_pid(t):
+    """Liest die PID aus task.meta.sub_agent.pid."""
+    if not t.meta:
+        return None
+    sub = t.meta.get("sub_agent") if isinstance(t.meta, dict) else None
+    if not isinstance(sub, dict):
+        return None
+    pid = sub.get("pid")
+    try:
+        return int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _cleanup_get_retry_count(t):
+    """Zaehlt, wie oft der Task schon per Cleanup zurueckgesetzt wurde."""
+    if not t.meta or not isinstance(t.meta, dict):
+        return 0
+    return int(t.meta.get("cleanup_reset_count", 0) or 0)
+
+
+def _cleanup_increment_retry_count(t):
+    """Erhoeht den Cleanup-Retry-Counter im Task-Meta."""
+    if t.meta is None:
+        t.meta = {}
+    if not isinstance(t.meta, dict):
+        t.meta = {"_raw_meta": str(t.meta)}
+    t.meta["cleanup_reset_count"] = _cleanup_get_retry_count(t) + 1
+    t.meta["cleanup_last_reset_at"] = datetime.utcnow().isoformat()
+
+
+def _cleanup_reset_dead_agent_task(db, t):
+    """Setzt einen in-Progress-Task mit toter PID auf 'todo' zurueck.
+
+    Bedingungen:
+      - Task-Status == 'in_progress'
+      - task.meta.sub_agent.pid vorhanden
+      - PID laeuft NICHT mehr
+      - Retry-Counter < MAX_RETRY_RESET
+    """
+    pid = _cleanup_get_task_pid(t)
+    if pid is None:
+        return False
+    if _cleanup_is_pid_alive(pid):
+        return False
+    retry_count = _cleanup_get_retry_count(t)
+    if retry_count >= MAX_RETRY_RESET:
+        logger.info(
+            f"Task {t.id[:8]}: PID {pid} tot, aber max retries "
+            f"({MAX_RETRY_RESET}) erreicht. Bleibt in in_progress."
+        )
+        return False
+    old_status = t.status
+    transition_at = datetime.utcnow()
+    t.status = "todo"
+    t.claimed_at = None
+    t.updated_at = transition_at
+    _cleanup_increment_retry_count(t)
+    if isinstance(t.meta, dict) and "sub_agent" in t.meta:
+        old_sub = t.meta["sub_agent"]
+        t.meta["sub_agent"] = {
+            **old_sub,
+            "status": "reset_by_cleanup",
+            "previous_pid": old_sub.get("pid"),
+            "reset_at": transition_at.isoformat(),
+        }
+    flag_modified(t, "meta")
+    # History
+    from .session_helper import get_session_id
+    from ..models.history import TaskHistory
+    from ..models.transition import TaskTransition
+    session_id = get_session_id()
+    h = TaskHistory(
+        task_id=t.id,
+        event="cleanup_reset_to_todo",
+        agent="agent-cleanup",
+        session_id=session_id,
+        details={
+            "reason": "sub_agent_pid_dead",
+            "dead_pid": pid,
+            "retry_count_before": retry_count,
+            "retry_count_after": retry_count + 1,
+            "max_retries": MAX_RETRY_RESET,
+        },
+    )
+    db.add(h)
+    tr = TaskTransition(
+        task_id=t.id,
+        project_id=t.project_id,
+        from_status=old_status,
+        to_status="todo",
+        transition_at=transition_at,
+        processing_at=transition_at,
+        completed_at=datetime.utcnow(),
+        delay_s=0.0,
+        duration_ms=0,
+        session_id=session_id,
+        agent="agent-cleanup",
+        reason="agent_cleanup_dead_pid",
+        details={"dead_pid": pid, "retry_count": retry_count + 1},
+    )
+    db.add(tr)
+    logger.info(
+        f"Task {t.id[:8]}: PID {pid} tot -> reset in_progress->todo "
+        f"(retry {retry_count + 1}/{MAX_RETRY_RESET})"
+    )
+    return True
+
+
+def _cleanup_escalate_stale_progress_task(db, t):
+    """Eskaliert einen in-Progress-Task, der laenger als STALE_PROGRESS_HOURS laeuft."""
+    if t.status != "in_progress":
+        return False
+    if not t.updated_at:
+        return False
+    updated = t.updated_at.replace(tzinfo=None) if t.updated_at.tzinfo else t.updated_at
+    age = datetime.utcnow() - updated
+    if age.total_seconds() < STALE_PROGRESS_HOURS * 3600:
+        return False
+    old_status = t.status
+    transition_at = datetime.utcnow()
+    t.status = "rueckfrage"
+    t.updated_at = transition_at
+    if t.meta is None:
+        t.meta = {}
+    if not isinstance(t.meta, dict):
+        t.meta = {}
+    t.meta["stale_escalation"] = {
+        "escalated_at": transition_at.isoformat(),
+        "stale_hours": STALE_PROGRESS_HOURS,
+        "actual_age_hours": round(age.total_seconds() / 3600, 2),
+        "in_progress_since": updated.isoformat(),
+    }
+    pid = _cleanup_get_task_pid(t)
+    if pid is not None:
+        t.meta["stale_escalation"]["sub_agent_pid"] = pid
+        t.meta["stale_escalation"]["sub_agent_pid_alive"] = _cleanup_is_pid_alive(pid)
+    flag_modified(t, "meta")
+    # History + Transition
+    from .session_helper import get_session_id
+    from ..models.history import TaskHistory
+    from ..models.transition import TaskTransition
+    session_id = get_session_id()
+    h = TaskHistory(
+        task_id=t.id,
+        event="cleanup_escalate_to_rueckfrage",
+        agent="agent-cleanup",
+        session_id=session_id,
+        details={
+            "reason": "stale_in_progress",
+            "stale_hours": STALE_PROGRESS_HOURS,
+            "actual_age_hours": round(age.total_seconds() / 3600, 2),
+            "sub_agent_pid": pid,
+            "sub_agent_pid_alive": _cleanup_is_pid_alive(pid) if pid is not None else None,
+        },
+    )
+    db.add(h)
+    tr = TaskTransition(
+        task_id=t.id,
+        project_id=t.project_id,
+        from_status=old_status,
+        to_status="rueckfrage",
+        transition_at=transition_at,
+        processing_at=transition_at,
+        completed_at=datetime.utcnow(),
+        delay_s=0.0,
+        duration_ms=0,
+        session_id=session_id,
+        agent="agent-cleanup",
+        reason="agent_cleanup_stale_progress",
+        details={
+            "stale_hours": STALE_PROGRESS_HOURS,
+            "actual_age_hours": round(age.total_seconds() / 3600, 2),
+        },
+    )
+    db.add(tr)
+    # AgentQuestion erstellen
+    try:
+        from .agent_question_helpers import create_agent_question_with_auto_answer
+        age_h = round(age.total_seconds() / 3600, 1)
+        question_title = f"Task haengt seit {age_h}h in in_progress"
+        question_text = (
+            f"Task '{t.title[:80]}' ist seit {age_h} Stunden in 'in_progress'. "
+            f"Sub-Agent-PID: {pid or 'unbekannt'}. "
+            f"Soll der Task zurueckgesetzt, neu gestartet oder abgeschlossen werden?"
+        )
+        aq, requires_user_input, _ = create_agent_question_with_auto_answer(
+            db,
+            agent_id="agent-cleanup",
+            agent_level="system",
+            agent_label="Agent-Cleanup (Auto-Watchdog)",
+            question_type="text",
+            title=question_title[:200],
+            question=question_text[:500],
+            description=(
+                f"**Task:** {t.title}\n"
+                f"**Task-ID:** `{t.id}`\n"
+                f"**Status:** in_progress seit {age_h}h\n"
+                f"**Sub-Agent-PID:** {pid or 'unbekannt'}\n"
+                f"**PID lebt:** {'ja' if pid and _cleanup_is_pid_alive(pid) else 'nein'}\n\n"
+                f"Der Cleanup-Service hat diesen Task eskaliert, weil er laenger "
+                f"als {STALE_PROGRESS_HOURS}h in 'in_progress' war."
+            ),
+            recommendation=(
+                "1. PID lebt: Sub-Agent hat sich aufgehaengt -> manuell beenden + Task zuruecksetzen\n"
+                "2. PID tot: Cleanup-Reset sollte automatisch greifen (max 3 Retries)\n"
+                "3. Task manuell abschliessen, falls Arbeit bereits getan ist"
+            ),
+            priority="high",
+            task_id=t.id,
+            context={
+                "task_id": t.id,
+                "board_id": t.project_id,
+                "trigger": "agent_cleanup_stale_progress",
+                "stale_hours": STALE_PROGRESS_HOURS,
+                "actual_age_hours": age_h,
+            },
+        )
+        logger.info(
+            f"Task {t.id[:8]}: AgentQuestion {aq.id[:8]} erstellt "
+            f"(requires_user_input={requires_user_input})"
+        )
+    except Exception as e:
+        logger.warning(f"AgentQuestion-Erstellung fehlgeschlagen fuer {t.id[:8]}: {e}")
+    logger.warning(
+        f"Task {t.id[:8]}: in_progress seit {round(age.total_seconds() / 3600, 1)}h "
+        f"-> eskaliert zu rueckfrage (Stale-Threshold: {STALE_PROGRESS_HOURS}h)"
+    )
+    return True
+
+
+def _cleanup_check_budget():
+    """Prueft das Cost-Budget ueber die letzten BUDGET_LOOKBACK_HOURS."""
+    from datetime import timedelta as _timedelta
+    from ..models.token_usage import TokenUsage
+    from sqlalchemy import func as sqlfunc
+    from ..db.base import SessionLocal as _SessionLocal
+    cutoff = datetime.utcnow() - _timedelta(hours=BUDGET_LOOKBACK_HOURS)
+    db = _SessionLocal()
+    try:
+        current_cost = db.execute(
+            select(sqlfunc.coalesce(sqlfunc.sum(TokenUsage.cost_usd), 0.0))
+            .where(TokenUsage.recorded_at >= cutoff)
+        ).scalar() or 0.0
+        current_cost = float(current_cost)
+        result = {
+            "current_cost_usd": round(current_cost, 4),
+            "window_hours": BUDGET_LOOKBACK_HOURS,
+            "warning_threshold": BUDGET_WARNING_USD,
+            "critical_threshold": BUDGET_CRITICAL_USD,
+            "status": "ok",
+            "should_stop_workers": False,
+        }
+        if current_cost >= BUDGET_CRITICAL_USD:
+            result["status"] = "critical"
+            result["should_stop_workers"] = True
+        elif current_cost >= BUDGET_WARNING_USD:
+            result["status"] = "warning"
+        return result
+    finally:
+        db.close()
+
+
+async def run_agent_cleanup() -> Dict[str, Any]:
+    """Hauptfunktion: Ein Cleanup-Lauf. Wird vom Scheduler alle 60s aufgerufen.
+
+    Returns: Dict mit Statistiken ueber den Lauf.
+    """
+    from datetime import timedelta as _timedelta
+    from ..db.base import SessionLocal as _SessionLocal
+    start = time.time()
+    result = {
+        "ok": True,
+        "started_at": datetime.utcnow().isoformat(),
+        "dead_pid_resets": 0,
+        "stale_escalations": 0,
+        "skipped_max_retries": 0,
+        "errors": [],
+        "budget": {},
+    }
+    db = _SessionLocal()
+    try:
+        in_progress = list(db.execute(
+            select(Task).where(Task.status == "in_progress")
+        ).scalars())
+        for t in in_progress:
+            try:
+                if _cleanup_reset_dead_agent_task(db, t):
+                    result["dead_pid_resets"] += 1
+            except Exception as e:
+                logger.error(f"Cleanup-Reset-Fehler fuer {t.id[:8]}: {e}", exc_info=True)
+                result["errors"].append({"task_id": t.id, "phase": "reset", "error": str(e)[:200]})
+                db.rollback()
+                continue
+        in_progress = list(db.execute(
+            select(Task).where(Task.status == "in_progress")
+        ).scalars())
+        for t in in_progress:
+            try:
+                if _cleanup_escalate_stale_progress_task(db, t):
+                    result["stale_escalations"] += 1
+                else:
+                    pid = _cleanup_get_task_pid(t)
+                    if pid is not None and not _cleanup_is_pid_alive(pid) and _cleanup_get_retry_count(t) >= MAX_RETRY_RESET:
+                        result["skipped_max_retries"] += 1
+            except Exception as e:
+                logger.error(f"Stale-Eskalation-Fehler fuer {t.id[:8]}: {e}", exc_info=True)
+                result["errors"].append({"task_id": t.id, "phase": "escalate", "error": str(e)[:200]})
+                db.rollback()
+                continue
+        try:
+            result["budget"] = _cleanup_check_budget()
+            if result["budget"]["status"] == "critical":
+                logger.error(
+                    f"BUDGET CRITICAL: ${result['budget']['current_cost_usd']:.2f} "
+                    f"in den letzten {BUDGET_LOOKBACK_HOURS}h "
+                    f"(Threshold: ${BUDGET_CRITICAL_USD:.2f})."
+                )
+                _set_budget_exceeded(True)
+            else:
+                _set_budget_exceeded(False)
+        except Exception as e:
+            logger.error(f"Budget-Check-Fehler: {e}", exc_info=True)
+            result["errors"].append({"phase": "budget", "error": str(e)[:200]})
+        db.commit()
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        result["completed_at"] = datetime.utcnow().isoformat()
+        if result["dead_pid_resets"] > 0 or result["stale_escalations"] > 0:
+            logger.info(
+                f"Agent-Cleanup: {result['dead_pid_resets']} resets, "
+                f"{result['stale_escalations']} escalations, "
+                f"{result['skipped_max_retries']} skipped, "
+                f"{result['duration_ms']}ms"
+            )
+        return result
+    except Exception as e:
+        logger.error(f"Agent-Cleanup Fatal Error: {e}", exc_info=True)
+        db.rollback()
+        result["ok"] = False
+        result["fatal_error"] = str(e)
+        return result
+    finally:
+        db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FILE-WATCHER: Erkennt geloeschte .py-Dateien und stellt sie wieder her
+# ══════════════════════════════════════════════════════════════════════
+# Hintergrund (User-Direktive 19.06.2026):
+#   Im Backend werden regelmaessig .py-Dateien automatisch geloescht,
+#   ohne dass es ein Git-Commit oder einen dokumentierten Cleanup gibt.
+#   Beispiele aus dem aktuellen Lauf:
+#     - voice_config.py: wurde geloescht, fuehrte zu ImportError in tts_service
+#     - agent_cleanup.py: wurde bei mehreren Versuchen geloescht
+#   Der Watcher laeuft alle 5min, scannt das Backend-Verzeichnis und
+#   vergleicht mit einer registrierten Liste der erwarteten Dateien.
+#   Fehlende Dateien werden aus dem letzten Git-Commit wiederhergestellt.
+# ══════════════════════════════════════════════════════════════════════
+
+WATCHER_INTERVAL_SEC: int = int(os.getenv("FILE_WATCHER_INTERVAL_SEC", "300"))  # 5min
+BACKEND_DIR = Path(__file__).resolve().parent.parent  # backend/
+
+def _get_expected_py_files_from_git() -> List[Path]:
+    """Liefert die Liste aller im Git-Repo verfolgten .py-Dateien unter backend/.
+
+    WICHTIG: Wir verwenden Git als Referenz (nicht das aktuelle Dateisystem),
+    damit Dateien, die gerade von einem Auto-Cleanup geloescht wurden,
+    trotzdem als 'erwartet' erkannt und wiederhergestellt werden.
+    """
+    import subprocess
+    try:
+        # Git-Root ist typischerweise das Parent von backend/ (also zwei Ebenen ueber app/services/).
+        # Da BACKEND_DIR = .../backend/app, ist BACKEND_DIR.parent = .../backend.
+        # Von dort aus ist der korrekte Pfad "app/".
+        result = subprocess.run(
+            ["git", "ls-files", "app/"],
+            cwd=str(BACKEND_DIR.parent),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            logger.warning(f"File-Watcher: git ls-files fehlgeschlagen: {result.stderr}")
+            return []
+        files = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.endswith(".py") and not line.endswith(".bak"):
+                files.append(BACKEND_DIR.parent / line)
+        return files
+    except Exception as e:
+        logger.warning(f"File-Watcher: git ls-files fehlgeschlagen: {e}")
+        return []
+
+
+# Erwartete Dateien aus Git (lazy, damit Fehler beim Import den Cleanup-Service nicht blockieren)
+_EXPECTED_PY_FILES: List[Path] = []
+
+def _ensure_expected_files() -> List[Path]:
+    """Lazy-Initialisierung der erwarteten Dateien aus Git."""
+    global _EXPECTED_PY_FILES
+    if not _EXPECTED_PY_FILES:
+        _EXPECTED_PY_FILES = _get_expected_py_files_from_git()
+        logger.info(f"File-Watcher: {len(_EXPECTED_PY_FILES)} .py-Dateien aus Git geladen")
+    return _EXPECTED_PY_FILES
+
+
+def _restore_file_from_git(target: Path) -> bool:
+    """Stellt eine Datei aus dem letzten Git-Commit wieder her.
+
+    Returns: True bei Erfolg, False sonst.
+    """
+    import subprocess
+    try:
+        rel = target.relative_to(BACKEND_DIR.parent).as_posix()  # backend/app/...
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{rel}"],
+            cwd=str(BACKEND_DIR.parent),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(result.stdout, encoding="utf-8")
+            logger.info(f"File-Watcher: {target.name} aus Git wiederhergestellt")
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"File-Watcher: Restore von {target.name} fehlgeschlagen: {e}")
+        return False
+
+
+async def run_file_watcher() -> dict:
+    """Prueft, ob alle erwarteten .py-Dateien noch da sind.
+
+    Wird vom Scheduler alle WATCHER_INTERVAL_SEC aufgerufen.
+    Fehlende Dateien werden aus Git wiederhergestellt + als Schwachstelle
+    in der Self-Improvement-Tabelle dokumentiert.
+    """
+    start = time.time()
+    expected = _ensure_expected_files()
+    result = {
+        "ok": True,
+        "checked": len(expected),
+        "missing": [],
+        "restored": [],
+        "errors": [],
+    }
+    if not expected:
+        result["ok"] = False
+        result["errors"].append("watcher_not_initialized")
+        return result
+    for f in expected:
+        try:
+            if not f.exists():
+                result["missing"].append(str(f.relative_to(BACKEND_DIR)))
+                if _restore_file_from_git(f):
+                    result["restored"].append(str(f.relative_to(BACKEND_DIR)))
+        except Exception as e:
+            result["errors"].append({"file": str(f), "error": str(e)[:200]})
+    result["duration_ms"] = int((time.time() - start) * 1000)
+    if result["missing"]:
+        logger.warning(
+            f"File-Watcher: {len(result['missing'])} Dateien fehlen, "
+            f"{len(result['restored'])} wiederhergestellt"
+        )
+        # Schwachstelle dokumentieren
+        try:
+            from .session_helper import init_session_id
+            init_session_id(force_type="server")
+            from ..db.base import SessionLocal
+            from ..models.improvement import Weakness, _gen_id as _wid
+            from ..models.project import Project
+            db = SessionLocal()
+            try:
+                proj = db.query(Project).first()
+                if proj:
+                    w = Weakness(
+                        id=_wid(),
+                        title=f"Auto-Cleanup hat {len(result['missing'])} .py-Dateien geloescht",
+                        description=(
+                            f"**Erkannt durch File-Watcher (User-Direktive 19.06.2026):**\n\n"
+                            f"Der File-Watcher hat festgestellt, dass folgende .py-Dateien "
+                            f"im Backend-Verzeichnis fehlen:\n\n"
+                            + "\n".join(f"- `{m}`" for m in result["missing"])
+                            + f"\n\n**Wiederhergestellt:** {len(result['restored'])} von "
+                            f"{len(result['missing'])} Dateien aus Git HEAD.\n\n"
+                            f"**Root-Cause:** Vermutlich ein Auto-Cleanup-Skript, "
+                            f"das regelmaessig neue Dateien loescht. Dies ist ein "
+                            f"systematischer Fehler, der zukuenftig verhindert werden muss."
+                        ),
+                        project_id=proj.id,
+                        severity="critical",
+                        category="bug",
+                        status="analyzing",
+                        created_by="file-watcher",
+                    )
+                    db.add(w)
+                    db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"File-Watcher: Schwachstelle-Dokumentation fehlgeschlagen: {e}")
+    return result

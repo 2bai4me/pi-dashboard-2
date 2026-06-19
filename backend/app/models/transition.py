@@ -78,7 +78,9 @@ class TaskTransition(Base):
 
     # === Kontextuelle Felder ===
     # (Session-ID, Agent, Reason, Details)
-    session_id: Mapped[Optional[str]] = mapped_column(String(64))
+    # session_id: index=True, weil Performance-Queries haeufig nach Session filtern
+    # (Migration m4n5o6p7q8r9_session_id erstellt den Index auf der DB-Seite)
+    session_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     agent: Mapped[Optional[str]] = mapped_column(String(64))
     reason: Mapped[Optional[str]] = mapped_column(String(128))
     details: Mapped[Optional[dict]] = mapped_column(JSONType, default=dict)

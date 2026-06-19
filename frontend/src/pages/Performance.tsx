@@ -10,6 +10,11 @@ type Transition = {
   project_id?: string | null
   from_status: string
   to_status: string
+  // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+  // Display-Namen vom Backend (z.B. "GO" statt "todo", "In Progress" statt
+  // "in_progress"). Werden bevorzugt in der UI angezeigt.
+  from_status_display?: string | null
+  to_status_display?: string | null
   transition_at: string
   processing_at?: string | null
   completed_at?: string | null
@@ -33,7 +38,20 @@ const TRANSITION_COLORS: Record<string, string> = {
   "done": "var(--color-hermes-accent)",
 }
 
-function StatusBadge({ status, color }: { status: string; color?: string }) {
+function StatusBadge({
+  status,
+  display,
+  color,
+}: {
+  status: string
+  display?: string | null
+  color?: string
+}) {
+  // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+  // Wenn ein Display-Name vorhanden ist (z.B. "GO"), wird dieser bevorzugt
+  // angezeigt. Andernfalls Fallback auf den DB-Key (z.B. "todo").
+  const label = display || status || "∅"
+  // Farb-Lookup muss auf den DB-Key basieren, damit die Farbpalette stabil bleibt
   const bg = color || TRANSITION_COLORS[status] || "var(--color-hermes-text-secondary)"
   return (
     <span
@@ -48,8 +66,9 @@ function StatusBadge({ status, color }: { status: string; color?: string }) {
         border: `1px solid ${bg}`,
         whiteSpace: "nowrap",
       }}
+      title={display && display !== status ? `${display} (${status})` : status || ""}
     >
-      {status || "∅"}
+      {label}
     </span>
   )
 }
@@ -121,7 +140,12 @@ export default function Performance() {
     for (const t of transitions) {
       const ag = t.agent || "unknown"
       byAgent[ag] = (byAgent[ag] || 0) + 1
-      const key = `${t.from_status}→${t.to_status}`
+      // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+      // Key mit Display-Namen bilden, damit die Top-Transitions-Liste
+      // "GO → In Progress" statt "todo → in_progress" anzeigt.
+      const fromLabel = t.from_status_display || t.from_status || "(initial)"
+      const toLabel = t.to_status_display || t.to_status || "?"
+      const key = `${fromLabel}→${toLabel}`
       byTransition[key] = (byTransition[key] || 0) + 1
     }
     return {
@@ -478,10 +502,10 @@ export default function Performance() {
                       {taskTitleById[t.task_id] || <span style={{ color: "var(--color-hermes-text-secondary)", fontStyle: "italic" }}>(unbekannt)</span>}
                     </td>
                     <td>
-                      <StatusBadge status={t.from_status} />
+                      <StatusBadge status={t.from_status} display={t.from_status_display} />
                     </td>
                     <td>
-                      <StatusBadge status={t.to_status} />
+                      <StatusBadge status={t.to_status} display={t.to_status_display} />
                     </td>
                     <td>
                       {t.agent ? (
@@ -607,9 +631,9 @@ function PerformanceDetailSidebar({
       <div className="detail-panel-body">
         {/* Titel: Transition-Name = "Von → Nach" */}
         <h2 style={{ fontSize: 16, fontWeight: 600, margin: "0 0 8px" }}>
-          <StatusBadge status={t.from_status || "(initial)"} />
+          <StatusBadge status={t.from_status || "(initial)"} display={t.from_status_display} />
           <span style={{ margin: "0 6px", color: "var(--color-hermes-text-secondary)" }}>→</span>
-          <StatusBadge status={t.to_status} />
+          <StatusBadge status={t.to_status} display={t.to_status_display} />
         </h2>
 
         {/* Badges */}
@@ -694,8 +718,15 @@ function TaskKpiCards({ transitions, taskTitle }: { transitions: Transition[]; t
   // Erste und letzte Transition (Status-Pfad)
   const fromStatuses = Array.from(new Set(transitions.map((t) => t.from_status).filter(Boolean)))
   const toStatuses = Array.from(new Set(transitions.map((t) => t.to_status).filter(Boolean)))
+  // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
+  // Pfad mit Display-Namen rendern, damit der User "GO → In Progress"
+  // sieht statt "todo → in_progress".
+  const firstTrans = sorted[0]
+  const lastTrans = sorted[sorted.length - 1]
+  const firstFrom = firstTrans?.from_status_display || firstTrans?.from_status || fromStatuses[0] || "?"
+  const lastTo = lastTrans?.to_status_display || lastTrans?.to_status || toStatuses[toStatuses.length - 1] || "?"
   const path = fromStatuses.length > 0 || toStatuses.length > 0
-    ? `${fromStatuses[0] || "?"} → ${toStatuses[toStatuses.length - 1] || "?"}`
+    ? `${firstFrom} → ${lastTo}`
     : "—"
 
   return (
