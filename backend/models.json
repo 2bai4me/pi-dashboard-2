@@ -132,7 +132,6 @@
       "api": "https://api.moonshot.ai/v1",
       "baseUrl": "https://api.moonshot.ai/v1",
       "displayName": "Kimi Coding (Moonshot)",
-      "apiKey": "",
       "models": [
         {
           "id": "kimi-for-coding",

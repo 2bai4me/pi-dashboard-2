@@ -11,10 +11,12 @@ from typing import Optional, List, Dict, Any
 
 import httpx
 
+from .provider_resolver import resolve_model_config
+
 logger = logging.getLogger("pi-dashboard-2.llm")
 
 
-# === Konfiguration (aus ~/.pi/agent/models.json) ===
+# === Konfiguration (nur noch aus Umgebungsvariablen / .env) ===
 DEFAULT_PROVIDER = "minimax-direct"
 DEFAULT_MODEL = "minimax-m3"
 DEFAULT_BASE_URL = "https://api.minimax.io/v1"
@@ -22,24 +24,9 @@ DEFAULT_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 
 
 def _load_api_credentials() -> tuple[str, str]:
-    """Laedt API-Key und baseUrl aus models.json oder Umgebungsvariablen."""
-    api_key = DEFAULT_API_KEY
-    base_url = DEFAULT_BASE_URL
-    # Versuche aus ~/.pi/agent/models.json zu laden
-    try:
-        import json
-        from pathlib import Path
-        models_file = Path.home() / ".pi" / "agent" / "models.json"
-        if models_file.exists():
-            with open(models_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            prov = data.get("providers", {}).get(DEFAULT_PROVIDER, {})
-            if prov.get("apiKey"):
-                api_key = prov["apiKey"]
-            if prov.get("baseUrl"):
-                base_url = prov["baseUrl"]
-    except Exception as e:
-        logger.warning(f"Konnte models.json nicht laden: {e}")
+    """Laedt API-Key und baseUrl ausschliesslich aus Umgebungsvariablen."""
+    api_key = os.getenv("MINIMAX_API_KEY", DEFAULT_API_KEY)
+    base_url = os.getenv("MINIMAX_BASE_URL", DEFAULT_BASE_URL)
     return api_key, base_url
 
 
@@ -50,6 +37,7 @@ async def chat_completion(
     max_tokens: int = 2000,
     response_format: Optional[Dict[str, str]] = None,
     timeout_sec: float = 60.0,
+    role: Optional[str] = None,
 ) -> Dict[str, Any]:
     """OpenAI-kompatibler Chat-Completion-Aufruf.
 
@@ -59,6 +47,10 @@ async def chat_completion(
       - "ollama/<model>" -> lokales Ollama (kein API-Key noetig)
       - alles andere      -> OpenAI-kompatibler Endpoint (MiniMax/OpenRouter/...)
 
+    Args:
+        role: Optional. Wenn gesetzt, wird Provider/Modell/API-Key/Base-URL
+              aus dem aktiven Provider-Profil aufgelöst (mit Fallback auf ENV).
+
     Returns: {
         "content": str,
         "model": str,
@@ -66,10 +58,30 @@ async def chat_completion(
         "usage": {"tokens_in": int, "tokens_out": int}
     }
     """
-    # === Provider-Resolution ===
-    if model.startswith("ollama/"):
-        return await _chat_ollama(messages, model, temperature, max_tokens, timeout_sec)
-    return await _chat_openai_compatible(messages, model, temperature, max_tokens, response_format, timeout_sec)
+    # === Provider-Resolution via Role (Multi-Provider Phase 2) ===
+    resolved_api_key: Optional[str] = None
+    resolved_base_url: Optional[str] = None
+    resolved_model = model
+    resolved_provider: Optional[str] = None
+
+    if role:
+        config = resolve_model_config(role)
+        resolved_api_key = config.get("api_key") or None
+        resolved_base_url = config.get("base_url") or None
+        resolved_model = config.get("model", model)
+        resolved_provider = config.get("provider")
+
+    if resolved_model.startswith("ollama/"):
+        return await _chat_ollama(
+            messages, resolved_model, temperature, max_tokens, timeout_sec,
+            base_url=resolved_base_url,
+        )
+    return await _chat_openai_compatible(
+        messages, resolved_model, temperature, max_tokens, response_format, timeout_sec,
+        api_key=resolved_api_key,
+        base_url=resolved_base_url,
+        provider=resolved_provider,
+    )
 
 
 async def _chat_ollama(
@@ -78,6 +90,7 @@ async def _chat_ollama(
     temperature: float,
     max_tokens: int,
     timeout_sec: float,
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Aufruf an lokales Ollama (http://localhost:11434). Kein API-Key noetig.
 
@@ -88,7 +101,7 @@ async def _chat_ollama(
     """
     # model ist z.B. "ollama/qwen3:4b" -> wir nehmen "qwen3:4b"
     ollama_model = model.split("/", 1)[1] if "/" in model else model
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     url = f"{base_url.rstrip('/')}/api/chat"
 
     payload: Dict[str, Any] = {
@@ -137,6 +150,9 @@ async def _chat_openai_compatible(
     max_tokens: int,
     response_format: Optional[Dict[str, str]],
     timeout_sec: float,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """OpenAI-kompatibler Chat-Completion-Aufruf (MiniMax/OpenRouter/Anthropic/...).
 
@@ -148,16 +164,29 @@ async def _chat_openai_compatible(
     }
     """
     # MiniMax hat keinen '/' im model_id, OpenRouter schon. Beide nutzen OpenAI-Format.
-    api_key, base_url = _load_api_credentials()
+    env_api_key, env_base_url = _load_api_credentials()
+    api_key = api_key or env_api_key
+    base_url = base_url or env_base_url
     if not api_key:
-        raise RuntimeError("MINIMAX_API_KEY nicht gesetzt und models.json enthaelt keinen Key")
+        raise RuntimeError("API-Key nicht gesetzt")
 
     # Model-Name-Normalisierung: MiniMax API erwartet 'MiniMax-M3' (CamelCase),
     # wir akzeptieren aber auch 'minimax-m3' (klein) als User-Input.
     api_model = _normalize_model_name(model, base_url)
 
-    # Provider-Name ableiten
-    provider = "minimax" if "minimax" in base_url.lower() else "openrouter"
+    # Provider-Name ableiten (explizit übergeben hat Vorrang)
+    if provider:
+        pass
+    elif "minimax" in base_url.lower():
+        provider = "minimax"
+    elif "openrouter" in base_url.lower():
+        provider = "openrouter"
+    elif "moonshot" in base_url.lower() or "kimi" in base_url.lower():
+        provider = "kimi"
+    elif "openai" in base_url.lower():
+        provider = "openai"
+    else:
+        provider = "openai-compatible"
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {

@@ -22,6 +22,14 @@ from .agent_question import (
     AgentQuestionRead, AgentQuestionDetail, AgentQuestionList,
     AgentQuestionAttachmentRead,
 )
+from .sop_action import (
+    ALLOWED_ACTIONS,
+    ACTION_PARAM_SCHEMAS,
+    SetStatusActionParams,
+    AskUserActionParams,
+    LLMCallActionParams,
+    SpawnSopActionParams,
+)
 
 __all__ = [
     # Project
@@ -43,4 +51,11 @@ __all__ = [
     "AgentQuestionCreate", "AgentQuestionAnswer",
     "AgentQuestionRead", "AgentQuestionDetail", "AgentQuestionList",
     "AgentQuestionAttachmentRead",
+    # SOP-Actions
+    "ALLOWED_ACTIONS",
+    "ACTION_PARAM_SCHEMAS",
+    "SetStatusActionParams",
+    "AskUserActionParams",
+    "LLMCallActionParams",
+    "SpawnSopActionParams",
 ]

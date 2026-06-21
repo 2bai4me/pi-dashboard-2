@@ -58,22 +58,10 @@ export const api = {
       if (overrideModel) params.set("override_model", overrideModel);
       return request<any>("POST", `/api/subagents/build?${params.toString()}`);
     },
-    updateModel: (roleName: string, model: string, provider?: string) =>
-      request<any>("PATCH", `/api/subagents/${roleName}/model`, { model, provider }),
-  },
-
-  // === TaskDrafts (User-Direktive 18.06.2026) - Iterativer Task-Refinement-Workflow ===
-  taskDrafts: {
-    list: (status?: string) => request<any>("GET", `/api/task-drafts${status ? `?status=${status}` : ""}`),
-    get: (id: string) => request<any>("GET", `/api/task-drafts/${id}`),
-    create: (userInput: string, projectId?: string) =>
-      request<any>("POST", "/api/task-drafts", { user_input: userInput, project_id: projectId }),
-    refine: (id: string, userFeedback: string) =>
-      request<any>("POST", `/api/task-drafts/${id}/refine`, { user_feedback: userFeedback }),
-    publish: (id: string) =>
-      request<any>("POST", `/api/task-drafts/${id}/publish`),
-    abandon: (id: string) =>
-      request<any>("DELETE", `/api/task-drafts/${id}`),
+    updateModel: (roleName: string, model: string, provider?: string, apiKeyId?: string | null) =>
+      request<any>("PATCH", `/api/subagents/${roleName}/model`, { model, provider, api_key_id: apiKeyId }),
+    updatePrompt: (roleName: string, systemPrompt: string) =>
+      request<any>("PATCH", `/api/subagents/${roleName}/prompt`, { system_prompt: systemPrompt }),
   },
 
   // === CIO-Triage (Schritt 0, User-Direktive 16.06.2026) ===
@@ -418,4 +406,13 @@ export const api = {
     history: (limit: number = 20) =>
       request<any>("GET", `/api/test-runner/history?limit=${limit}`),
   },
+
+  // ─────────────── Provider Credentials (API-Keys) ───────────────
+  listProviderCredentials: () => request<any>("GET", "/api/provider-credentials"),
+  getProviderCredential: (id: string) => request<any>("GET", `/api/provider-credentials/${id}`),
+  createProviderCredential: (data: any) => request<any>("POST", "/api/provider-credentials", data),
+  updateProviderCredential: (id: string, data: any) => request<any>("PUT", `/api/provider-credentials/${id}`, data),
+  deleteProviderCredential: (id: string) => request<any>("DELETE", `/api/provider-credentials/${id}`),
+  refreshProviderCredentialPricing: (id: string) =>
+    request<any>("POST", `/api/provider-credentials/${id}/refresh-pricing`),
 }

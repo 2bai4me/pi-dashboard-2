@@ -18,6 +18,53 @@ import "bpmn-js/dist/assets/diagram-js.css"
 import "bpmn-js/dist/assets/bpmn-js.css"
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css"
 
+// ─────────────── Dynamische Agent-Auswahl aus SubAgent-Konfigurationen ───────────────
+interface AgentOption {
+  name: string
+  role_type?: string
+  is_subagent: boolean
+  emoji?: string
+}
+
+function AgentSelect({
+  value,
+  onChange,
+  style,
+}: {
+  value: string
+  onChange: (agent: string) => void
+  style?: React.CSSProperties
+}) {
+  const { data } = useQuery({
+    queryKey: ["subagent-configs"],
+    queryFn: () => api.subagents.listConfigs(),
+    staleTime: 60_000,
+  })
+  const configs: AgentOption[] = (data as any) || []
+  // Immer bekannte System-Optionen anbieten, auch wenn Configs noch laden
+  const systemOptions = ["system", "user"]
+  const unknownButSelected = value && !configs.some((c) => c.name === value) && !systemOptions.includes(value)
+
+  return (
+    <select
+      className="select"
+      value={value || ""}
+      onChange={(e) => onChange(e.target.value)}
+      style={style}
+    >
+      {configs.map((c) => (
+        <option key={c.name} value={c.name}>
+          {c.emoji || "🤖"} {c.name} {c.is_subagent ? "(Sub-Agent)" : "(Org)"}
+        </option>
+      ))}
+      {systemOptions.map((s) => (
+        <option key={s} value={s}>{s}</option>
+      ))}
+      {unknownButSelected && <option value={value}>{value} (unbekannt)</option>}
+    </select>
+  )
+}
+
 // Markdown-Styles fuer KI-Support-Designer Vorschau
 const mdComponents = {
   h1: ({ children }: any) => <h1 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 8px", color: "var(--color-hermes-accent-blue)" }}>{children}</h1>,
@@ -2334,16 +2381,7 @@ function StepEditor({ step, index, onChange, onRemove }: any) {
           <option>Wait</option>
           <option>Notification</option>
         </select>
-        <select className="select" value={step.agent} onChange={(e) => onChange({ ...step, agent: e.target.value })} style={{ width: 120 }}>
-          <option>CIO</option>
-          <option>pi-coder</option>
-          <option>pi-tester</option>
-          <option>pi-reviewer</option>
-          <option>pi-fixer</option>
-          <option>CEO-digital</option>
-          <option>system</option>
-          <option>user</option>
-        </select>
+        <AgentSelect value={step.agent} onChange={(agent) => onChange({ ...step, agent })} style={{ width: 140 }} />
         <button className="btn btn-sm" onClick={onRemove}><X size={12} /></button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 100px", gap: 6, marginBottom: 6 }}>
@@ -3103,14 +3141,7 @@ function AddStepModal({ sopId, steps, onClose, onCreated }: {
               <label style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", display: "block", marginBottom: 4 }}>
                 Worker / Agent
               </label>
-              <select className="input" value={agent} onChange={(e) => setAgent(e.target.value)}>
-                <option value="pi-coder">pi-coder (Implementation)</option>
-                <option value="pi-tester">pi-tester (Tests)</option>
-                <option value="pi-reviewer">pi-reviewer (Code-Review)</option>
-                <option value="pi-fixer">pi-fixer (Bug-Fix)</option>
-                <option value="cio">CIO (Architektur/Triage)</option>
-                <option value="ceo-digital">CEO-digital (Dokumentation)</option>
-              </select>
+              <AgentSelect value={agent} onChange={setAgent} />
             </div>
           </div>
 

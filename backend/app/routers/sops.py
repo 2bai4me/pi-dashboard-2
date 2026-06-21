@@ -25,16 +25,36 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..db.base import get_db
 from ..auth import require_auth
 from ..models.sop import SOP, SOPStep, SOPStepRule, SOPInstance, SOPExecution
-from ..services.sop_engine import SOPEngine, seed_default_sops, DEFAULT_TASK_SOP
+from ..services.sop_engine import SOPEngine, seed_default_sops, DEFAULT_TASK_SOP, ALLOWED_SOP_ACTIONS
+from ..schemas.sop_action import ALLOWED_ACTIONS, ACTION_PARAM_SCHEMAS
 
 router = APIRouter(prefix="/api/sops", tags=["sops"])
+
+
+def _validate_step_action_params(action: Optional[str], action_params: Optional[dict]) -> None:
+    """Prueft action gegen die Whitelist und action_params gegen das Pydantic-Schema.
+
+    Wirft HTTPException(400) bei Verstossen, damit der Client ein klares
+    Fehler-Response bekommt.
+    """
+    if action is not None and action not in ALLOWED_SOP_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown or disallowed SOP action: {action!r}. Allowed: {sorted(ALLOWED_SOP_ACTIONS)}",
+        )
+    schema_cls = ACTION_PARAM_SCHEMAS.get(action) if action else None
+    if schema_cls and action_params is not None:
+        try:
+            schema_cls.model_validate(action_params)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 logger = logging.getLogger("pi-dashboard-2.sops")
 
 
@@ -56,6 +76,22 @@ class SOPStepInput(BaseModel):
     next_step: Optional[int] = None
     fail_step: Optional[int] = None
     on_sub_sop_step: Optional[int] = None
+
+    @field_validator("action", "action_params")
+    @classmethod
+    def _validate_action_and_params(cls, v, info):
+        if info.field_name == "action":
+            if v not in ALLOWED_SOP_ACTIONS:
+                raise ValueError(
+                    f"Action {v!r} not allowed. Allowed: {sorted(ALLOWED_SOP_ACTIONS)}"
+                )
+            return v
+        # action_params
+        action = info.data.get("action")
+        schema_cls = ACTION_PARAM_SCHEMAS.get(action) if action else None
+        if schema_cls and v is not None:
+            schema_cls.model_validate(v)
+        return v
 
 
 class SOPCreate(BaseModel):
@@ -122,13 +158,21 @@ async def create_sop(
     _user: str = Depends(require_auth),
 ):
     engine = SOPEngine(db)
+    # Sicherheitspruefung: jeder Step muss eine erlaubte Action haben und
+    # action_params muessen zum jeweiligen Schema passen.
+    for step in req.steps:
+        _validate_step_action_params(step.action, step.action_params)
+
     steps_payload = [s.model_dump(exclude_none=True) for s in req.steps]
-    sop = engine.create_sop(
-        name=req.name, description=req.description, category=req.category,
-        version=req.version, parent_sop_id=req.parent_sop_id,
-        is_template=req.is_template, default_delay_s=req.default_delay_s,
-        steps=steps_payload,
-    )
+    try:
+        sop = engine.create_sop(
+            name=req.name, description=req.description, category=req.category,
+            version=req.version, parent_sop_id=req.parent_sop_id,
+            is_template=req.is_template, default_delay_s=req.default_delay_s,
+            steps=steps_payload,
+        )
+    except (ValidationError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not sop:
         raise HTTPException(400, "SOP konnte nicht erstellt werden")
     return sop.to_dict(include_steps=True)
@@ -181,6 +225,22 @@ class StepDescriptionUpdate(BaseModel):
     trigger: Optional[str] = None
     agent: Optional[str] = None
 
+    @field_validator("action", "action_params")
+    @classmethod
+    def _validate_action_and_params(cls, v, info):
+        if info.field_name == "action":
+            if v is not None and v not in ALLOWED_SOP_ACTIONS:
+                raise ValueError(
+                    f"Action {v!r} not allowed. Allowed: {sorted(ALLOWED_SOP_ACTIONS)}"
+                )
+            return v
+        # action_params
+        action = info.data.get("action")
+        schema_cls = ACTION_PARAM_SCHEMAS.get(action) if action else None
+        if schema_cls and v is not None:
+            schema_cls.model_validate(v)
+        return v
+
 
 # === POST neuer Step (User-Direktive 17.06.2026: "+ Step hinzufügen"-Button) ===
 class StepCreate(BaseModel):
@@ -218,6 +278,22 @@ class StepCreate(BaseModel):
     # Optional: vorheriger Step (fuer nahtlosen Anschluss via next_step_id)
     insert_after_step_id: Optional[str] = None
 
+    @field_validator("action", "action_params")
+    @classmethod
+    def _validate_action_and_params(cls, v, info):
+        if info.field_name == "action":
+            if v is not None and v not in ALLOWED_SOP_ACTIONS:
+                raise ValueError(
+                    f"Action {v!r} not allowed. Allowed: {sorted(ALLOWED_SOP_ACTIONS)}"
+                )
+            return v
+        # action_params
+        action = info.data.get("action")
+        schema_cls = ACTION_PARAM_SCHEMAS.get(action) if action else None
+        if schema_cls and v is not None:
+            schema_cls.model_validate(v)
+        return v
+
 
 def _generate_step_id() -> str:
     """Erzeugt eine neue 12-stellige hexadezimale Step-ID (konsistent mit _gen_qid-Stil)."""
@@ -244,6 +320,9 @@ async def create_step(
     sop = db.get(SOP, sop_id)
     if not sop:
         raise HTTPException(404, f"SOP {sop_id} not found")
+
+    # Action + action_params gegen Whitelist/Schema pruefen (klares 400)
+    _validate_step_action_params(req.action, req.action_params)
 
     # === 1) step_order bestimmen ===
     existing_steps = db.execute(
@@ -340,6 +419,10 @@ async def update_step(
     step = db.get(SOPStep, step_id)
     if not step or step.sop_id != sop_id:
         raise HTTPException(404, f"Step {step_id} not found in SOP {sop_id}")
+
+    # Action + action_params gegen Whitelist/Schema pruefen (klares 400)
+    _validate_step_action_params(req.action, req.action_params)
+
     changes = []
     if req.description is not None:
         old = step.description
@@ -482,6 +565,7 @@ async def ai_step_helper(
     try:
         raw_response = await chat_completion(
             messages=messages, model=model, temperature=0.3, max_tokens=2000,
+            role=step.agent,
         )
     except Exception as e:
         logger.error(f"AI-Helper Fehler: {e}")
@@ -674,6 +758,7 @@ async def ai_step_evaluate(
         ai_md = await chat_completion(
             messages=messages, model=model, temperature=0.3, max_tokens=4000,
             timeout_sec=300.0,  # 5 Min — lokale Ollama-Modelle (gemma4:12b) brauchen oft 60-180s
+            role=step.agent,
         )
     except Exception as e:
         logger.error(f"AI-Evaluate Fehler: {e}")

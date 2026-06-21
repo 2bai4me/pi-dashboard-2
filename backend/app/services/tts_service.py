@@ -199,7 +199,7 @@ class TTSService:
         """
 
         if not settings.MINIMAX_API_KEY:
-            raise RuntimeError("MINIMAX_API_KEY nicht konfiguriert")
+            raise RuntimeError("MINIMAX_API_KEY nicht gesetzt")
 
         url = settings.MINIMAX_TTS_API_URL
         payload = cls._build_payload(

@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, select, func as sqlfunc
 from sqlalchemy.orm import Session
 
-from .config import settings
+from .config import settings, BACKEND_ROOT
 from .db.base import init_db, engine, SessionLocal, get_db
 from .auth import require_auth
 from .services.role_service import RoleService
@@ -47,14 +47,59 @@ if os.getenv("LOG_FORMAT", "text").lower() == "json":
         h.setFormatter(JsonFormatter())
 
 
+def _alembic_is_current() -> bool:
+    """Prueft, ob die Datenbank auf der neuesten Alembic-Revision ist.
+
+    Gibt True zurueck, wenn Alembic nicht konfiguriert ist oder der
+    aktuelle Head mit der Datenbank uebereinstimmt.
+    """
+    try:
+        from alembic.runtime.migration import MigrationContext
+        from alembic.script import ScriptDirectory
+        from alembic.config import Config
+
+        alembic_cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
+        script = ScriptDirectory.from_config(alembic_cfg)
+        with engine.connect() as conn:
+            context = MigrationContext.configure(conn)
+            current_rev = context.get_current_revision()
+            head_rev = script.get_current_head()
+            return current_rev == head_rev
+    except Exception as e:
+        logger.warning(f"Could not verify Alembic revision: {e}")
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """App-Lifecycle: DB-Init + Role-Defaults beim Start."""
     logger.info("Pi Dashboard 2.0 starting...")
     logger.info(f"Database: {settings.DATABASE_URL}")
+    # Sicherheits-Check: Auth erfordert sichere Secrets
+    if settings.AUTH_ENABLED:
+        if not settings.JWT_SECRET or settings.JWT_SECRET == "__CHANGE_ME__":
+            raise RuntimeError(
+                "AUTH_ENABLED=true, aber JWT_SECRET ist nicht gesetzt oder unsicher "
+                "(Wert: __CHANGE_ME__). Bitte setze ein starkes JWT_SECRET in der .env."
+            )
+        if not settings.ADMIN_PASSWORD or settings.ADMIN_PASSWORD == "__CHANGE_ME__":
+            raise RuntimeError(
+                "AUTH_ENABLED=true, aber ADMIN_PASSWORD ist nicht gesetzt oder unsicher "
+                "(Wert: __CHANGE_ME__). Bitte setze ein starkes ADMIN_PASSWORD in der .env."
+            )
     try:
-        init_db()
-        logger.info("Database initialized.")
+        if settings.ENV == "production":
+            init_db()
+            if not _alembic_is_current():
+                logger.warning(
+                    "Alembic is not at the latest revision. "
+                    "Run 'alembic upgrade head' before running in production."
+                )
+            else:
+                logger.info("Alembic version check passed.")
+        else:
+            init_db()
+            logger.info("Development mode: Base.metadata.create_all() executed.")
         with SessionLocal() as db:
             added = RoleService.seed_defaults(db)
             if added:
@@ -148,9 +193,9 @@ if settings.RATE_LIMIT_PER_MINUTE > 0:  # type: ignore
 # - architecture_rules:      Standardvorgaben für Schritt 0
 # - process_template:        BPMN-Templates für Task-Aggregation
 # - agent_questions:         User<->Agent Interaktionstool
-# - subagents/task_drafts:   SubAgent-Konfig + iterativer Task-Refinement
+# - subagents:              SubAgent-Konfig
 # - board_operators/test_runner: Live-Watchdog + Test-Navigator
-from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, task_drafts, tts  # noqa: E402
+from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials  # noqa: E402
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
@@ -164,10 +209,11 @@ app.include_router(process_template.router)
 app.include_router(architecture_rules.router)  # User-Direktive 16.06.2026: Standardvorgaben für Schritt 0
 app.include_router(agent_questions.router)  # User-Direktive 17.06.2026: User<->Agent Interaktionstool
 app.include_router(subagents.router)  # User-Direktive 18.06.2026: SubAgent-Konfiguration (Modell pro Rolle)
-app.include_router(task_drafts.router)  # User-Direktive 18.06.2026: Iterativer Task-Refinement-Workflow (KI+User)
 app.include_router(board_operators.router)  # User-Direktive 17.06.2026: Live-Board Watchdog-Instanzen
 app.include_router(test_runner.router)  # User-Direktive 17.06.2026: Navigator-Service fuer Test-Aktionen
 app.include_router(tts.router)  # MiniMax Text-to-Audio V2
+app.include_router(auth.router)  # JWT Login
+app.include_router(provider_credentials.router)  # Zentrale API-Key-Verwaltung
 
 
 # === Health-Check ===

@@ -800,6 +800,7 @@ Pruefe diesen Task und schlage Verbesserungen vor."""
             model="minimax-m3",
             temperature=0.3,
             max_tokens=2000,
+            role="CIO",
         )
         # Content extrahieren
         if isinstance(result, dict):

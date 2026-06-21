@@ -49,7 +49,6 @@ const NAV_ITEMS = [
     { to: "/tasks/draft", label: "Task-Drafts", icon: Sparkles },
     { to: "/tools", label: "Tools", icon: Wrench },
     { to: "/skills", label: "Skills", icon: BookOpen },
-    { to: "/roles", label: "Rollen", icon: Shield },
     { to: "/test-runner", label: "Test Tool", icon: Beaker },
   ]},
   { section: "Management", items: [

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Generator
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 
 from ..config import settings
@@ -50,12 +50,42 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Erstellt alle Tabellen (nur für Dev — in Prod via Alembic)."""
+    """Initialisiert die Datenbank.
+
+    In der Entwicklung werden alle Tabellen via Base.metadata.create_all()
+    erstellt. In Produktion wird das Schema ausschliesslich durch Alembic-
+    Migrationen verwaltet; hier wird nur geprueft, ob die erwarteten
+    Tabellen existieren.
+    """
     # Import aller Models, damit sie bei Base.metadata registriert sind
     from ..models import project, task, history, transition, sop, role, token_usage, pricing  # noqa: F401
     from ..models import improvement  # noqa: F401  # User-Direktive 17.06.2026 (Self-Improvement)
     from ..models import agent_question  # noqa: F401  # User-Direktive 17.06.2026 (User<->Agent Interaktionstool)
     from ..models import board_operator  # noqa: F401  # User-Direktive 17.06.2026 (Live-Board Watchdog)
-    from ..models import task_draft  # noqa: F401  # User-Direktive 18.06.2026 (Iterativer Task-Refinement-Workflow)
+    from ..models import architecture_rule  # noqa: F401  # Standardvorgaben fuer Schritt 0
+    from ..models import process_template  # noqa: F401  # BPMN-Templates fuer Task-Aggregation
+    from ..models import brainstorm  # noqa: F401  # Requirements-Engineering
+    from ..models import provider_credential  # noqa: F401  # Zentrale API-Key-Verwaltung
+
+    if settings.ENV == "production":
+        _ensure_tables_exist()
+        return
 
     Base.metadata.create_all(bind=engine)
+
+
+def _ensure_tables_exist() -> None:
+    """Prueft, dass alle erwarteten Tabellen in der Datenbank vorhanden sind.
+
+    Wird in Produktion verwendet, um zu verhindern, dass Tabellen
+    automatisch erstellt werden. Alembic ist dafuer zustaendig.
+    """
+    inspector = inspect(engine)
+    existing = set(inspector.get_table_names())
+    expected = set(Base.metadata.tables.keys())
+    missing = expected - existing
+    if missing:
+        raise RuntimeError(
+            f"Production: missing database tables: {sorted(missing)}. "
+            "Run 'alembic upgrade head' before starting the application."
+        )

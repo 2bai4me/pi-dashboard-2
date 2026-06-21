@@ -148,6 +148,11 @@ def translate_task_dict(task_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 # === Test-Snippet (nur bei direktem Aufruf) ===
 if __name__ == "__main__":
+    """Schnell-Tests fuer status_labels."""
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("status_labels_test")
+    
     test_cases = [
         ("todo", "GO"),
         ("in_progress", "In Progress"),
@@ -157,17 +162,17 @@ if __name__ == "__main__":
         (None, "—"),
         ("unknown", "unknown"),
     ]
-    print("=== display_status Tests ===")
+    logger.info("=== display_status Tests ===")
     for db, expected in test_cases:
         result = display_status(db)
         ok = "OK" if result == expected else "FAIL"
-        print(f"  [{ok}] display_status({db!r}) = {result!r} (expected {expected!r})")
-
-    print("\n=== display_status_with_emoji Tests ===")
+        logger.info(f"  [{ok}] display_status({db!r}) = {result!r} (expected {expected!r})")
+    
+    logger.info("\n=== display_status_with_emoji Tests ===")
     for db in ["triage", "todo", "in_progress", "done"]:
-        print(f"  display_status_with_emoji({db!r}) = {display_status_with_emoji(db)!r}")
-
-    print("\n=== translate_history_details Tests ===")
+        logger.info(f"  display_status_with_emoji({db!r}) = {display_status_with_emoji(db)!r}")
+    
+    logger.info("\n=== translate_history_details Tests ===")
     test_details = {
         "from": "todo",
         "to": "in_progress",
@@ -179,5 +184,5 @@ if __name__ == "__main__":
         "new_status": "in_progress",
         "description": "Test description with todo word (should NOT be replaced)",
     }
-    print(f"  Vorher: {test_details}")
-    print(f"  Nachher: {translate_history_details(test_details)}")
+    logger.info(f"  Vorher: {test_details}")
+    logger.info(f"  Nachher: {translate_history_details(test_details)}")

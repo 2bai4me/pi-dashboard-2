@@ -21,7 +21,10 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import Column, String, Text, DateTime, Integer, Index
+from datetime import datetime
+from typing import Optional
+from sqlalchemy import String, Text, DateTime, Integer, Index
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy.orm import Session
 
@@ -29,23 +32,44 @@ from .db.base import Base, SessionLocal
 
 
 # === Event-Log-Tabelle (persistent) ===
-class EventLog(Base):  # type: ignore
+# Fix (v2.0-rc): Umstellung auf SQLAlchemy 2.0 Style (Mapped + mapped_column)
+# Alter Stil (events.py): id: Column = Column(Integer, ...)
+# Neuer Stil:           id: Mapped[int] = mapped_column(Integer, ...)
+class EventLog(Base):
     """Alle veroeffentlichten Events werden hier persistent gespeichert."""
     __tablename__ = "event_log"
 
-    id: Column = Column(Integer, primary_key=True, autoincrement=True)
-    project_id: Column = Column(String(32), nullable=False, index=True)
-    event_type: Column = Column(String(64), nullable=False)
-    payload: Column = Column(Text, nullable=False)  # JSON mit data
-    ts: Column = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)  # JSON mit data
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
         Index("idx_eventlog_project_ts", "project_id", "ts"),
     )
 
+    def __repr__(self) -> str:
+        return f"<EventLog {self.id} [{self.event_type}] project={self.project_id[:8]}>"
 
-# Sicherstellen dass die Tabelle existiert (wird bei Bedarf erstellt)
+
+# Fix (v2.0-rc): ensure_table() wird NICHT mehr in Production aufgerufen.
+# In Production muessen Migrationen via Alembic ausgefuehrt werden.
+ENSURE_TABLE_ENABLED: bool = True  # Set to False in production
+
+
 def ensure_table():
+    """Stellt sicher, dass die EventLog-Tabelle existiert.
+    
+    Fix (v2.0-rc): Wird nur in development/ENV=development ausgefuehrt.
+    In Production muss die Tabelle via Alembic-Migration erstellt werden.
+    """
+    from .config import settings
+    if settings.ENV != "development":
+        raise RuntimeError(
+            "EventLog-Tabelle fehlt! Bitte Migration ausfuehren: "
+            "alembic upgrade head"
+        )
     from .db.base import engine
     EventLog.__table__.create(bind=engine, checkfirst=True)
 

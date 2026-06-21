@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { RefreshCw, Server, Cpu, Terminal, CheckCircle, XCircle, AlertTriangle, Settings, Volume2 } from "lucide-react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { RefreshCw, CheckCircle, XCircle, AlertTriangle, Settings, Volume2 } from "lucide-react";
 import { api } from "./api";
 import { useTTSContext } from "./TTSContext";
 import { TTSControl } from "./TTSControl";
@@ -47,6 +47,7 @@ export function GatewayStatusBar() {
     queryFn: () => api.getGatewayStatus(),
     refetchInterval: 15000,
   });
+  const queryClient = useQueryClient();
 
   const restartMut = useMutation({
     mutationFn: () => api.restartOllama(),
@@ -72,32 +73,6 @@ export function GatewayStatusBar() {
       minHeight: 28,
       flexShrink: 0,
     }}>
-      {/* === MiniMax M3 Aktiv-Badge (prominent, links) === */}
-      <div
-        title="Alle Sub-Agents laufen mit MiniMax M3 (Hybrid-Cloud)"
-        style={{
-          display: "flex", alignItems: "center", gap: 5,
-          padding: "2px 8px",
-          background: "linear-gradient(135deg, rgba(255,166,43,0.18) 0%, rgba(248,81,73,0.18) 100%)",
-          border: "1px solid rgba(255,166,43,0.5)",
-          borderRadius: 4,
-          fontSize: 10, fontWeight: 700, color: "var(--color-hermes-accent-orange)",
-          letterSpacing: 0.3,
-          textTransform: "uppercase",
-        }}
-      >
-        <span style={{
-          display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-          background: "var(--color-hermes-accent-orange)",
-          boxShadow: "0 0 6px rgba(255,166,43,0.7)",
-          animation: "pulse-minimax 2s ease-in-out infinite",
-        }} />
-        <span>MINIMAX M3</span>
-        <span style={{ color: "var(--color-hermes-text-secondary)", fontWeight: 400, textTransform: "none", fontSize: 9 }}>
-          · Sub-Agents aktiv
-        </span>
-      </div>
-
       {/* Status Dots */}
       {services.map((svc) => {
         const svcStatus = status?.[svc.key];

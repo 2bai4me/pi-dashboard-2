@@ -10,7 +10,6 @@ import Tools from "./pages/Tools";
 import AgentQuestions from "./pages/AgentQuestions";
 import TestRunner from "./pages/TestRunner";
 import Skills from "./pages/Skills";
-import Roles from "./pages/Roles";
 import Sessions from "./pages/Sessions";
 import Config from "./pages/Config";
 import Logs from "./pages/Logs";
@@ -30,7 +29,6 @@ import RacWorkflow from "./pages/RacWorkflow";
 import Selfimprovment from "./pages/Selfimprovment";
 import Performance from "./pages/Performance";
 import SubAgents from "./pages/SubAgents";
-import TaskDraft from "./pages/TaskDraft";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -59,7 +57,6 @@ export default function App() {
               <Route path="/tools/agent-questions/:id" element={<AgentQuestions />} />
               <Route path="/test-runner" element={<TestRunner />} />
               <Route path="/skills" element={<Skills />} />
-              <Route path="/roles" element={<Roles />} />
               <Route path="/sessions" element={<Sessions />} />
               <Route path="/config" element={<Config />} />
               <Route path="/logs" element={<Logs />} />
@@ -75,9 +72,6 @@ export default function App() {
               <Route path="/self-improve" element={<SelfImprovement />} />
               <Route path="/performance" element={<Performance />} />
               <Route path="/subagents" element={<SubAgents />} />
-              <Route path="/tasks/draft" element={<TaskDraft />} />
-              <Route path="/tasks/draft/new" element={<TaskDraft />} />
-              <Route path="/tasks/draft/:id" element={<TaskDraft />} />
               <Route path="/api-keys" element={<ApiKeys />} />
               <Route path="/brain-graph" element={<BrainGraph />} />
               <Route path="/raci" element={<RacWorkflow />} />

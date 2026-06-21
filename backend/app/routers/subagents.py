@@ -28,9 +28,12 @@ class AgentConfigRead(BaseModel):
     is_subagent: bool
     model: Optional[str] = None
     provider: Optional[str] = None
+    api_key_id: Optional[str] = None
     default_model: Optional[str] = None
     tools: List[str] = []
     emoji: Optional[str] = None
+    system_prompt: Optional[str] = None
+    description: Optional[str] = None
 
 
 class AgentRead(BaseModel):
@@ -48,6 +51,11 @@ class AgentRead(BaseModel):
 class ModelUpdate(BaseModel):
     model: str
     provider: Optional[str] = None
+    api_key_id: Optional[str] = None
+
+
+class PromptUpdate(BaseModel):
+    system_prompt: str
 
 
 # === Endpoints ===
@@ -109,11 +117,33 @@ async def update_role_model(
               Body: {"model": "ollama/gemma4:12b", "provider": "ollama"}
     """
     try:
-        role = SubAgentService.update_role_model(db, role_name, body.model, body.provider)
+        role = SubAgentService.update_role_model(
+            db, role_name, body.model, body.provider, body.api_key_id
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
     # Aktualisierte Config zurueckgeben
+    configs = SubAgentService.list_agent_configs(db)
+    for c in configs:
+        if c["name"] == role_name:
+            return c
+    raise HTTPException(500, "Config nicht gefunden nach Update")
+
+
+@router.patch("/{role_name}/prompt", response_model=AgentConfigRead)
+async def update_role_prompt(
+    role_name: str,
+    body: PromptUpdate,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """Aktualisiert den System-Prompt / die Rollenbeschreibung einer Rolle."""
+    try:
+        role = SubAgentService.update_role_prompt(db, role_name, body.system_prompt)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     configs = SubAgentService.list_agent_configs(db)
     for c in configs:
         if c["name"] == role_name:

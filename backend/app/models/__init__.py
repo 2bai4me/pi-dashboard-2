@@ -13,6 +13,7 @@ from .process_template import ProcessTemplate
 from .improvement import Weakness, WeaknessAnalysis
 from .agent_question import AgentQuestion, AgentQuestionAttachment
 from .board_operator import BoardOperator
+from .provider_credential import ProviderCredential
 
 __all__ = [
     "Project",
@@ -38,4 +39,5 @@ __all__ = [
     "AgentQuestion",
     "AgentQuestionAttachment",
     "BoardOperator",
+    "ProviderCredential",
 ]

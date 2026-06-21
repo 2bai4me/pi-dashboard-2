@@ -37,9 +37,26 @@ from ..models.sop import (
 )
 from ..models.task import Task
 from ..models.project import Project
+from ..schemas.sop_action import ALLOWED_ACTIONS, ACTION_PARAM_SCHEMAS
 from .task_service import TaskService
 
 logger = logging.getLogger("pi-dashboard-2.sop")
+
+
+# === Erlaubte SOP-Actions (Security-Whitelist) ===
+ALLOWED_SOP_ACTIONS = frozenset({
+    "noop",
+    "set_status",
+    "ask_user",
+    "llm_call",
+    "spawn_sop",
+    "review_task",
+    "assign_worker",
+    "implement",
+    "test",
+    "cio_final_review",
+    "tester_code_review",
+})
 
 
 def _gen_id() -> str:
@@ -85,6 +102,7 @@ class SOPEngine:
         version: int = 1, parent_sop_id: Optional[str] = None,
         is_template: bool = False, default_delay_s: float = 5.0,
         steps: Optional[List[Dict[str, Any]]] = None,
+        _trusted: bool = False,
     ) -> SOP:
         """Erstellt eine neue SOP inkl. Steps + Rules.
 
@@ -119,7 +137,15 @@ class SOPEngine:
         self.db.flush()
 
         step_id_map: Dict[int, str] = {}  # index -> step_id
+        created_steps: List[SOPStep] = []
         if steps:
+            for idx, sd in enumerate(steps):
+                action = sd.get("action", "noop")
+                params = sd.get("action_params") or {}
+                schema_cls = ACTION_PARAM_SCHEMAS.get(action)
+                if schema_cls:
+                    schema_cls.model_validate(params)
+
             for idx, sd in enumerate(steps):
                 step = SOPStep(
                     id=_gen_id(),
@@ -139,6 +165,7 @@ class SOPEngine:
                 self.db.add(step)
                 self.db.flush()
                 step_id_map[idx] = step.id
+                created_steps.append(step)
 
                 # Rules
                 for ridx, rd in enumerate(sd.get("rules", [])):
@@ -155,6 +182,15 @@ class SOPEngine:
                         action_params=rd.get("action_params", {}),
                     )
                     self.db.add(rule)
+
+            # Sicherheitspruefung: alle erstellten Steps muessen gegen die
+            # Engine-Whitelist erlaubt sein. Bei Verstoss wird alles zurueckgerollt.
+            # _trusted=True erlaubt System-/Seed-SOPs mit Legacy-Actions.
+            if not _trusted:
+                for step in created_steps:
+                    if step.action not in ALLOWED_SOP_ACTIONS:
+                        self.db.rollback()
+                        raise ValueError(f"Disallowed SOP action: {step.action}")
 
             # Verzweigungen setzen
             self.db.flush()
@@ -270,6 +306,14 @@ class SOPEngine:
         step = self.db.get(SOPStep, instance.current_step_id)
         if not step:
             return {"ok": False, "error": "Step not found"}
+
+        # === Action-Whitelist (Sicherheit) ===
+        if step.action not in ALLOWED_SOP_ACTIONS:
+            logger.error(
+                f"Unknown or disallowed SOP action {step.action!r} in step {step.id} "
+                f"(instance {instance.id})"
+            )
+            return {"ok": False, "error": f"Unknown or disallowed SOP action: {step.action}"}
 
         # === User-Input-Tool (User-Direktive 17.06.2026) ===
         # Wenn der Step ein Input-Tool erfordert UND der Context-Wert fehlt,
@@ -482,6 +526,37 @@ class SOPEngine:
                 return {"ok": True, "action": "spawn_sop", "sub_instance_id": sub_inst.id,
                         "sop_id": sub_sop_id, "status": sub_inst.status}
             return {"ok": False, "error": "spawn_sop failed"}
+
+        # === LLM-Call Action (Multi-Provider Phase 2) ===
+        if action == "llm_call":
+            from .llm_service import chat_completion
+            system_prompt = params.get("system_prompt", "Du bist ein hilfreicher Assistent.")
+            user_prompt = params.get("user_prompt", "")
+            if not user_prompt:
+                return {"ok": False, "error": "llm_call: user_prompt missing in action_params"}
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            try:
+                response = await chat_completion(
+                    messages=messages,
+                    model=params.get("model", "minimax-m3"),
+                    temperature=params.get("temperature", 0.3),
+                    max_tokens=params.get("max_tokens", 2000),
+                    response_format=params.get("response_format"),
+                    timeout_sec=params.get("timeout_sec", 60.0),
+                    role=step.agent,
+                )
+                return {
+                    "ok": True,
+                    "action": "llm_call",
+                    "agent": step.agent,
+                    "response": response,
+                }
+            except Exception as e:
+                logger.error(f"llm_call failed for step {step.id}: {e}")
+                return {"ok": False, "error": f"llm_call failed: {e}"}
 
         # === Custom-Actions fuer CIO-Triage-SOP ===
         # Diese Actions fuehren die 4 Kriterien-Pruefungen aus und sammeln Issues.
@@ -1859,6 +1934,7 @@ def seed_default_sops(db: Session) -> int:
             category=sop_def["category"],
             default_delay_s=sop_def["default_delay_s"],
             steps=sop_def["steps"],
+            _trusted=True,
         )
         if sop:
             added += 1

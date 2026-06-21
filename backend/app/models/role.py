@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import String, Text, DateTime, Integer, Boolean, Numeric
+from sqlalchemy import String, Text, DateTime, Integer, Boolean, Numeric, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -31,6 +31,9 @@ class Role(Base):
     # === LLM-Config ===
     provider: Mapped[Optional[str]] = mapped_column(String(64))
     model: Mapped[Optional[str]] = mapped_column(String(128))
+    api_key_id: Mapped[Optional[str]] = mapped_column(
+        String(32), ForeignKey("provider_credentials.id", ondelete="SET NULL"), nullable=True
+    )
 
     # === Prompts + Tools ===
     system_prompt: Mapped[Optional[str]] = mapped_column(Text)

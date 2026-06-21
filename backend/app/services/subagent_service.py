@@ -1,22 +1,16 @@
 """SubAgent Service - Baut Sub-Agenten mit konfiguriertem Modell auf.
 
 User-Direktive 18.06.2026: Beim Aufbau eines Sub-Agenten MUSS das in der
-Role konfigurierte Modell geladen werden. Standard fuer Sub-Agenten
-(pi-coder, pi-tester, pi-reviewer, pi-fixer): ollama/gemma4:12b.
+Role konfigurierte Modell geladen werden.
+
+User-Direktive 20.06.2026: Jede Rolle hat eine editierbare Beschreibung
+(system_prompt) und kann direkt einen API-Key/Provider referenzieren.
 
 Architektur:
-  1. Rolle aus DB laden (Role-Model)
-  2. Modell + Provider aus Role extrahieren
-  3. SubAgent-Instanz bauen mit:
-     - model (z.B. ollama/gemma4:12b)
-     - system_prompt (rollenspezifisch)
-     - tools (z.B. bash, read, write, grep)
-     - timeout, temperature, max_tokens
-  4. SubAgent ist "ready" fuer den Aufruf via LLM-Service
-
-Verwendung:
-  agent = SubAgentService.build_agent("pi-coder", task=task_obj)
-  response = await agent.run(prompt="...")
+  1. Rolle aus DB laden (Role-Model) — Role-Service ist die alleinige Quelle.
+  2. Modell + Provider + API-Key via ProviderResolver auflösen.
+  3. System-Prompt + Tools aus Role extrahieren.
+  4. SubAgent-Instanz bauen.
 """
 from __future__ import annotations
 
@@ -29,86 +23,31 @@ from sqlalchemy import select
 
 from ..models.role import Role
 from ..models.task import Task
-from .llm_service import chat_completion, _load_api_credentials
+from ..models.provider_credential import ProviderCredential
+from .provider_resolver import get_role_config
+from .llm_service import chat_completion
 
 logger = logging.getLogger("pi-dashboard-2.subagent")
 
 
-# === Default-Konfiguration pro Sub-Agent-Typ ===
-# (User-Direktive 18.06.2026: Standard ist ollama/gemma4:12b)
-DEFAULT_SUBAGENT_CONFIG = {
-    "pi-coder": {
-        "model": "ollama/gemma4:12b",
-        "provider": "ollama",
-        "system_prompt_template": (
-            "Du bist pi-coder, ein erfahrener Software-Entwickler. "
-            "Deine Aufgabe ist es, den Task '{task_title}' umzusetzen. "
-            "Verwende Write/Read/Bash/Grep-Tools. "
-            "Liefere am Ende Code, Tests und Commit. "
-            "Halte dich an die in der Description dokumentierten Erfolgskriterien. "
-            "Dokumentiere alle Aenderungen in task.meta (z.B. test_coverage, criteria_met, criteria_total)."
-        ),
-        "temperature": 0.3,
-        "max_tokens": 4096,
-        "tools": ["read", "write", "bash", "grep"],
-    },
-    "pi-tester": {
-        "model": "ollama/gemma4:12b",
-        "provider": "ollama",
-        "system_prompt_template": (
-            "Du bist pi-tester, ein erfahrener QA-Engineer. "
-            "Deine Aufgabe ist es, die Implementation des Tasks '{task_title}' zu testen. "
-            "Pruefe ALLE in der Description dokumentierten success_criteria. "
-            "Fuehre Tests aus, pruefe Coverage, Lint, kritische Issues. "
-            "Dokumentiere in task.meta: test_coverage, lint_errors, test_files, critical_issues. "
-            "Schreibe am Ende criteria_met/criteria_total in task.meta (vom Worker implementiert)."
-        ),
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "tools": ["read", "bash", "grep"],
-    },
-    "pi-reviewer": {
-        "model": "ollama/gemma4:12b",
-        "provider": "ollama",
-        "system_prompt_template": (
-            "Du bist pi-reviewer, ein erfahrener Code-Reviewer. "
-            "Pruefe Code-Qualitaet, Architektur, Best-Practices. "
-            "Verwende Read/Grep-Tools, analysiere den Code. "
-            "Dokumentiere Findings in task.meta.code_review_findings."
-        ),
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "tools": ["read", "grep"],
-    },
-    "pi-fixer": {
-        "model": "ollama/gemma4:12b",
-        "provider": "ollama",
-        "system_prompt_template": (
-            "Du bist pi-fixer, ein Bug-Fixer. "
-            "Analysiere den Bug, fixe ihn, schreibe Tests, commit. "
-            "Verwende Read/Write/Bash/Grep. "
-            "Dokumentiere Fix-Commits in task.meta.fix_commits."
-        ),
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "tools": ["read", "write", "bash", "grep"],
-    },
-}
+# Fallback-Werte, falls eine Rolle in der DB unvollstaendig ist.
+_FALLBACK_MODEL = "ollama/gemma4:12b"
+_FALLBACK_PROVIDER = "ollama"
+_FALLBACK_TOOLS = ["read", "write", "bash", "grep"]
+_FALLBACK_TEMPERATURE = 0.3
+_FALLBACK_MAX_TOKENS = 4096
+_FALLBACK_TIMEOUT_SEC = 120.0
 
-# === C-Level Rollen (nicht Sub-Agenten) ===
-C_LEVEL_CONFIG = {
-    "CIO": {
-        "model": "gemma4:12b",
-        "system_prompt_template": (
-            "Du bist der CIO. Pruefe Tasks auf Vollstaendigkeit, Klarheit, Konflikte. "
-            "Stelle success_criteria fest. Lege Rollenzuweisungen fest."
-        ),
-    },
-    "CEO-digital": {
-        "model": "minimax-m3",
-        "system_prompt_template": "Du bist CEO-digital. Triff strategische Entscheidungen.",
-    },
-}
+
+def _derive_provider(model: Optional[str], fallback: Optional[str]) -> str:
+    """Erkennt den Provider anhand des Modell-Namens."""
+    if fallback:
+        return fallback
+    if model and model.startswith("ollama/"):
+        return "ollama"
+    if model and "minimax" in model.lower():
+        return "minimax-direct"
+    return _FALLBACK_PROVIDER
 
 
 @dataclass
@@ -119,9 +58,9 @@ class SubAgent:
     provider: Optional[str] = None
     system_prompt: str = ""
     tools: List[str] = field(default_factory=list)
-    temperature: float = 0.3
-    max_tokens: int = 4096
-    timeout_sec: float = 120.0
+    temperature: float = _FALLBACK_TEMPERATURE
+    max_tokens: int = _FALLBACK_MAX_TOKENS
+    timeout_sec: float = _FALLBACK_TIMEOUT_SEC
     role_id: Optional[str] = None
     task: Optional[Task] = None
 
@@ -137,6 +76,7 @@ class SubAgent:
             temperature=kwargs.get("temperature", self.temperature),
             max_tokens=kwargs.get("max_tokens", self.max_tokens),
             timeout_sec=kwargs.get("timeout_sec", self.timeout_sec),
+            role=self.name,
         )
 
     def to_dict(self) -> dict:
@@ -188,32 +128,33 @@ class SubAgentService:
         if not role:
             raise ValueError(f"Role '{role_name}' nicht in DB gefunden. Bitte zuerst seed_defaults aufrufen.")
 
-        # Modell aus Role (oder override)
+        # Modell/Provider aus Role/Credential auflösen (oder override)
         if override_model:
             model = override_model
-            provider = None
+            provider = _derive_provider(model, None)
         else:
-            model = role.model or DEFAULT_SUBAGENT_CONFIG.get(role_name, {}).get("model", "ollama/gemma4:12b")
-            provider = role.provider or DEFAULT_SUBAGENT_CONFIG.get(role_name, {}).get("provider", "ollama")
+            config = get_role_config(db, role_name)
+            if config:
+                model = config["model"]
+                provider = config["provider"]
+            else:
+                model = role.model or _FALLBACK_MODEL
+                provider = role.provider or _derive_provider(model, None)
 
-        # Defaults aus dem Config-Mapping
-        default_config = DEFAULT_SUBAGENT_CONFIG.get(role_name, C_LEVEL_CONFIG.get(role_name, {}))
-        system_prompt_template = default_config.get(
-            "system_prompt_template",
-            f"Du bist {role_name}. Bearbeite deine zugewiesenen Tasks."
-        )
-        tools = default_config.get("tools", ["read", "write", "bash", "grep"])
-        temperature = default_config.get("temperature", 0.3)
-        max_tokens = default_config.get("max_tokens", 4096)
-
-        # System-Prompt mit Task-Daten fuellen (falls Task gegeben)
-        system_prompt = system_prompt_template
-        if task:
+        # System-Prompt aus Role; task-spezifische Platzhalter werden gefuellt.
+        system_prompt_template = role.system_prompt or f"Du bist {role_name}. Bearbeite deine zugewiesenen Tasks."
+        try:
             system_prompt = system_prompt_template.format(
-                task_title=task.title or "(kein Titel)",
-                task_id=task.id,
-                task_description=(task.description or "")[:500],
+                task_title=task.title if task else "(kein Titel)",
+                task_id=task.id if task else "(keine ID)",
+                task_description=(task.description or "")[:500] if task else "",
             )
+        except (KeyError, IndexError):
+            # Template enthaelt unbekannte Platzhalter -> unformatiert verwenden
+            system_prompt = system_prompt_template
+
+        tools = role.tool_whitelist or _FALLBACK_TOOLS
+        timeout_sec = float(role.timeout_sec) if role.timeout_sec else _FALLBACK_TIMEOUT_SEC
 
         return SubAgent(
             name=role_name,
@@ -221,41 +162,61 @@ class SubAgentService:
             provider=provider,
             system_prompt=system_prompt,
             tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
             role_id=role.id,
             task=task,
         )
 
     @staticmethod
     def list_agent_configs(db: Session) -> List[Dict[str, Any]]:
-        """Listet alle verfuegbaren Sub-Agent-Konfigurationen."""
+        """Listet alle verfuegbaren Sub-Agent-Konfigurationen aus der DB."""
         result = []
         roles = db.execute(select(Role)).scalars().all()
         for role in roles:
-            is_subagent = role.name in DEFAULT_SUBAGENT_CONFIG
+            is_subagent = role.role_type == "sub_agent"
+
+            # Aufgelöste Konfiguration anzeigen
+            config = get_role_config(db, role.name)
+            if config:
+                model = config["model"]
+                provider = config["provider"]
+            else:
+                model = role.model or _FALLBACK_MODEL
+                provider = role.provider or _derive_provider(role.model, None)
+
             result.append({
                 "name": role.name,
                 "role_id": role.id,
                 "role_type": role.role_type,
                 "is_subagent": is_subagent,
-                "model": role.model or DEFAULT_SUBAGENT_CONFIG.get(role.name, {}).get("model"),
-                "provider": role.provider or DEFAULT_SUBAGENT_CONFIG.get(role.name, {}).get("provider"),
-                "default_model": DEFAULT_SUBAGENT_CONFIG.get(role.name, {}).get("model"),
-                "tools": DEFAULT_SUBAGENT_CONFIG.get(role.name, {}).get("tools", []),
+                "model": model,
+                "provider": provider,
+                "api_key_id": role.api_key_id,
+                "default_model": role.model or _FALLBACK_MODEL,
+                "tools": role.tool_whitelist or _FALLBACK_TOOLS,
                 "emoji": role.emoji,
+                "system_prompt": role.system_prompt,
+                "description": role.description,
             })
         return result
 
     @staticmethod
-    def update_role_model(db: Session, role_name: str, model: str, provider: Optional[str] = None) -> Role:
-        """Aktualisiert das Modell einer Rolle (User-Direktive 18.06.2026: konfigurierbar).
+    def update_role_model(
+        db: Session,
+        role_name: str,
+        model: str,
+        provider: Optional[str] = None,
+        api_key_id: Optional[str] = None,
+    ) -> Role:
+        """Aktualisiert das Modell/Provider/API-Key einer Rolle.
 
         Args:
             db: SQLAlchemy Session
             role_name: z.B. "pi-coder"
             model: z.B. "ollama/gemma4:12b" oder "minimax-m3"
             provider: z.B. "ollama" oder "minimax-direct" (auto-erkannt wenn None)
+            api_key_id: Optional ID einer ProviderCredential. Wenn gesetzt,
+                        werden provider/model aus der Credential übernommen.
 
         Returns:
             Aktualisierte Role
@@ -263,17 +224,41 @@ class SubAgentService:
         role = SubAgentService.get_role(db, role_name)
         if not role:
             raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
-        role.model = model
-        # Provider automatisch erkennen wenn nicht angegeben
-        if provider:
-            role.provider = provider
-        elif model.startswith("ollama/"):
-            role.provider = "ollama"
-        elif "minimax" in model.lower():
-            role.provider = "minimax-direct"
+
+        if api_key_id:
+            credential = db.get(ProviderCredential, api_key_id)
+            if not credential:
+                raise ValueError(f"ProviderCredential '{api_key_id}' nicht gefunden.")
+            role.api_key_id = api_key_id
+            role.provider = credential.provider
+            role.model = credential.model
         else:
-            role.provider = role.provider or "unknown"
+            role.api_key_id = None
+            role.model = model
+            role.provider = provider or _derive_provider(model, role.provider)
+
         db.commit()
         db.refresh(role)
-        logger.info(f"Role {role_name}: model={role.model}, provider={role.provider}")
+        logger.info(f"Role {role_name}: model={role.model}, provider={role.provider}, api_key_id={role.api_key_id}")
+        return role
+
+    @staticmethod
+    def update_role_prompt(db: Session, role_name: str, system_prompt: str) -> Role:
+        """Aktualisiert den System-Prompt / die Rollenbeschreibung einer Rolle.
+
+        Args:
+            db: SQLAlchemy Session
+            role_name: z.B. "pi-coder"
+            system_prompt: Neuer System-Prompt-Text
+
+        Returns:
+            Aktualisierte Role
+        """
+        role = SubAgentService.get_role(db, role_name)
+        if not role:
+            raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
+        role.system_prompt = system_prompt
+        db.commit()
+        db.refresh(role)
+        logger.info(f"Role {role_name}: system_prompt updated ({len(system_prompt)} chars)")
         return role
