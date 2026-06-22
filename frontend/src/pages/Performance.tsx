@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query"
 import { api } from "../api"
 import { Activity, TrendingUp, Zap, Clock, AlertCircle, X } from "lucide-react"
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
+import { formatAge, ageColor, formatRelativeTime, formatTimestampDE, formatTimestampDEFull } from "../utils/dateFormat"
 
 type Transition = {
   id: number
@@ -37,6 +38,16 @@ const TRANSITION_COLORS: Record<string, string> = {
   "block": "var(--color-hermes-danger)",
   "done": "var(--color-hermes-accent)",
 }
+
+// === Feature 22.06.2026 (Task 13b322a2b926) ===
+// Relative Zeit + Farbcode fuer "Alter des Eintrags".
+// Implementiert in src/utils/dateFormat.ts (formatAge, ageColor) — wird oben importiert.
+//  < 1h    -> gruen  (frisch)
+//  < 24h   -> blau   (heute)
+//  < 7d    -> orange (diese Woche)
+//  >= 7d   -> rot    (alt)
+// formatRelativeTime() liefert die ausfuehrliche Variante ("vor 5 Minuten")
+// fuer Tooltips/Badges — siehe dateFormat.ts fuer Details.
 
 function StatusBadge({
   status,
@@ -121,6 +132,14 @@ export default function Performance() {
   useEffect(() => {
     if (taskFilter) setSelectionActive(true)
   }, [taskFilter])
+
+  // === Feature 22.06.2026 (Task 13b322a2b926) ===
+  // Tick jede Minute, damit "Alter"-Spalte live aktualisiert (nicht statisch).
+  const [now, setNow] = useState<number>(Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60_000)
+    return () => clearInterval(id)
+  }, [])
 
   // Globale Stats
   const { data: globalStats } = useQuery({
@@ -433,6 +452,7 @@ export default function Performance() {
                   <th style={{ width: 140 }}>Reason</th>
                   <th style={{ width: 60 }}>Delay</th>
                   <th style={{ width: 70 }}>Duration</th>
+                  <th style={{ width: 80 }} title="Relatives Alter seit Transition-At. Live-Update jede Minute.">Alter</th>
                   <th style={{ width: 130 }}>Transition-At</th>
                   <th style={{ width: 130 }}>Completed-At</th>
                 </tr>
@@ -536,11 +556,32 @@ export default function Performance() {
                     <td className="mono">
                       {t.duration_ms != null ? `${t.duration_ms}ms` : <span style={{ color: "var(--color-hermes-text-secondary)" }}>—</span>}
                     </td>
+                    {(() => {
+                      const ageText = formatAge(t.transition_at, now)
+                      const ageFg = ageColor(t.transition_at, now)
+                      return (
+                        <td
+                          className="mono"
+                          style={{
+                            fontSize: 11,
+                            fontWeight: 600,
+                            color: ageFg,
+                          }}
+                          title={
+                            t.transition_at
+                              ? `Exakt: ${formatTimestampDE(t.transition_at)} (${formatRelativeTime(t.transition_at, now)})`
+                              : "Kein Transition-At"
+                          }
+                        >
+                          {ageText}
+                        </td>
+                      )
+                    })()}
                     <td className="mono" style={{ fontSize: 10 }}>
-                      {t.transition_at ? new Date(t.transition_at).toLocaleString("de-DE") : "—"}
+                      {formatTimestampDE(t.transition_at)}
                     </td>
                     <td className="mono" style={{ fontSize: 10 }}>
-                      {t.completed_at ? new Date(t.completed_at).toLocaleString("de-DE") : <span style={{ color: "var(--color-hermes-text-secondary)" }}>pending</span>}
+                      {t.completed_at ? formatTimestampDE(t.completed_at) : <span style={{ color: "var(--color-hermes-text-secondary)" }}>pending</span>}
                     </td>
                   </tr>
                   )
@@ -669,9 +710,9 @@ function PerformanceDetailSidebar({
         {/* Zeitstempel */}
         <div className="detail-panel-section">
           <h4 style={{ margin: "0 0 8px", fontSize: 12 }}>🕐 Zeitstempel</h4>
-          <DetailRow label="Transition-At" value={t.transition_at ? new Date(t.transition_at).toLocaleString("de-DE") : "—"} />
-          <DetailRow label="Processing-At" value={t.processing_at ? new Date(t.processing_at).toLocaleString("de-DE") : "—"} />
-          <DetailRow label="Completed-At" value={t.completed_at ? new Date(t.completed_at).toLocaleString("de-DE") : "—"} />
+          <DetailRow label="Transition-At" value={formatTimestampDE(t.transition_at)} />
+          <DetailRow label="Processing-At" value={formatTimestampDE(t.processing_at)} />
+          <DetailRow label="Completed-At" value={formatTimestampDE(t.completed_at)} />
         </div>
 
         {/* Details / Reason */}
