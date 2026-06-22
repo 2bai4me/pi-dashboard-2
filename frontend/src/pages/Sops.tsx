@@ -35,6 +35,12 @@ function AgentSelect({
     staleTime: 60_000,
   })
   const configs: AgentOption[] = (data as any) || []
+  // User-Direktive 22.06.2026: Agenten alphabetisch sortieren fuer bessere UX
+  // localeCompare() beachtet Umlaute und Locale-Einstellungen korrekt.
+  const sortedConfigs = useMemo(
+    () => [...configs].sort((a, b) => a.name.localeCompare(b.name, "de")),
+    [configs]
+  )
   // Immer bekannte System-Optionen anbieten, auch wenn Configs noch laden
   const systemOptions = ["system", "user"]
   const unknownButSelected = value && !configs.some((c) => c.name === value) && !systemOptions.includes(value)
@@ -46,7 +52,7 @@ function AgentSelect({
       onChange={(e) => onChange(e.target.value)}
       style={style}
     >
-      {configs.map((c) => (
+      {sortedConfigs.map((c) => (
         <option key={c.name} value={c.name}>
           {c.emoji || "🤖"} {c.name} {c.is_subagent ? "(Sub-Agent)" : "(Org)"}
         </option>
