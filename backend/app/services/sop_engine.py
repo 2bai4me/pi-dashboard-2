@@ -629,6 +629,12 @@ class SOPEngine:
         if action == "noop":
             return {"ok": True, "action": "noop", "note": "no action performed"}
 
+        # === Multi-Agent-Swarm (User-Direktive 22.06.2026) ===
+        # Startet einen Swarm von SubAgents (parallel/competitive) fuer
+        # hoechste Qualitaet durch Diversitaet und Konsens-Bewertung.
+        if action == "spawn_swarm":
+            return await self._execute_spawn_swarm(instance, step, task, params)
+
         if action == "spawn_sop":
             sub_sop_id = params.get("sop_id")
             if not sub_sop_id:
@@ -1496,6 +1502,87 @@ class SOPEngine:
         return {"ok": True, "action": "failed", "reason": reason}
 
     # === Helper ===
+
+    async def _execute_spawn_swarm(
+        self, instance: SOPInstance, step: SOPStep,
+        task: Optional[Task], params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Multi-Agent-Swarm starten und orchestrieren.
+
+        User-Direktive 22.06.2026: Staged Hybrid Swarm.
+        Liest swarm-Konfiguration aus step.action_params (oder stage_key
+        aus den Default-Konfigs), startet den Swarm und gibt das
+        konsolidierte Ergebnis zurueck.
+
+        Returns:
+            Dict mit ok=True/False, swarm_run_id, merged_output, cost_usd
+        """
+        from ..services.swarm_spawner import (
+            SwarmConfig, SwarmType, MergeStrategy,
+            SWARM_CONFIGS, create_swarm_run, execute_swarm,
+        )
+
+        # Konfiguration aus params oder Default-Config laden
+        stage_key = params.get("stage_key")
+        if stage_key and stage_key in SWARM_CONFIGS:
+            config = SWARM_CONFIGS[stage_key]
+        else:
+            try:
+                config = SwarmConfig.from_dict(params)
+            except Exception as e:
+                return {"ok": False, "error": f"spawn_swarm: invalid config: {e}"}
+
+        # Swarm-Run in DB anlegen
+        swarm_id = create_swarm_run(
+            task_id=instance.task_id or "",
+            sop_instance_id=instance.id,
+            step_id=step.id,
+            config=config,
+        )
+
+        # Task-Kontext fuer die Worker
+        task_context = {
+            "task_id": task.id if task else None,
+            "title": task.title if task else None,
+            "description": task.description if task else None,
+            "sop_step_name": step.name,
+        }
+
+        # Swarm ausfuehren
+        try:
+            result = await execute_swarm(swarm_id, task_context=task_context)
+        except Exception as e:
+            logger.exception(f"spawn_swarm fehlgeschlagen: {e}")
+            return {"ok": False, "error": f"spawn_swarm: {e}",
+                    "swarm_run_id": swarm_id}
+
+        # Konsens-Score extrahieren (falls vorhanden)
+        consensus_score = None
+        auto_approved = False
+        merged = result.get("merged_output", {})
+        if isinstance(merged, dict):
+            consensus_score = merged.get("avg_score")
+            auto_approved = merged.get("auto_approve", False)
+
+        # Kosten-Check
+        if result["total_cost_usd"] > config.max_cost_usd:
+            logger.warning(
+                f"Swarm {swarm_id} hat Cost-Limit ueberschritten: "
+                f"${result['total_cost_usd']:.2f} > ${config.max_cost_usd:.2f}"
+            )
+
+        return {
+            "ok": True,
+            "action": "spawn_swarm",
+            "swarm_run_id": swarm_id,
+            "swarm_type": config.swarm_type.value,
+            "worker_count": result["worker_count"],
+            "merge_strategy": config.merge_strategy.value,
+            "total_cost_usd": result["total_cost_usd"],
+            "consensus_score": consensus_score,
+            "auto_approved": auto_approved,
+            "merged_output": merged,
+        }
 
     def _log_execution(
         self, instance: SOPInstance, step_id: Optional[str], event: str,

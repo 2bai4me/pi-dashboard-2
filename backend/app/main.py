@@ -5,18 +5,26 @@ Alle Daten werden in SQL gespeichert (SQLite/PostgreSQL via SQLAlchemy 2.0).
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text, select, func as sqlfunc
 from sqlalchemy.orm import Session
 
 from .config import settings, BACKEND_ROOT
 from .db.base import init_db, engine, SessionLocal, get_db
-from .auth import require_auth
+from .mcp_bus import MCPServer
+from .auth import require_auth, require_role
+from .schemas.error import ErrorResponse
+from .utils.exceptions import DashboardError
 from .services.role_service import RoleService
 from .scheduler import start_scheduler, stop_scheduler
 from .models.task import Task
@@ -31,6 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pi-dashboard-2")
 
+_mcp_server: Optional[MCPServer] = None
+
 # JSON-Logging Setup (Production-Ready) — toggle via LOG_FORMAT=json
 import os
 if os.getenv("LOG_FORMAT", "text").lower() == "json":
@@ -38,13 +48,136 @@ if os.getenv("LOG_FORMAT", "text").lower() == "json":
     class JsonFormatter(logging.Formatter):
         def format(self, record):
             return json.dumps({
-                "ts": datetime.utcnow().isoformat(),
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": record.getMessage(),
             })
     for h in logging.root.handlers:
         h.setFormatter(JsonFormatter())
+
+
+def _read_models_json() -> Dict[str, Any]:
+    """Liest die zentrale models.json (Provider/Modell-Konfiguration)."""
+    from .config import get_models_json_path
+
+    p = get_models_json_path()
+    if not p.exists():
+        return {"providers": {}}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"models.json read failed: {e}")
+        return {"providers": {}}
+
+
+def _read_auth_json() -> Dict[str, Any]:
+    """Liest die zentrale auth.json (API-Keys)."""
+    from .config import get_auth_json_path
+
+    p = get_auth_json_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"auth.json read failed: {e}")
+        return {}
+
+
+def _check_provider_key_configured(provider: str) -> bool:
+    """Prueft, ob fuer einen Provider ein API-Key vorhanden ist.
+
+    Reihenfolge:
+      1. ENV-Variable (z.B. KIMI_API_KEY, MINIMAX_API_KEY)
+      2. auth.json Eintrag fuer den Provider
+      3. apiKey/apiKeyRef in models.json
+    """
+    cfg = _read_models_json()
+    prov_cfg = (cfg.get("providers") or {}).get(provider, {})
+    if prov_cfg.get("apiKey") or prov_cfg.get("authHeader"):
+        return True
+
+    # ENV-Mapping
+    env_var_map = {
+        "kimi": "KIMI_API_KEY",
+        "minimax-direct": "MINIMAX_API_KEY",
+        "minimax": "MINIMAX_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "ollama": "",  # kein Key noetig
+    }
+    env_var = env_var_map.get(provider, f"{provider.upper().replace('-', '_')}_API_KEY")
+    if env_var and os.environ.get(env_var):
+        return True
+
+    auth = _read_auth_json()
+    if isinstance(auth, dict) and provider in auth:
+        entry = auth[provider]
+        if isinstance(entry, dict) and entry.get("key"):
+            return True
+        if isinstance(entry, str) and entry:
+            return True
+    return False
+
+
+def _validate_code_agent_provider() -> Dict[str, Any]:
+    """Validiert die Sub-Agent Provider/Model-Konfiguration beim Start.
+
+    Gibt ein Dict mit provider, model, valid, fallback, warnings zurueck.
+    """
+    from .services.worker_service import (
+        CODE_AGENT_PROVIDER, CODE_AGENT_MODEL, _normalize_code_agent_provider_model,
+    )
+
+    provider, model = _normalize_code_agent_provider_model(
+        CODE_AGENT_PROVIDER, CODE_AGENT_MODEL
+    )
+    cfg = _read_models_json()
+    providers = cfg.get("providers") or {}
+    warnings: list[str] = []
+    fallback = False
+
+    if provider not in providers:
+        warnings.append(
+            f"Sub-Agent Provider '{CODE_AGENT_PROVIDER}' nicht in models.json. "
+            f"Fallback auf 'kimi'."
+        )
+        provider, model = "kimi", "kimi-k2.7-code"
+        fallback = True
+
+    prov_cfg = providers.get(provider, {})
+    model_ids = {m.get("id") for m in prov_cfg.get("models", [])}
+    if model not in model_ids:
+        warnings.append(
+            f"Sub-Agent Model '{model}' nicht fuer Provider '{provider}' in models.json. "
+            f"Fallback auf 'kimi-k2.7-code'."
+        )
+        if "kimi-k2.7-code" in model_ids:
+            model = "kimi-k2.7-code"
+        elif model_ids:
+            model = sorted(model_ids)[0]
+        else:
+            model = "kimi-k2.7-code"
+            provider = "kimi"
+        fallback = True
+
+    key_ok = _check_provider_key_configured(provider)
+    if not key_ok:
+        warnings.append(
+            f"Kein API-Key fuer Provider '{provider}' konfiguriert. "
+            f"Bitte ENV-Variable oder auth.json setzen."
+        )
+
+    return {
+        "provider": provider,
+        "model": model,
+        "valid": not fallback and key_ok,
+        "fallback": fallback,
+        "key_configured": key_ok,
+        "warnings": warnings,
+    }
 
 
 def _alembic_is_current() -> bool:
@@ -104,6 +237,20 @@ async def lifespan(app: FastAPI):
             added = RoleService.seed_defaults(db)
             if added:
                 logger.info(f"Seeded {added} default roles.")
+        # Sub-Agent Provider/Model validieren (User-Direktive: keine 401 durch Mismatch)
+        try:
+            code_agent_status = _validate_code_agent_provider()
+            if code_agent_status["valid"]:
+                logger.info(
+                    f"Sub-Agent Provider-Validierung OK: {code_agent_status['provider']}/"
+                    f"{code_agent_status['model']}"
+                )
+            else:
+                logger.warning(
+                    f"Sub-Agent Provider-Validierung: {code_agent_status['warnings']}"
+                )
+        except Exception as e:
+            logger.warning(f"Sub-Agent Provider-Validierung fehlgeschlagen: {e}")
         # Session-IDs fuer die Background-Prozesse initialisieren
         try:
             from .services.session_helper import init_session_id
@@ -130,6 +277,17 @@ async def lifespan(app: FastAPI):
             logger.info("Worker-Loop gestartet (automatische Task-Bearbeitung via LLM)")
         except Exception as e:
             logger.warning(f"Worker-Loop konnte nicht starten: {e}")
+        # MCP-over-ZMQ Bus starten (User-Direktive: MCP/ZMQ Standard)
+        global _mcp_server
+        try:
+            from . import mcp_tools  # noqa: F401 - registers tools
+            from .mcp_tools import register_external_tools
+            await register_external_tools()
+            _mcp_server = MCPServer(session_factory=SessionLocal)
+            await _mcp_server.start()
+            logger.info(f"MCP-over-ZMQ server started with tools: {list(_mcp_server.tools().keys())}")
+        except Exception as e:
+            logger.warning(f"MCP-over-ZMQ server konnte nicht starten: {e}")
     except Exception as e:
         logger.error(f"Init failed: {e}")
         raise
@@ -149,6 +307,13 @@ async def lifespan(app: FastAPI):
         await stop_worker_loop()
     except Exception as e:
         logger.warning(f"Worker-Loop-Stop fehlgeschlagen: {e}")
+    # MCP-over-ZMQ Bus stoppen
+    if _mcp_server is not None:
+        try:
+            await _mcp_server.stop()
+            logger.info("MCP-over-ZMQ server stopped")
+        except Exception as e:
+            logger.warning(f"MCP-over-ZMQ server stop failed: {e}")
     engine.dispose()
 
 
@@ -158,6 +323,57 @@ app = FastAPI(
     version="2.0.0-rc",
     lifespan=lifespan,
 )
+
+
+# === Globales Exception-Handling ===
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Einheitliche HTTP-Exception Responses."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse.from_exception(
+            error="http_error",
+            detail=str(exc.detail),
+            status_code=exc.status_code,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(DashboardError)
+async def dashboard_exception_handler(request: Request, exc: DashboardError):
+    """Wandelt bekannte Dashboard-Fehler in einheitliche Responses um."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse.from_exception(
+            error=exc.__class__.__name__,
+            detail=exc.message,
+            status_code=exc.status_code,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Fangt unerwartete Fehler und verhindert rohe Stacktraces im Response-Body."""
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=ErrorResponse.from_exception(
+                error="http_error",
+                detail=str(exc.detail),
+                status_code=exc.status_code,
+            ).model_dump(),
+        )
+    logger.error(f"Unerwarteter Fehler: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse.from_exception(
+            error="internal_error",
+            detail="Ein unerwarteter Fehler ist aufgetreten",
+            status_code=500,
+        ).model_dump(),
+    )
+
 
 # CORS (Whitelist aus .env via CORS_ORIGINS env-var)
 app.add_middleware(
@@ -195,7 +411,7 @@ if settings.RATE_LIMIT_PER_MINUTE > 0:  # type: ignore
 # - agent_questions:         User<->Agent Interaktionstool
 # - subagents:              SubAgent-Konfig
 # - board_operators/test_runner: Live-Watchdog + Test-Navigator
-from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials  # noqa: E402
+from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials, smproducer, swarm  # noqa: E402
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
@@ -211,9 +427,11 @@ app.include_router(agent_questions.router)  # User-Direktive 17.06.2026: User<->
 app.include_router(subagents.router)  # User-Direktive 18.06.2026: SubAgent-Konfiguration (Modell pro Rolle)
 app.include_router(board_operators.router)  # User-Direktive 17.06.2026: Live-Board Watchdog-Instanzen
 app.include_router(test_runner.router)  # User-Direktive 17.06.2026: Navigator-Service fuer Test-Aktionen
+app.include_router(swarm.router)  # User-Direktive 22.06.2026: Multi-Agent-Swarm (Phase 0-2)
 app.include_router(tts.router)  # MiniMax Text-to-Audio V2
 app.include_router(auth.router)  # JWT Login
 app.include_router(provider_credentials.router)  # Zentrale API-Key-Verwaltung
+app.include_router(smproducer.router)  # OpenBrain-konforme SMproducer 3.0 Bridge
 
 
 # === Health-Check ===
@@ -278,7 +496,32 @@ async def health_db_deep(
     return {
         "status": "ok" if overall_ok else "degraded",
         "checks": checks,
-        "checked_at": datetime.utcnow().isoformat(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/health/providers")
+async def health_providers(
+    _user: str = Depends(require_auth),
+):
+    """Provider-Health: Sub-Agent Config + Key-Status fuer alle konfigurierten Provider."""
+    code_agent_status = _validate_code_agent_provider()
+    cfg = _read_models_json()
+    providers = cfg.get("providers") or {}
+    provider_status = {}
+    for name, prov_cfg in providers.items():
+        model_ids = [m.get("id") for m in prov_cfg.get("models", [])]
+        provider_status[name] = {
+            "base_url": prov_cfg.get("baseUrl") or prov_cfg.get("api"),
+            "models": model_ids,
+            "supports_parallel": prov_cfg.get("supportsParallel", False),
+            "key_configured": _check_provider_key_configured(name),
+        }
+    return {
+        "status": "ok" if code_agent_status["valid"] else "degraded",
+        "code_agent": code_agent_status,
+        "providers": provider_status,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -300,7 +543,7 @@ async def version() -> dict:
 @app.get("/api/analytics/summary")
 async def analytics_summary(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("cio")),
 ):
     """Globale Analytics — SQL-Aggregation."""
     total_tasks = db.execute(select(sqlfunc.count(Task.id))).scalar()
@@ -363,7 +606,7 @@ async def kanban_events(
             "event": "connected",
             "data": _json.dumps({
                 "project_id": project_id,
-                "ts": datetime.utcnow().isoformat(),
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "last_event_id": last_event_id,
             }),
         }
@@ -389,7 +632,7 @@ async def kanban_events(
 # === Analytics: Index-Audit (welche DB-Indizes werden genutzt?) ===
 @app.post("/api/analytics/analyze")
 async def run_analyze(
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Fuehrt ANALYZE auf der DB aus — sammelt sqlite_stat1 fuer EXPLAIN-Ausgaben."""
     with engine.connect() as conn:
@@ -401,7 +644,7 @@ async def run_analyze(
 @app.get("/api/analytics/index-usage")
 async def index_usage(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Liefert Index-Usage-Statistiken + Drop-Empfehlungen."""
     with engine.connect() as conn:
@@ -444,7 +687,7 @@ async def index_usage(
             "selectivity": selectivity,
             "recommendation": recommendation,
         })
-    return {"indexes": out, "analyzed_at": datetime.utcnow().isoformat()}
+    return {"indexes": out, "analyzed_at": datetime.now(timezone.utc).isoformat()}
 
 
 # === Cost-Endpoint (aggregiert, war in v1 mit JSON-Parsing) ===
@@ -452,7 +695,7 @@ async def index_usage(
 async def cost_summary(
     days: int = Query(30, ge=1, le=365),
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("cio")),
 ):
     """Aggregierte Token/Cost-Stats der letzten N Tage (default 30).
 
@@ -460,7 +703,7 @@ async def cost_summary(
     Liefert: total, by_model, by_provider, by_role, by_day, savings.
     """
     from datetime import timedelta
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     # Total
     totals = db.execute(
         select(
@@ -542,7 +785,7 @@ async def cost_summary(
 @app.post("/api/kanban/backup")
 async def create_backup(
     target_path: str = "database/pi_dashboard.backup.db",
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Erstellt einen SQLite-Hot-Backup via sqlite3 .backup()-API.
 
@@ -566,7 +809,7 @@ async def create_backup(
         "ok": True,
         "path": str(target),
         "size_mb": round(size_mb, 3),
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -575,7 +818,7 @@ async def create_backup(
 async def restore_backup(
     source_path: str = "database/pi_dashboard.backup.db",
     confirm: bool = False,
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Stellt einen SQLite-Backup wieder her.
 
@@ -595,5 +838,5 @@ async def restore_backup(
         "restored_from": str(src),
         "restored_to": db_path,
         "size_mb": round(src.stat().st_size / (1024 * 1024), 3),
-        "restored_at": datetime.utcnow().isoformat(),
+        "restored_at": datetime.now(timezone.utc).isoformat(),
     }

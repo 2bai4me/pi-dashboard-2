@@ -36,6 +36,13 @@ export const api = {
   put: <T = any>(path: string, body?: any) => request<T>("PUT", path, body),
   patch: <T = any>(path: string, body?: any) => request<T>("PATCH", path, body),
   delete: <T = any>(path: string) => request<T>("DELETE", path),
+  // Multi-Agent-Swarm (User-Direktive 22.06.2026)
+  swarms: {
+    listByTask: (taskId: string) =>
+      request<any>("GET", `/api/swarms?task_id=${taskId}`),
+    get: (id: string) => request<any>("GET", `/api/swarms/${id}`),
+    spawn: (config: any) => request<any>("POST", "/api/swarms", config),
+  },
   // Projects
   listProjects: () => request<any>("GET", "/api/kanban/projects"),
   getProject: (id: string) => request<any>("GET", `/api/kanban/projects/${id}`),
@@ -62,6 +69,19 @@ export const api = {
       request<any>("PATCH", `/api/subagents/${roleName}/model`, { model, provider, api_key_id: apiKeyId }),
     updatePrompt: (roleName: string, systemPrompt: string) =>
       request<any>("PATCH", `/api/subagents/${roleName}/prompt`, { system_prompt: systemPrompt }),
+    updateName: (roleName: string, displayName: string) =>
+      request<any>("PATCH", `/api/subagents/${roleName}/name`, { display_name: displayName }),
+    updateSop: (roleName: string, sopId: string | null) =>
+      request<any>("PATCH", `/api/subagents/${roleName}/sop`, { sop_id: sopId || null }),
+    updateConfig: (roleName: string, data: {
+      display_name?: string | null;
+      sop_id?: string | null;
+      model?: string | null;
+      provider?: string | null;
+      api_key_id?: string | null;
+      system_prompt?: string | null;
+    }) => request<any>("PATCH", `/api/subagents/${roleName}/config`, data),
+    delete: (roleName: string) => request<any>("DELETE", `/api/subagents/${roleName}`),
   },
 
   // === CIO-Triage (Schritt 0, User-Direktive 16.06.2026) ===
@@ -208,7 +228,7 @@ export const api = {
   getSop: (sopId: string) => request<any>("GET", `/api/sops/${sopId}`),
   createSop: (data: any) => request<any>("POST", "/api/sops", data),
   updateSop: (sopId: string, data: any) => request<any>("PUT", `/api/sops/${sopId}`, data),
-  updateSopStep: (sopId: string, stepId: string, data: { description?: string; expected_result?: string; ai_instructions_md?: string }) =>
+  updateSopStep: (sopId: string, stepId: string, data: { description?: string; expected_result?: string; ai_instructions_md?: string; agent?: string; model?: string }) =>
     request<any>("PATCH", `/api/sops/${sopId}/steps/${stepId}`, data),
   createSopStep: (sopId: string, data: any) => request<any>("POST", `/api/sops/${sopId}/steps`, data),
   aiStepHelper: (sopId: string, stepId: string, userInput: string, model?: string) =>
