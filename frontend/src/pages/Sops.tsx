@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useMemo, useRef } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import ReactMarkdown from "react-markdown"
 import {
@@ -24,6 +24,9 @@ interface AgentOption {
   role_type?: string
   is_subagent: boolean
   emoji?: string
+  model?: string
+  provider?: string
+  default_model?: string
 }
 
 function AgentSelect({
@@ -62,6 +65,135 @@ function AgentSelect({
       ))}
       {unknownButSelected && <option value={value}>{value} (unbekannt)</option>}
     </select>
+  )
+}
+
+// ─────────────── Modell-Anzeige: read-only, wird aus SubAgent-Konfiguration gezogen ───────────────
+// User-Direktive 22.06.2026: Im SOP-Step-Editor wird das Modell NICHT mehr ausgewaehlt,
+// sondern aus der gewaehlten SubAgent-Konfiguration uebernommen und nur angezeigt.
+// Aenderung des Modells erfolgt ausschliesslich in der SubAgent-Ansicht.
+function AgentModelDisplay({
+  agent,
+  style,
+}: {
+  agent: string
+  style?: React.CSSProperties
+}) {
+  const { data } = useQuery({
+    queryKey: ["subagent-configs"],
+    queryFn: () => api.subagents.listConfigs(),
+    staleTime: 60_000,
+  })
+  const configs: AgentOption[] = (data as any) || []
+
+  // Basis-Styles fuer alle Anzeigevarianten
+  const baseStyle: React.CSSProperties = {
+    ...style,
+    fontSize: 11,
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "4px 8px",
+    border: "1px solid var(--color-hermes-border)",
+    borderRadius: 4,
+    cursor: "help",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  }
+
+  // System / User: kein LLM-Aufruf
+  if (!agent || agent === "system" || agent === "user") {
+    const isSystem = agent === "system"
+    return (
+      <div
+        className="input"
+        style={{
+          ...baseStyle,
+          background: "var(--color-hermes-bg-secondary)",
+          color: "var(--color-hermes-text-secondary)",
+          fontStyle: "italic",
+        }}
+        title={isSystem ? "System-Aktion (kein LLM-Aufruf)" : "User-Aktion (manuell)"}
+      >
+        <span>{isSystem ? "⚙️" : "👤"}</span>
+        <span>{isSystem ? "System-Aktion — kein Modell" : "User-Aktion — manuell"}</span>
+      </div>
+    )
+  }
+
+  // Agent nicht in SubAgent-Konfigurationen gefunden
+  const cfg = configs.find((c) => c.name === agent)
+  if (!cfg) {
+    return (
+      <div
+        className="input"
+        style={{
+          ...baseStyle,
+          background: "rgba(239, 68, 68, 0.08)",
+          color: "var(--color-hermes-danger, #ef4444)",
+          borderColor: "var(--color-hermes-danger, #ef4444)",
+        }}
+        title={`Agent "${agent}" wurde nicht in den SubAgent-Konfigurationen gefunden. Bitte in SubAgenten anlegen.`}
+      >
+        <span>⚠️</span>
+        <span>Agent unbekannt — SubAgent-Konfiguration fehlt</span>
+      </div>
+    )
+  }
+
+  // Modell aus SubAgent-Konfiguration ableiten (model hat Vorrang vor default_model)
+  const modelName = cfg.model || cfg.default_model || ""
+  const providerName = cfg.provider || ""
+  const fullName = providerName && modelName ? `${providerName}/${modelName}` : modelName
+
+  // SubAgent vorhanden, aber kein Modell konfiguriert
+  if (!fullName) {
+    return (
+      <div
+        className="input"
+        style={{
+          ...baseStyle,
+          background: "rgba(245, 158, 11, 0.08)",
+          color: "var(--color-hermes-warning, #f59e0b)",
+          borderColor: "rgba(245, 158, 11, 0.4)",
+        }}
+        title={`SubAgent "${agent}" hat kein Modell konfiguriert. Bitte in SubAgenten ergaenzen.`}
+      >
+        <span>🟡</span>
+        <span>Kein Modell in SubAgent konfiguriert</span>
+      </div>
+    )
+  }
+
+  // Normalfall: Modell wird aus SubAgent uebernommen und read-only angezeigt
+  return (
+    <div
+      className="input"
+      style={{
+        ...baseStyle,
+        background: "var(--color-hermes-bg-secondary)",
+        color: "var(--color-hermes-text)",
+      }}
+      title={`Modell wird automatisch aus SubAgent-Konfiguration uebernommen. Aenderung in SubAgenten vornehmen.`}
+    >
+      <span style={{ fontSize: 10 }}>🧠</span>
+      <code style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>{fullName}</code>
+      {!cfg.is_subagent && (
+        <span
+          style={{
+            fontSize: 9,
+            color: "var(--color-hermes-text-secondary)",
+            marginLeft: 2,
+            padding: "0 4px",
+            background: "var(--color-hermes-bg)",
+            borderRadius: 3,
+          }}
+        >
+          Org
+        </span>
+      )}
+    </div>
   )
 }
 
@@ -1169,6 +1301,16 @@ function StepDetailSidebar({
   onStepDeleted?: () => void
   onOpenAiDesigner?: () => void
 }) {
+  const qc = useQueryClient()
+  const updateMut = useMutation({
+    mutationFn: (data: { agent?: string; model?: string }) => api.updateSopStep(sopId, step.id, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["sop", sopId] })
+      qc.invalidateQueries({ queryKey: ["sop-bpmn", sopId] })
+      qc.invalidateQueries({ queryKey: ["sop-uml", sopId] })
+    },
+  })
+
   return (
     <div className="card" style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
       {/* Header */}
@@ -1191,9 +1333,19 @@ function StepDetailSidebar({
         <h3 style={{ margin: "4px 0 8px", fontSize: 15, fontWeight: 600, color: "var(--color-hermes-accent-blue)" }}>
           {step.name}
         </h3>
-        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
           <span className="badge badge-blue" style={{ fontSize: 10 }}>{step.phase}</span>
-          {step.agent && <span className="badge badge-green" style={{ fontSize: 10 }}>👤 {step.agent}</span>}
+          <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginLeft: 4 }}>Agent:</span>
+          <AgentSelect
+            value={step.agent || ""}
+            onChange={(agent) => updateMut.mutate({ agent })}
+            style={{ width: 130, fontSize: 11 }}
+          />
+          <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginLeft: 4 }}>Modell:</span>
+          <AgentModelDisplay
+            agent={step.agent || ""}
+            style={{ width: 190 }}
+          />
           {step.action && <span className="badge badge-gray" style={{ fontSize: 10 }}>⚡ {step.action}</span>}
         </div>
       </div>
@@ -2358,6 +2510,7 @@ function makeEmptyStep(order: number) {
     action: "noop",
     action_params: {},
     agent: "system",
+    model: "minimax-direct/minimax-m3",
     expected_result: "",
     success_criteria: [],
     delay_s: 5.0,
@@ -2382,6 +2535,7 @@ function StepEditor({ step, index, onChange, onRemove }: any) {
           <option>Notification</option>
         </select>
         <AgentSelect value={step.agent} onChange={(agent) => onChange({ ...step, agent })} style={{ width: 140 }} />
+        <AgentModelDisplay agent={step.agent} style={{ width: 200 }} />
         <button className="btn btn-sm" onClick={onRemove}><X size={12} /></button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 100px", gap: 6, marginBottom: 6 }}>
@@ -3041,6 +3195,21 @@ function AddStepModal({ sopId, steps, onClose, onCreated }: {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // User-Direktive 22.06.2026: Modell wird automatisch aus SubAgent-Konfiguration abgeleitet,
+  // nicht mehr manuell gewaehlt. Backend erhaelt das abgeleitete Modell fuer historische Speicherung.
+  const { data: agentConfigsData } = useQuery({
+    queryKey: ["subagent-configs"],
+    queryFn: () => api.subagents.listConfigs(),
+    staleTime: 60_000,
+  })
+  const modelFromAgent = useMemo(() => {
+    if (!agent || agent === "system" || agent === "user") return ""
+    const cfg = (agentConfigsData || []).find((c: any) => c.name === agent)
+    if (!cfg) return ""
+    const m = cfg.model || cfg.default_model || ""
+    return cfg.provider && m ? `${cfg.provider}/${m}` : m
+  }, [agent, agentConfigsData])
+
   async function handleSave() {
     if (!name.trim()) {
       setError("Bitte einen Namen eingeben.")
@@ -3053,6 +3222,7 @@ function AddStepModal({ sopId, steps, onClose, onCreated }: {
         name: name.trim(),
         phase,
         agent,
+        model: modelFromAgent,
         trigger,
         action,
         description: description.trim() || null,
@@ -3143,6 +3313,13 @@ function AddStepModal({ sopId, steps, onClose, onCreated }: {
               </label>
               <AgentSelect value={agent} onChange={setAgent} />
             </div>
+          </div>
+
+          <div>
+            <label style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", display: "block", marginBottom: 4 }}>
+              Modell (aus SubAgent-Konfiguration)
+            </label>
+            <AgentModelDisplay agent={agent} style={{ width: "100%" }} />
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
