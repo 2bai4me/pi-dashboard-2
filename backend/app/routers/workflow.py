@@ -20,6 +20,7 @@ Implementiert:
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Body
@@ -38,6 +39,31 @@ router = APIRouter(prefix="/api/workflow", tags=["workflow"])
 
 
 # ------------------------------------------------------------ Helpers ------------------------------------------------------------
+
+def _conflict_keyword_matches(kw: str, text: str) -> bool:
+    """Prueft ob ein Konflikt-Keyword im Text vorkommt.
+
+    Wort-Keywords (nur Wortzeichen) werden mit Wortgrenzen-Match geprueft
+    (re.search mit \\b), um False-Positives zu vermeiden. Beispiel:
+    'tba' matcht NICHT in 'sichtbar', weil 'tba' kein eigenstaendiges Wort ist.
+
+    Symbol-Keywords (enthalten Sonderzeichen wie ':', '?', '[', ']') werden
+    als Substring gematcht, weil \\b fuer Sonderzeichen nicht definiert ist.
+    Beispiel: 'todo:' matcht ueberall wo 'todo:' vorkommt (auch in der Wortmitte).
+
+    Args:
+        kw: Das Konflikt-Keyword (z.B. 'tba', 'todo:', '???').
+        text: Der zu pruefende Text (bereits lowercase).
+
+    Returns:
+        True wenn Keyword gefunden wurde, sonst False.
+    """
+    if re.match(r'^\w+$', kw):
+        # Wort-Keyword: Wortgrenzen-Match (kein False-Positive bei 'sichtbar'->'tba')
+        return bool(re.search(rf'\b{re.escape(kw)}\b', text))
+    # Symbol-Keyword: Substring-Match
+    return kw in text
+
 
 def _get_task(db: Session, task_id: str) -> Task:
     t = db.get(Task, task_id)
@@ -318,9 +344,13 @@ def _check_cio_heuristic(db: Session, t: Task) -> dict:
     # vielen User-Texten vor (z.B. 'no_todos', 'in_todo_phase'). NICHT als
     # Konflikt-Keyword pruefen! Stattdessen nur 'TODO:' (mit Doppelpunkt) als
     # Code-Marker pruefen. Fix (User-Direktive 18.06.2026).
+    #
+    # BUGFIX 22.06.2026: Wortgrenzen (re.search mit \b) verhindern False-Positives
+    # wie 'sichtbar' -> 'tba' (User-Direktive Test mit Task 13b322a2b926).
     conflict_keywords = ["todo:", "tbd", "??", "fixme", "klären", "unbekannt", "???", "tba", "[todo]"]
     for kw in conflict_keywords:
-        if kw in full_text:
+        keyword_found = _conflict_keyword_matches(kw, full_text)
+        if keyword_found:
             kw_label = {
                 "todo:": "TODO (Code-Marker fuer 'noch zu tun')",
                 "tbd": "TBD (To Be Determined)",

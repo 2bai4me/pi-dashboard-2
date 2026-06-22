@@ -25,11 +25,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, func as sqlfunc
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..models.sop import (
@@ -37,26 +39,24 @@ from ..models.sop import (
 )
 from ..models.task import Task
 from ..models.project import Project
-from ..schemas.sop_action import ALLOWED_ACTIONS, ACTION_PARAM_SCHEMAS
+from ..schemas.sop_action import ALLOWED_ACTIONS as ALLOWED_SOP_ACTIONS, ACTION_PARAM_SCHEMAS
+from .llm_service import chat_completion
 from .task_service import TaskService
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None  # type: ignore
 
 logger = logging.getLogger("pi-dashboard-2.sop")
 
 
-# === Erlaubte SOP-Actions (Security-Whitelist) ===
-ALLOWED_SOP_ACTIONS = frozenset({
-    "noop",
-    "set_status",
-    "ask_user",
-    "llm_call",
-    "spawn_sop",
-    "review_task",
-    "assign_worker",
-    "implement",
-    "test",
-    "cio_final_review",
-    "tester_code_review",
-})
+# === SOP-Ausfuehrungs-Guards (Security & Stability) ===
+_DEFAULT_STEP_TIMEOUT_S: float = 300.0
+_MAX_STEP_TIMEOUT_S: float = 600.0
+_DEFAULT_MAX_COST_USD: float = 10.0
+_DEFAULT_MAX_LLM_TOKENS: int = 1_000_000
+_DEFAULT_MAX_STEP_ITERATIONS: int = 10
 
 
 def _gen_id() -> str:
@@ -85,6 +85,70 @@ class SOPEngine:
 
     def __init__(self, db: Session):
         self.db = db
+
+    # === Guard-Helper ===
+
+    def _step_timeout_s(self, step: SOPStep) -> float:
+        """Ermittelt das fuer diesen Step gueltige Execution-Timeout."""
+        params = step.action_params or {}
+        timeout = float(params.get("timeout_sec", _DEFAULT_STEP_TIMEOUT_S))
+        return min(max(timeout, 0.001), _MAX_STEP_TIMEOUT_S)
+
+    def _guard_limits(self, instance: SOPInstance, step: SOPStep) -> Optional[Dict[str, Any]]:
+        """Prueft Budget- und Loop-Guard vor der Step-Ausfuehrung.
+
+        Liefert ein Fehler-Dict, wenn ein Limit ueberschritten wurde, sonst None.
+        """
+        params = step.action_params or {}
+        max_cost = float(params.get("max_cost_usd", _DEFAULT_MAX_COST_USD))
+        max_tokens = int(params.get("max_llm_tokens", _DEFAULT_MAX_LLM_TOKENS))
+        max_iterations = int(params.get("max_step_iterations", _DEFAULT_MAX_STEP_ITERATIONS))
+
+        # Iterations-Guard: wie oft wurde dieser Step bereits ausgefuehrt?
+        iteration_count = self.db.execute(
+            select(sqlfunc.count(SOPExecution.id))
+            .where(SOPExecution.instance_id == instance.id)
+            .where(SOPExecution.step_id == step.id)
+            .where(SOPExecution.event.in_(["step_started", "step_completed"]))
+        ).scalar() or 0
+        if iteration_count >= max_iterations:
+            return {
+                "ok": False,
+                "error": (
+                    f"Step iteration guard triggered: step {step.id} executed "
+                    f"{iteration_count} times (limit {max_iterations})"
+                ),
+            }
+
+        # Budget-Guard: kumulierte Kosten/Tokens fuer den zugehoerigen Task
+        if instance.task_id:
+            from ..models.token_usage import TokenUsage
+            totals = self.db.execute(
+                select(
+                    sqlfunc.coalesce(sqlfunc.sum(TokenUsage.cost_usd), 0.0),
+                    sqlfunc.coalesce(sqlfunc.sum(TokenUsage.tokens_in + TokenUsage.tokens_out), 0),
+                ).where(TokenUsage.task_id == instance.task_id)
+            ).one()
+            total_cost = float(totals[0] or 0.0)
+            total_tokens = int(totals[1] or 0)
+            if total_cost >= max_cost:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Instance budget exceeded: cost ${total_cost:.4f} >= "
+                        f"limit ${max_cost:.4f}"
+                    ),
+                }
+            if total_tokens >= max_tokens:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Instance token budget exceeded: {total_tokens} tokens >= "
+                        f"limit {max_tokens}"
+                    ),
+                }
+
+        return None
 
     # === CRUD: SOPs ===
 
@@ -157,6 +221,7 @@ class SOPEngine:
                     action=sd.get("action", "noop"),
                     action_params=sd.get("action_params", {}),
                     agent=sd.get("agent", "system"),
+                    model=sd.get("model"),
                     expected_result=sd.get("expected_result"),
                     success_criteria=sd.get("success_criteria", []),
                     delay_s=sd.get("delay_s", default_delay_s),
@@ -215,7 +280,7 @@ class SOPEngine:
         for k, v in fields.items():
             if v is not None and hasattr(sop, k):
                 setattr(sop, k, v)
-        sop.updated_at = datetime.utcnow()
+        sop.updated_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(sop)
         return sop
@@ -307,6 +372,13 @@ class SOPEngine:
         if not step:
             return {"ok": False, "error": "Step not found"}
 
+        # === Verantwortlichen Agent aus dem SOP-Step auf den Task uebertragen ===
+        # Damit Board-Karten immer den aktuellen Step-Agenten zeigen (z.B. CIO in Triage).
+        task = self.db.get(Task, instance.task_id) if instance.task_id else None
+        if task and step.agent:
+            task.assigned_role = step.agent
+            self.db.commit()
+
         # === Action-Whitelist (Sicherheit) ===
         if step.action not in ALLOWED_SOP_ACTIONS:
             logger.error(
@@ -343,7 +415,22 @@ class SOPEngine:
                 )
                 self.db.commit()
 
-        start_ts = datetime.utcnow()
+        # === Budget- & Loop-Guard ===
+        limit_violation = self._guard_limits(instance, step)
+        if limit_violation:
+            logger.error(
+                f"[sop-guard] Instance {instance.id[:8]} step {step.name!r}: "
+                f"{limit_violation['error']}"
+            )
+            self._log_execution(
+                instance, step_id=step.id, event="step_failed",
+                agent=step.agent, success=False,
+                details=limit_violation,
+            )
+            self.db.commit()
+            return self.fail_instance(instance, limit_violation["error"])
+
+        start_ts = datetime.now(timezone.utc)
         # Audit: step_started
         self._log_execution(
             instance, step_id=step.id, event="step_started",
@@ -363,9 +450,31 @@ class SOPEngine:
             )
             await asyncio.sleep(step.delay_s)
 
-        # Action ausfuehren (delegiert an Task-Service)
-        step_result = await self._execute_action(instance, step)
-        duration_ms = int((datetime.utcnow() - start_ts).total_seconds() * 1000)
+        # Action ausfuehren (mit Timeout)
+        timeout_s = self._step_timeout_s(step)
+        try:
+            step_result = await asyncio.wait_for(
+                self._execute_action(instance, step), timeout=timeout_s
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[sop-timeout] Instance {instance.id[:8]} step {step.name!r} "
+                f"exceeded timeout {timeout_s}s"
+            )
+            self._log_execution(
+                instance, step_id=step.id, event="step_failed",
+                agent=step.agent, success=False,
+                details={"error": f"step timeout after {timeout_s}s"},
+            )
+            self.db.commit()
+            if step.fail_step_id:
+                return self.advance(
+                    instance, step.fail_step_id,
+                    {"ok": False, "error": f"step timeout after {timeout_s}s"},
+                )
+            return self.fail_instance(instance, f"step timeout after {timeout_s}s")
+
+        duration_ms = int((datetime.now(timezone.utc) - start_ts).total_seconds() * 1000)
 
         # Audit: step_completed
         self._log_execution(
@@ -442,7 +551,7 @@ class SOPEngine:
                         agent_id=q.agent_id,
                         agent_label=q.agent_label,
                     )
-            except Exception as e:
+            except (SQLAlchemyError, ValueError, TypeError) as e:
                 logger.warning(f"Helper update_task_on_question fehlgeschlagen: {e}")
 
         # Audit: input_requested
@@ -460,10 +569,10 @@ class SOPEngine:
         )
 
         # 2) BLOCKIEREND auf Antwort warten
-        start = datetime.utcnow()
+        start = datetime.now(timezone.utc)
         deadline = start.timestamp() + timeout_s
         try:
-            while datetime.utcnow().timestamp() < deadline:
+            while datetime.now(timezone.utc).timestamp() < deadline:
                 await asyncio.sleep(2.0)
                 # In eigener Session pruefen (Hauptsession ist durch step in use)
                 with _SessionLocal() as qdb:
@@ -510,8 +619,11 @@ class SOPEngine:
           - spawn_sop: startet Sub-SOP
           - move_status: generischer Status-Wechsel
         """
-        action = step.action
+        # BUGFIX 22.06.2026: 'task' aus instance ableiten (analog zu run_step:377),
+        # weil _execute_action frueher eine undefinierte 'task'-Variable referenzierte
+        # (NameError: name 'task' is not defined bei Custom-Triage-Actions).
         task = self.db.get(Task, instance.task_id) if instance.task_id else None
+        action = step.action
         params = step.action_params or {}
 
         if action == "noop":
@@ -529,7 +641,6 @@ class SOPEngine:
 
         # === LLM-Call Action (Multi-Provider Phase 2) ===
         if action == "llm_call":
-            from .llm_service import chat_completion
             system_prompt = params.get("system_prompt", "Du bist ein hilfreicher Assistent.")
             user_prompt = params.get("user_prompt", "")
             if not user_prompt:
@@ -538,14 +649,17 @@ class SOPEngine:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ]
+            # LLM-Parameter auf sichere Maxima begrenzen
+            max_tokens = min(int(params.get("max_tokens", 2000)), 16000)
+            timeout_sec = min(float(params.get("timeout_sec", 60.0)), 300.0)
             try:
                 response = await chat_completion(
                     messages=messages,
                     model=params.get("model", "minimax-m3"),
                     temperature=params.get("temperature", 0.3),
-                    max_tokens=params.get("max_tokens", 2000),
+                    max_tokens=max_tokens,
                     response_format=params.get("response_format"),
-                    timeout_sec=params.get("timeout_sec", 60.0),
+                    timeout_sec=timeout_sec,
                     role=step.agent,
                 )
                 return {
@@ -554,7 +668,7 @@ class SOPEngine:
                     "agent": step.agent,
                     "response": response,
                 }
-            except Exception as e:
+            except (RuntimeError, ValueError, OSError, httpx.HTTPError) as e:
                 logger.error(f"llm_call failed for step {step.id}: {e}")
                 return {"ok": False, "error": f"llm_call failed: {e}"}
 
@@ -596,7 +710,7 @@ class SOPEngine:
                         "issues": result.get("issues", []),
                         "questions": result.get("questions", []),
                     }
-                except Exception as e:
+                except (ValueError, TypeError, OSError) as e:
                     logger.warning(f"review_task: Heuristik fehlgeschlagen: {e}")
                     # Fallback: manueller Review-Mode
                     return {"ok": True, "action": "review_task",
@@ -730,13 +844,13 @@ class SOPEngine:
             worker = params.get("worker", step.agent)
             old = task.assigned_role
             task.assigned_role = worker
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(timezone.utc)
             self.db.commit()
             return {"ok": True, "action": "assign_worker",
                     "task_id": task.id, "from": old, "to": worker}
 
         if action == "start_work":
-            task.claimed_at = datetime.utcnow()
+            task.claimed_at = datetime.now(timezone.utc)
             # Stufe 2: assigned_role = step.agent (z.B. pi-coder in Step 2)
             old_role = task.assigned_role
             task.assigned_role = step.agent
@@ -934,15 +1048,15 @@ class SOPEngine:
             if op == "eq":
                 try:
                     return field_value == target_value
-                except Exception:
+                except (TypeError, ValueError):
                     return False
             if op == "neq":
                 try:
                     return field_value != target_value
-                except Exception:
+                except (TypeError, ValueError):
                     return False
             return False
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             logger.warning(f"Condition-Eval fehlgeschlagen: {e}")
             return False
 
@@ -971,7 +1085,7 @@ class SOPEngine:
         if not isinstance(instance.meta, dict):
             try:
                 instance.meta = _json.loads(instance.meta) if instance.meta else {}
-            except Exception:
+            except _json.JSONDecodeError:
                 instance.meta = {}
 
         issues: list = instance.meta.setdefault("triage_issues", [])
@@ -1069,7 +1183,7 @@ class SOPEngine:
                 rules = self.db.execute(
                     select(ArchitectureRule).where(ArchitectureRule.is_active == True)
                 ).scalars().all()
-            except Exception:
+            except SQLAlchemyError:
                 return {"ok": True, "issues_count": len(issues), "note": "rules not loadable"}
             arch_issues = []
             for rule in rules:
@@ -1348,7 +1462,7 @@ class SOPEngine:
     ) -> Dict[str, Any]:
         """Markiert die Instance als completed."""
         instance.status = "completed"
-        instance.completed_at = datetime.utcnow()
+        instance.completed_at = datetime.now(timezone.utc)
         self._log_execution(
             instance, step_id=step.id if step else None,
             event="instance_completed", agent="system",
@@ -1372,7 +1486,7 @@ class SOPEngine:
     ) -> Dict[str, Any]:
         """Markiert die Instance als failed."""
         instance.status = "failed"
-        instance.completed_at = datetime.utcnow()
+        instance.completed_at = datetime.now(timezone.utc)
         self._log_execution(
             instance, step_id=instance.current_step_id,
             event="instance_failed", agent="system", success=False,
@@ -1602,105 +1716,6 @@ DEFAULT_TASK_SOP = {
 }
 
 
-# === Default-SOP: Task-Creation (Triage + Prio 1) ===
-# User-Direktive 15.06.2026: Jeder neue Task wird mit status=triage + priority=1 angelegt.
-DEFAULT_TASK_CREATION_SOP = {
-    "name": "Task Creation Default (Triage + Prio 1)",
-    "description": (
-        "SOP, die festlegt, dass jeder neue Task IMMER in Triage mit Prio 1 "
-        "angelegt wird. CIO bewertet im Triage-Prozess und hebt die Prio an. "
-        "Verhindert, dass neue Tasks mit Default-Prio 50 die Watchdog-Logik "
-        "oder die Sortierung dominieren.\n\n"
-        "User-Direktive 15.06.2026. Teil der kanban-operator Skill."
-    ),
-    "category": "task-creation",
-    "default_delay_s": 0.0,
-    "steps": [
-        {
-            "name": "Task anlegen mit Standard-Defaults",
-            "phase": "Task",
-            "trigger": "task_created",
-            "action": "apply_defaults",
-            "agent": "system",
-            "expected_result": (
-                "Task existiert in DB mit status='triage' und priority=1. "
-                "History-Eintrag 'task_created' enthaelt details.sop='task-creation-default'."
-            ),
-            "success_criteria": [
-                "Task-Status ist 'triage' (nicht 'todo' oder 'in_progress')",
-                "Task-Priority ist 1 (nicht 50 oder hoeher)",
-                "History-Eintrag enthaelt SOP-Referenz",
-            ],
-            "delay_s": 0.0,
-            "description": (
-                "Beim Anlegen eines neuen Tasks werden folgende Defaults "
-                "AUTOMATISCH gesetzt: status='triage', priority=1, "
-                "category='new_request', assigned_role='pi-coder'. Diese "
-                "Defaults sind Teil der SOP und duerfen nur durch explizite "
-                "Argumente ueberschrieben werden (z.B. fuer Sub-Tasks oder "
-                "System-Tasks).\n\n"
-                "API-Endpoint: POST /api/kanban/tasks\n"
-                "Backend-Funktion: TaskService.create_task()"
-            ),
-            "next_step": 1,  # -> Process Triage
-            "rules": [
-                {
-                    "description": (
-                        "Task wurde erfolgreich mit status=triage + priority=1 "
-                        "angelegt. History-Eintrag dokumentiert die SOP-Anwendung."
-                    ),
-                    "condition_field": "step_ok",
-                    "condition_operator": "is_true",
-                    "condition_value": True,
-                    "action_type": "complete",
-                    "action_target": None,
-                    "action_params": {},
-                },
-            ],
-        },
-        {
-            "name": "Triage-Prozess durchfuehren",
-            "phase": "Task",
-            "trigger": "manual OR process_triage_endpoint",
-            "action": "evaluate_and_move_to_todo",
-            "agent": "CIO",
-            "expected_result": (
-                "Task-Status ist 'todo' (Auto-Claim triggert Worker-Start), "
-                "Priority ist passend zur Komplexitaet (25/50/75/100), "
-                "History-Eintrag 'status_changed' mit details.reason='process_triage'."
-            ),
-            "success_criteria": [
-                "Status ist nicht mehr 'triage'",
-                "Priority ist >= 25 (CIO hat bewertet)",
-                "History-Eintrag dokumentiert die Triage-Entscheidung",
-            ],
-            "delay_s": 0.0,
-            "description": (
-                "Der CIO bewertet den Triage-Task: liest Description, prueft "
-                "Klarheit, setzt passende Prio (25/50/75/100) und schiebt den "
-                "Task auf 'todo'.\n\n"
-                "Trigger: User klickt 'Process Triage' (Bulk fuer alle "
-                "Triage-Tasks eines Projekts) oder manuell via Task-Detail-Sidebar.\n\n"
-                "Logik: Basiert auf Description-Laenge: desc>500 -> Prio 75, "
-                ">200 -> 50, sonst -> 25. Role: 'pi-tester' wenn 'test'/"
-                "'pruefen' im Text, sonst 'pi-coder'."
-            ),
-            "next_step": None,  # End-State
-            "rules": [
-                {
-                    "description": "Triage abgeschlossen: Task in todo",
-                    "condition_field": "step_ok",
-                    "condition_operator": "is_true",
-                    "condition_value": True,
-                    "action_type": "complete",
-                    "action_target": None,
-                    "action_params": {},
-                },
-            ],
-        },
-    ],
-}
-
 
 # === Default-SOP: CIO Triage Review (User-Direktive 16.06.2026) ===
 # Generischer 4-Kriterien-Check, deklarativ in der DB gespeichert.
@@ -1921,7 +1936,7 @@ DEFAULT_CIO_TRIAGE_SOP = {
 def seed_default_sops(db: Session) -> int:
     """Seeded die Standard-SOPs, falls noch nicht vorhanden."""
     added = 0
-    for sop_def in (DEFAULT_TASK_SOP, DEFAULT_TASK_CREATION_SOP, DEFAULT_CIO_TRIAGE_SOP):
+    for sop_def in (DEFAULT_TASK_SOP, DEFAULT_CIO_TRIAGE_SOP):
         existing = db.execute(
             select(SOP).where(SOP.name == sop_def["name"])
         ).scalar_one_or_none()
