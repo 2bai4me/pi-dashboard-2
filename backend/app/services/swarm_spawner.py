@@ -382,7 +382,9 @@ def _is_process_alive(pid: int) -> bool:
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True, text=True, timeout=5,
             )
-            return str(pid) in result.stdout
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            return str(pid) in stdout or str(pid) in stderr
         else:
             # Unix: os.kill(pid, 0) testet Existenz ohne Signal
             os.kill(pid, 0)

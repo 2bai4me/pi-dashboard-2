@@ -47,10 +47,10 @@ from typing import Any, Dict, Optional, List
 
 from sqlalchemy.orm import Session
 
-from ..models.task import Task
-from ..config import settings
-from ..utils.exceptions import SubAgentError, InvalidInputError
-from ..utils.id_generator import gen_id
+from ...models.task import Task
+from ...config import settings
+from ...utils.exceptions import SubAgentError, InvalidInputError
+from ...utils.id_generator import gen_id
 
 logger = logging.getLogger("pi-dashboard-2.sub-agent")
 
@@ -66,11 +66,10 @@ ALLOWED_ROLES: frozenset[str] = frozenset({
 # Erlaubte Zeichen für task_id: Hexadezimal (6 Bytes = 12 Zeichen)
 _TASK_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
-# Erlaubte Zeichen für Titel/Description (Positiv-Liste statt Negativ-Liste)
-# Erlaubt: Buchstaben, Zahlen, Leerzeichen, Punkte, Kommas, Doppelpunkte,
-#          Schrägstriche, Gleichheitszeichen, Plus, Minus, At-Zeichen, Anführungszeichen
+# Erlaubte Zeichen fuer Titel/Description (Positiv-Liste).
+# Explizit KEINE Shell-Metazeichen: ; | & $ ` < > \ " ' = + @ / # * ? { } [ ]
 _SAFE_TEXT_RE = re.compile(
-    r"^[\w\s.,:;\/'+=@\-_!?()äöüÄÖÜßéèêàáâçÇñÑ]{1,500}$", re.UNICODE
+    r"^[\w\s.,:\-_!?()äöüÄÖÜßéèêàáâçÇñÑ]{1,500}$", re.UNICODE
 )
 
 # Maximale Länge für Titel (abgestimmt mit DB: String(500))
@@ -188,160 +187,148 @@ def validate_spawn_inputs(
     return True, ""
 
 
+def _count_alive_agents_for_task(task_id: str) -> int:
+    """Zählt aktive Sub-Agents für einen Task."""
+    return sum(
+        1 for info in _AGENT_REGISTRY.values()
+        if info.get("task_id") == task_id and _is_process_alive(info.get("pid"))
+    )
+
+
+def _resolve_role(t: Task) -> Optional[str]:
+    """Ermittelt die Rolle für den Sub-Agent aus dem Task."""
+    return t.assigned_subagent or t.assigned_role
+
+
+def _prepare_spawn_environment(t: Task, role: str) -> tuple[Path, str, Path, str]:
+    """Bereitet Spawn-Skript, Bash, Log-Pfad und Context vor."""
+    spawn_script = _get_spawn_script_path()
+    bash = _get_bash_executable()
+    if not bash:
+        raise SubAgentError("bash nicht gefunden (Windows braucht Git-Bash oder WSL)")
+
+    log_dir = Path(os.path.expanduser("~/.pi/agent/operator/logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"spawn-{t.id}.log"
+
+    # Context enthält KEINE User-Inputs (nur Identifikation)
+    context = f"task_id={t.id}; branch=task/{t.id}"
+    return spawn_script, bash, log_path, context
+
+
+def _start_subprocess(
+    bash: str,
+    spawn_script: Path,
+    role: str,
+    t: Task,
+    log_path: Path,
+    context: str,
+) -> subprocess.Popen:
+    """Startet den Sub-Agent-Prozess mit shell=False (RCE-Prävention)."""
+    cmd = [str(bash), str(spawn_script), role, t.id, context]
+    logger.info(f"Spawning Sub-Agent: role={role} task={t.id[:8]} script={spawn_script.name}")
+
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        return subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            cwd=str(spawn_script.parent),
+            env={
+                **os.environ,
+                "PI_DASHBOARD_API": "http://127.0.0.1:9220",
+                "PI_MCP_ROUTER_ENDPOINT": settings.PI_MCP_ROUTER_ENDPOINT or "tcp://127.0.0.1:5555",
+                "PI_MCP_API_KEY": settings.PI_MCP_API_KEY or "",
+            },
+            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
+            shell=False,  # ← KEIN Shell-Injection möglich!
+        )
+
+
+def _register_spawned_agent(
+    t: Task,
+    db: Session,
+    proc: subprocess.Popen,
+    spawn_script: Path,
+    log_path: Path,
+    role: str,
+    user: Optional[str],
+) -> Dict[str, Any]:
+    """Speichert Agent-Info in Registry, DB und History."""
+    spawned_at = time.time()
+    agent_info = {
+        "pid": proc.pid,
+        "spawned_at": spawned_at,
+        "log_path": str(log_path),
+        "role": role,
+        "task_id": t.id,
+        "process": proc,
+    }
+    _AGENT_REGISTRY[t.id] = agent_info
+
+    if t.meta is None:
+        t.meta = {}
+    t.meta["sub_agent"] = {
+        "pid": proc.pid,
+        "role": role,
+        "spawned_at": spawned_at,
+        "log_path": str(log_path),
+        "status": "running",
+    }
+    db.commit()
+
+    _add_history_safe(db, t, "sub_agent_spawned", "system", {
+        "pid": proc.pid,
+        "role": role,
+        "log_path": str(log_path),
+        "spawn_script": str(spawn_script),
+        "user": user,
+    })
+    db.commit()
+
+    logger.info(f"Sub-Agent Task {t.id[:8]}: PID {proc.pid}, Rolle {role}")
+    return agent_info
+
+
 async def spawn_sub_agent(
     t: Task,
     db: Session,
     user: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Startet einen Sub-Agent für einen Task.
-    
-    Diese Funktion ersetzt die alte `_spawn_sub_agent()` mit vollständiger
-    RCE-Prävention und klarer Fehlerbehandlung.
-    
-    Args:
-        t: Der Task für den der Sub-Agent gestartet werden soll
-        db: SQLAlchemy-Session
-        user: Optionaler User für Audit-Log
-    
-    Returns:
-        Dict mit pid, spawned_at, log_path, role oder None bei Fehler
-    
-    Raises:
-        SubAgentError: Bei schwerwiegenden Fehlern (z.B. fehlender spawn.sh)
-        InvalidInputError: Bei ungültigen Eingaben
-    """
-    # ============================================
-    # 1. Pre-Check: Max Sub-Agents pro Task
-    # ============================================
-    agent_count = sum(
-        1 for info in _AGENT_REGISTRY.values()
-        if info.get("task_id") == t.id and _is_process_alive(info.get("pid"))
-    )
-    if agent_count >= MAX_AGENTS_PER_TASK:
+    """Startet einen Sub-Agent für einen Task (RCE-gehärtet)."""
+    if _count_alive_agents_for_task(t.id) >= MAX_AGENTS_PER_TASK:
         logger.warning(f"Task {t.id[:8]}: Max Sub-Agents erreicht ({MAX_AGENTS_PER_TASK})")
         return None
-    
-    # ============================================
-    # 2. Role bestimmen
-    # ============================================
-    role = t.assigned_subagent or t.assigned_role
+
+    role = _resolve_role(t)
     if not role:
         logger.warning(f"Task {t.id[:8]}: kein assigned_subagent oder assigned_role")
         return None
-    
-    # ============================================
-    # 3. Input-Validierung (RCE-Prävention)
-    # ============================================
+
     is_valid, reason = validate_spawn_inputs(
-        task_id=t.id,
-        title=t.title,
-        description=t.description,
-        role=role,
+        task_id=t.id, title=t.title, description=t.description, role=role
     )
     if not is_valid:
         _add_history_safe(db, t, "sub_agent_spawn_rejected", "system", {
-            "reason": reason,
-            "role": role,
-            "user": user,
+            "reason": reason, "role": role, "user": user,
         })
         db.commit()
         raise InvalidInputError("sub_agent_input", reason)
-    
-    # ============================================
-    # 4. Spawn-Skript und Bash finden
-    # ============================================
+
     try:
-        spawn_script = _get_spawn_script_path()
+        spawn_script, bash, log_path, context = _prepare_spawn_environment(t, role)
     except SubAgentError as e:
         _add_history_safe(db, t, "sub_agent_spawn_failed", "system", {
-            "error": str(e),
-            "role": role,
+            "error": str(e), "role": role,
         })
         db.commit()
         raise
-    
-    bash = _get_bash_executable()
-    if not bash:
-        error_msg = "bash nicht gefunden (Windows braucht Git-Bash oder WSL)"
-        _add_history_safe(db, t, "sub_agent_spawn_failed", "system", {
-            "error": error_msg,
-            "role": role,
-        })
-        db.commit()
-        raise SubAgentError(error_msg)
-    
-    # ============================================
-    # 5. Log-Verzeichnis vorbereiten
-    # ============================================
-    log_dir = Path(os.path.expanduser("~/.pi/agent/operator/logs"))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"spawn-{t.id}.log"
-    
-    # ============================================
-    # 6. Context aus Task (NUR sichere Felder!)
-    # ============================================
-    # WICHTIG: Keine User-Inputs mehr im Context-String!
-    # Der Context dient nur der Identifikation, nicht der Steuerung.
-    context = f"task_id={t.id}; branch=task/{t.id}"
-    
-    # ============================================
-    # 7. Sub-Prozess starten
-    # ============================================
-    cmd = [str(bash), str(spawn_script), role, t.id, context]
-    logger.info(f"Spawning Sub-Agent: role={role} task={t.id[:8]} script={spawn_script.name}")
-    
+
     try:
-        with open(log_path, "a", encoding="utf-8") as log_file:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                cwd=str(spawn_script.parent),
-                env={**os.environ, "PI_DASHBOARD_API": "http://127.0.0.1:9220"},
-                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
-                shell=False,  # ← KEIN Shell-Injection möglich!
-            )
-        
-        spawned_at = time.time()
-        
-        # In Registry speichern
-        agent_info = {
-            "pid": proc.pid,
-            "spawned_at": spawned_at,
-            "log_path": str(log_path),
-            "role": role,
-            "task_id": t.id,
-            "process": proc,
-        }
-        _AGENT_REGISTRY[t.id] = agent_info
-        
-        # In DB tracken
-        if t.meta is None:
-            t.meta = {}
-        t.meta["sub_agent"] = {
-            "pid": proc.pid,
-            "role": role,
-            "spawned_at": spawned_at,
-            "log_path": str(log_path),
-            "status": "running",
-        }
-        db.commit()
-        
-        # Audit-Log
-        _add_history_safe(db, t, "sub_agent_spawned", "system", {
-            "pid": proc.pid,
-            "role": role,
-            "log_path": str(log_path),
-            "spawn_script": str(spawn_script),
-            "user": user,
-        })
-        db.commit()
-        
-        logger.info(f"Sub-Agent Task {t.id[:8]}: PID {proc.pid}, Rolle {role}")
-        return agent_info
-        
-    except Exception as e:
+        proc = _start_subprocess(bash, spawn_script, role, t, log_path, context)
+        return _register_spawned_agent(t, db, proc, spawn_script, log_path, role, user)
+    except OSError as e:
         logger.error(f"Fehler beim Spawn für Task {t.id[:8]}: {e}")
         return None
 
@@ -365,20 +352,25 @@ def kill_sub_agent(task_id: str) -> bool:
     
     try:
         if platform.system() == "Windows":
-            subprocess.run(f"taskkill /PID {pid} /F", shell=True, capture_output=True)
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                shell=False,
+                capture_output=True,
+                check=False,
+            )
         else:
             os.kill(pid, 15)  # SIGTERM
             time.sleep(1)
             if _is_process_alive(pid):
                 os.kill(pid, 9)  # SIGKILL
-        
+
         _AGENT_REGISTRY.pop(task_id, None)
         logger.info(f"Sub-Agent Task {task_id[:8]}: PID {pid} beendet")
         return True
     except ProcessLookupError:
         _AGENT_REGISTRY.pop(task_id, None)
         return True
-    except Exception as e:
+    except OSError as e:
         logger.error(f"Fehler beim Beenden von Task {task_id[:8]}: {e}")
         return False
 
@@ -446,5 +438,8 @@ def cleanup_dead_agents() -> int:
 
 def _add_history_safe(db, task, event, agent, details):
     """Wrapper für History-Eintrag (vermeidet Circular Import)."""
-    from ..services.task_service import TaskService
+    # BUGFIX 22.06.2026: '..services' -> '...services' (Datei liegt in services/micro/)
+    # Der Fehler 'No module named app.services.services' wurde durch Phase-15-Live-
+    # Test entdeckt: dieser Code wird nur bei Sub-Agent-Spawn aufgerufen.
+    from ...services.task_service import TaskService
     TaskService._add_history(db, task, event, agent=agent, details=details)
