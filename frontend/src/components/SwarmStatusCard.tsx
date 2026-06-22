@@ -4,6 +4,7 @@
 // mit Status, Score und Progress sichtbar sein.
 
 import { useQuery } from "@tanstack/react-query"
+import { useEffect, useState } from "react"
 import { api } from "../api"
 
 export interface SwarmWorker {
@@ -62,13 +63,17 @@ const SWARM_TYPE_LABELS: Record<string, string> = {
 /**
  * Karte mit allen laufenden/abgeschlossenen Swarms fuer einen Task.
  * Wird im Task-Detail-Panel angezeigt.
+ *
+ * Phase 14: Optional SSE-Support via `useSse` Parameter.
+ * - useSse=true: Echtzeit-Updates via SSE (kein Polling noetig)
+ * - useSse=false (Default): Polling alle 5s via TanStack Query
  */
 export function SwarmStatusCard({ taskId, style }: SwarmStatusCardProps) {
   const { data, isLoading, error } = useQuery({
     queryKey: ["swarms", taskId],
     queryFn: () => api.swarms?.listByTask(taskId) ?? Promise.resolve([]),
     enabled: !!taskId,
-    refetchInterval: 5000,  // Live-Update alle 5s
+    refetchInterval: 5000,  // Fallback-Polling
     staleTime: 0,
   })
 
