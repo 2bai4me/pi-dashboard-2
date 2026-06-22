@@ -19,6 +19,20 @@ import "bpmn-js/dist/assets/diagram-js.css"
 import "bpmn-js/dist/assets/bpmn-js.css"
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css"
 
+// === Phase-Optionen (Single Source of Truth) ===
+// User-Direktive 22.06.2026: Phase soll in der Step-Detail-View als Dropdown editierbar sein.
+// Diese Liste wird in StepEditor, AddStepModal und StepDetailSidebar verwendet.
+// Das Backend akzeptiert diese Werte als String (siehe backend/app/models/sop.py:150).
+const PHASE_OPTIONS = [
+  "Task",         // Standard-Schritt mit Agent-Ausführung
+  "Decision",     // Entscheidungs-Schritt (Gate/Bedingung)
+  "Sub-SOP",      // Eingebettete Sub-SOP
+  "Wait",         // Warteschritt (manuell oder timeout)
+  "Notification", // Benachrichtigung an User/Agent
+  "End",          // End-Marker
+] as const
+type PhaseOption = typeof PHASE_OPTIONS[number]
+
 // ─────────────── Dynamische Agent-Auswahl aus SubAgent-Konfigurationen ───────────────
 function AgentSelect({
   value,
@@ -1177,7 +1191,7 @@ function StepDetailSidebar({
 }) {
   const qc = useQueryClient()
   const updateMut = useMutation({
-    mutationFn: (data: { agent?: string; model?: string }) => api.updateSopStep(sopId, step.id, data),
+    mutationFn: (data: { agent?: string; model?: string; phase?: string }) => api.updateSopStep(sopId, step.id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["sop", sopId] })
       qc.invalidateQueries({ queryKey: ["sop-bpmn", sopId] })
@@ -1208,7 +1222,18 @@ function StepDetailSidebar({
           {step.name}
         </h3>
         <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
-          <span className="badge badge-blue" style={{ fontSize: 10 }}>{step.phase}</span>
+          <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>Phase:</span>
+          <select
+            className="select"
+            value={step.phase || "Task"}
+            onChange={(e) => updateMut.mutate({ phase: e.target.value })}
+            style={{ width: 110, fontSize: 11 }}
+            title="Phase des Steps (wann er ausgeführt wird)"
+          >
+            {PHASE_OPTIONS.map((p) => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
           <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginLeft: 4 }}>Agent:</span>
           <AgentSelect
             value={step.agent || ""}
@@ -2400,13 +2425,10 @@ function StepEditor({ step, index, onChange, onRemove }: any) {
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
         <span className="badge badge-orange">#{index + 1}</span>
         <input className="input" value={step.name} onChange={(e) => onChange({ ...step, name: e.target.value })} placeholder="Step-Name" style={{ flex: 1 }} />
-        <select className="select" value={step.phase} onChange={(e) => onChange({ ...step, phase: e.target.value })} style={{ width: 120 }}>
-          <option>Task</option>
-          <option>Decision</option>
-          <option>Sub-SOP</option>
-          <option>End</option>
-          <option>Wait</option>
-          <option>Notification</option>
+        <select className="select" value={step.phase} onChange={(e) => onChange({ ...step, phase: e.target.value })} style={{ width: 120 }} title="Phase des Steps (wann er ausgeführt wird)">
+          {PHASE_OPTIONS.map((p) => (
+            <option key={p} value={p}>{p}</option>
+          ))}
         </select>
         <AgentSelect value={step.agent} onChange={(agent) => onChange({ ...step, agent })} style={{ width: 140 }} />
         <AgentModelDisplay agent={step.agent} style={{ width: 200 }} />
@@ -3175,10 +3197,10 @@ function AddStepModal({ sopId, steps, onClose, onCreated }: {
               <label style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", display: "block", marginBottom: 4 }}>
                 Phase
               </label>
-              <select className="input" value={phase} onChange={(e) => setPhase(e.target.value)}>
-                <option value="Task">Task</option>
-                <option value="Sub-SOP">Sub-SOP</option>
-                <option value="End">End</option>
+              <select className="input" value={phase} onChange={(e) => setPhase(e.target.value)} title="Phase des Steps (wann er ausgeführt wird)">
+                {PHASE_OPTIONS.map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
               </select>
             </div>
             <div>
