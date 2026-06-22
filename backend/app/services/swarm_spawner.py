@@ -92,6 +92,7 @@ class SwarmConfig:
     auto_approve_threshold: float = 90.0
     max_cost_usd: float = 0.50
     timeout_sec: int = 600
+    use_real_workers: bool = False  # Phase 11: echte SubAgent-Calls statt Mock
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SwarmConfig":
@@ -104,6 +105,7 @@ class SwarmConfig:
             auto_approve_threshold=data.get("auto_approve_threshold", 90.0),
             max_cost_usd=data.get("max_cost_usd", 0.50),
             timeout_sec=data.get("timeout_sec", 600),
+            use_real_workers=bool(data.get("use_real_workers", False)),
         )
 
 
@@ -332,6 +334,7 @@ async def execute_worker_mock(
     worker_role: str,
     variant: str,
     task_context: Dict[str, Any],
+    timeout_sec: int = 600,
 ) -> WorkerResult:
     """Mock-Worker: simuliert einen Worker-Output.
 
@@ -359,6 +362,208 @@ async def execute_worker_mock(
     )
 
 
+# === Echte Worker-Execution (Phase 11) ===
+
+import os
+import signal
+import subprocess
+import time as _time
+from pathlib import Path
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Prueft ob ein Prozess mit der PID noch laeuft (Windows + Unix)."""
+    if pid is None or pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            # Windows: kein os.kill, stattdessen subprocess oder tasklist
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in result.stdout
+        else:
+            # Unix: os.kill(pid, 0) testet Existenz ohne Signal
+            os.kill(pid, 0)
+            return True
+    except (subprocess.TimeoutExpired, OSError, ProcessLookupError):
+        return False
+
+
+def _tail_log(log_path: str, max_lines: int = 100) -> str:
+    """Liest die letzten N Zeilen einer Log-Datei."""
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return ""
+        # Performance: nur letzte 64KB lesen
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > 65536:
+                f.seek(size - 65536)
+            content = f.read().decode("utf-8", errors="replace")
+        lines = content.splitlines()
+        return "\n".join(lines[-max_lines:])
+    except Exception as e:
+        logger.warning(f"Konnte Log nicht lesen: {e}")
+        return ""
+
+
+async def execute_worker_real(
+    worker_role: str,
+    variant: str,
+    task_context: Dict[str, Any],
+    timeout_sec: int = 600,
+) -> WorkerResult:
+    """Echter Worker: spawnt SubAgent und wartet auf Output.
+
+    User-Direktive 22.06.2026 Phase 11: Echte Worker statt Mock.
+    Strategie:
+      1. SubAgent-Prozess via subagent_service.spawn_sub_agent() starten
+      2. Polling auf Process-Exit (alle 5s, max timeout_sec)
+      3. Output aus Log-Datei extrahieren
+      4. Bei Timeout: Worker als 'failed' markieren, Process killen
+
+    Args:
+        worker_role: z.B. 'pi-coder', 'pi-tester', 'pi-reviewer'
+        variant: z.B. 'minimalist', 'robust', 'quality'
+        task_context: Dict mit task_id, title, description, etc.
+        timeout_sec: Max Wartezeit
+
+    Returns:
+        WorkerResult mit output, cost_usd, status
+    """
+    worker_id = f"w-{secrets.token_hex(4)}"
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Task laden (falls nur ID vorhanden)
+    task_id = task_context.get("task_id")
+    if not task_id:
+        return WorkerResult(
+            worker_id=worker_id, role=worker_role, variant=variant,
+            status=WorkerStatus.FAILED, error="task_id fehlt in task_context",
+            started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    # SubAgent spawnen
+    try:
+        from app.services.sub_agent import spawn_sub_agent
+        from app.db.base import SessionLocal
+        from app.models.task import Task
+
+        db = SessionLocal()
+        try:
+            task = db.get(Task, task_id)
+            if not task:
+                return WorkerResult(
+                    worker_id=worker_id, role=worker_role, variant=variant,
+                    status=WorkerStatus.FAILED, error=f"Task {task_id} nicht gefunden",
+                    started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            # System-Prompt mit Variant-Info erweitern (falls vorhanden)
+            variant_prompts = {
+                "minimalist": "Schreibe minimalen, lesbaren Code. Keine Over-Engineering.",
+                "robust": "Defensive Programmierung. Edge-Cases abdecken. Null-Checks.",
+                "performant": "Performance-optimiert. O(n)-Analyse. Memory-Profiling.",
+                "unit": "Unit-Tests schreiben. Coverage > 90%. Edge-Cases.",
+                "integration": "Integration-Tests. API-Contracts. End-to-End-Flows.",
+                "performance": "Performance-Tests. Load-Testing. Latenz-Messung.",
+                "quality": "Bewerte Code-Quality: Lesbarkeit, Patterns, Naming, DRY.",
+                "bugs": "Finde Bugs: Edge-Cases, Race-Conditions, Error-Handling.",
+                "robustness": "Pruefe Robustheit: Input-Validierung, Failure-Modes, Recovery.",
+            }
+            variant_prompt = variant_prompts.get(variant, "")
+            if variant_prompt and task.meta is None:
+                task.meta = {}
+            if variant_prompt:
+                task.meta["variant_prompt"] = variant_prompt
+            # assigned_subagent setzen damit spawn_sub_agent ihn nimmt
+            task.assigned_subagent = worker_role
+            db.commit()
+
+            spawn_result = await spawn_sub_agent(task, db)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.exception(f"SubAgent-Spawn fehlgeschlagen: {e}")
+        return WorkerResult(
+            worker_id=worker_id, role=worker_role, variant=variant,
+            status=WorkerStatus.FAILED, error=f"Spawn-Fehler: {e}",
+            started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    if not spawn_result:
+        return WorkerResult(
+            worker_id=worker_id, role=worker_role, variant=variant,
+            status=WorkerStatus.FAILED, error="Spawn lieferte None",
+            started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    pid = spawn_result.get("pid")
+    log_path = spawn_result.get("log_path")
+    logger.info(f"Worker {worker_id} ({worker_role}/{variant}) gestartet: PID={pid}, Log={log_path}")
+
+    # Polling auf Process-Exit
+    poll_interval = 5  # Sekunden
+    max_wait = timeout_sec
+    waited = 0
+    while waited < max_wait:
+        if not _is_process_alive(pid):
+            break
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+        if waited % 30 == 0:
+            logger.info(f"Worker {worker_id} laeuft seit {waited}s...")
+
+    # Timeout-Check
+    if _is_process_alive(pid):
+        logger.warning(f"Worker {worker_id} hat Timeout nach {max_wait}s, kille PID {pid}")
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=10)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except Exception as e:
+            logger.error(f"Process-Kill fehlgeschlagen: {e}")
+        return WorkerResult(
+            worker_id=worker_id, role=worker_role, variant=variant,
+            status=WorkerStatus.FAILED, error=f"Timeout nach {max_wait}s",
+            started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    # Output extrahieren
+    output_text = _tail_log(log_path, max_lines=200) if log_path else ""
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    # Kosten aus token_usage extrahieren (falls vorhanden)
+    cost_usd = 0.0
+    try:
+        from app.db.base import SessionLocal
+        from app.models.token_usage import TokenUsage
+        db = SessionLocal()
+        try:
+            usages = db.query(TokenUsage).filter_by(task_id=task_id).all()
+            cost_usd = sum(float(u.cost_usd or 0) for u in usages)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Konnte TokenUsage nicht laden: {e}")
+
+    return WorkerResult(
+        worker_id=worker_id,
+        role=worker_role,
+        variant=variant,
+        status=WorkerStatus.COMPLETED,
+        output=output_text,
+        cost_usd=cost_usd,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+
+
 async def execute_swarm(swarm_id: str, task_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Orchestriert einen kompletten Swarm-Run.
 
@@ -379,12 +584,43 @@ async def execute_swarm(swarm_id: str, task_context: Optional[Dict[str, Any]] = 
     workers = run["workers"]
     results: List[WorkerResult] = []
 
+    # Worker-Executor waehlen (Phase 11)
+    # use_real_workers wird als ENV ueberschrieben (PI_SWARM_USE_REAL=1) ODER aus DB
+    use_real_env = os.environ.get("PI_SWARM_USE_REAL", "").lower() in ("1", "true", "yes")
+    workers_cfg_raw = run.get("workers_config", "{}")
+    try:
+        workers_cfg = json.loads(workers_cfg_raw) if isinstance(workers_cfg_raw, str) else workers_cfg_raw
+    except (json.JSONDecodeError, TypeError):
+        workers_cfg = {}
+    # SwarmConfig optional erweitert: use_real_workers aus workers_cfg
+    use_real_db = bool(workers_cfg.get("use_real_workers", False)) if isinstance(workers_cfg, dict) else False
+    use_real = use_real_env or use_real_db
+    worker_fn = execute_worker_real if use_real else execute_worker_mock
+    if use_real:
+        logger.info(f"Swarm {swarm_id} verwendet ECHTE Worker (Phase 11)")
+
+    # SwarmConfig aus DB-Daten rekonstruieren (fuer timeout_sec etc.)
+    try:
+        config = SwarmConfig(
+            swarm_type=SwarmType(run["swarm_type"]),
+            workers=[WorkerConfig(**w) for w in workers_cfg.get("workers", [])] if isinstance(workers_cfg, dict) else [],
+            merge_strategy=MergeStrategy(run.get("merge_strategy") or "reviewer_picks_best"),
+            consensus_threshold=float(run.get("consensus_threshold") or 75.0),
+            auto_approve_threshold=float(run.get("auto_approve_threshold") or 90.0),
+            max_cost_usd=float(run.get("max_cost_usd") or 0.50),
+            timeout_sec=int(run.get("timeout_sec") or 600),
+            use_real_workers=use_real,
+        )
+    except Exception:
+        config = None
+
     try:
         if run["swarm_type"] == SwarmType.SINGLE.value:
             # Single-Mode: nur der erste Worker
             w = workers[0]
             update_worker_status(w["id"], WorkerStatus.RUNNING)
-            result = await execute_worker_mock(w["subagent_role"], w.get("variant") or "default", task_context)
+            result = await worker_fn(w["subagent_role"], w.get("variant") or "default", task_context,
+                                     timeout_sec=config.timeout_sec)
             update_worker_status(w["id"], result.status, output=result.output, cost_usd=result.cost_usd)
             results.append(result)
         else:
@@ -392,8 +628,9 @@ async def execute_swarm(swarm_id: str, task_context: Optional[Dict[str, Any]] = 
             tasks = []
             for w in workers:
                 update_worker_status(w["id"], WorkerStatus.RUNNING)
-                tasks.append(execute_worker_mock(
-                    w["subagent_role"], w.get("variant") or "default", task_context
+                tasks.append(worker_fn(
+                    w["subagent_role"], w.get("variant") or "default", task_context,
+                    timeout_sec=config.timeout_sec,
                 ))
             results = await asyncio.gather(*tasks, return_exceptions=False)
             for w, r in zip(workers, results):

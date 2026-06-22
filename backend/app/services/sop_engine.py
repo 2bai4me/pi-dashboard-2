@@ -786,8 +786,12 @@ class SOPEngine:
             all_tests_passing = bool((task.meta or {}).get("all_tests_passing", False) if isinstance(task.meta, dict) else False)
             no_open_todos = bool((task.meta or {}).get("no_open_todos", True) if isinstance(task.meta, dict) else True)
             code_quality_ok = bool((task.meta or {}).get("code_quality_ok", True) if isinstance(task.meta, dict) else True)
+            # User-Direktive 22.06.2026: Konsens-Score aus letzter Competitive-Review-Swarm
+            consensus_score = (task.meta or {}).get("consensus_score", 0.0) if isinstance(task.meta, dict) else 0.0
+            iteration_count = int((task.meta or {}).get("swarm_iteration_count", 0) if isinstance(task.meta, dict) else 0)
             # Acceptance-Criteria aus action_params
             acceptance = params.get("acceptance_criteria", [
+                "consensus_score >= 90",
                 "criteria_met == criteria_total",
                 "all_tests_passing == True",
                 "no_open_todos == True",
@@ -795,6 +799,8 @@ class SOPEngine:
             ])
             issues = []
             for criterion in acceptance:
+                if "consensus_score" in criterion and ">= 90" in criterion and consensus_score < 90:
+                    issues.append(f"consensus_score={consensus_score} < 90")
                 if "criteria_met" in criterion and "== criteria_total" in criterion:
                     if criteria_met < criteria_total:
                         issues.append(f"criteria_met={criteria_met}/{criteria_total}")
@@ -812,6 +818,8 @@ class SOPEngine:
                 "current_status": task.status,
                 "agent": step.agent,
                 "message": f"CIO-Final-Review: {'OK' if ok else 'Issues: ' + ', '.join(issues)}",
+                "consensus_score": consensus_score,
+                "iteration_count": iteration_count,
                 "criteria_met": criteria_met,
                 "criteria_total": criteria_total,
                 "all_tests_passing": all_tests_passing,
@@ -1570,6 +1578,33 @@ class SOPEngine:
                 f"Swarm {swarm_id} hat Cost-Limit ueberschritten: "
                 f"${result['total_cost_usd']:.2f} > ${config.max_cost_usd:.2f}"
             )
+
+        # === User-Direktive 22.06.2026 Phase 12: Score in task.meta persistieren ===
+        # Wenn Competitive-Review-Swarm, Score + Iteration-Counter speichern
+        # fuer Auto-Fix-Loop-Entscheidung in nachfolgenden Steps.
+        if config.swarm_type == SwarmType.COMPETITIVE and task is not None and consensus_score is not None:
+            try:
+                if not isinstance(task.meta, dict):
+                    task.meta = {}
+                task.meta["consensus_score"] = consensus_score
+                task.meta["last_swarm_run_id"] = swarm_id
+                task.meta["swarm_iteration_count"] = int(task.meta.get("swarm_iteration_count", 0)) + 1
+                # Auto-Fix-Loop-Entscheidung
+                from ..services.task_metrics import (
+                    should_auto_fix, get_next_iteration_action
+                )
+                iteration_count = task.meta["swarm_iteration_count"]
+                if should_auto_fix(consensus_score, iteration_count - 1):
+                    decision = get_next_iteration_action(consensus_score, iteration_count - 1)
+                    task.meta["next_action"] = decision["action"]
+                    task.meta["next_action_reason"] = decision["reason"]
+                    logger.info(
+                        f"Auto-Fix-Loop-Entscheidung: {decision['action']} "
+                        f"(Score {consensus_score}, Iter {iteration_count})"
+                    )
+                self.db.commit()
+            except Exception as e:
+                logger.warning(f"Score-Persistierung fehlgeschlagen: {e}")
 
         return {
             "ok": True,
