@@ -2,15 +2,15 @@ import { useState, useEffect, useMemo, useRef } from "react"
 import { useSearchParams } from "react-router-dom"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { api } from "../api"
+import { KANBAN_PHASES } from "../constants/kanban"
 import {
   Plus, Search, ChevronDown, ChevronRight, CheckCircle2, ListChecks,
   Filter, BarChart3, ClipboardList, ListTodo, AlertCircle, FolderKanban,
   X, Flame, Hash, RotateCcw, Sparkles, ChevronLeft, ChevronRight as ChevronRightIcon,
-  Trash2, Users, Brain, MessageSquare, HelpCircle, Send, Loader2,
+  Trash2, Users, MessageSquare, HelpCircle, Send, Loader2,
 } from "lucide-react"
 import BrainstormTab from "../components/BrainstormTab"
 import KpisTab from "../components/KpisTab"
-import BrainDevTab from "../components/BrainDevTab"
 import { SpeakButton } from "../components/SpeakButton"
 import { BoardModeSwitcher } from "../components/BoardModeSwitcher"
 import { NewTaskModal } from "../components/NewTaskModal"
@@ -20,15 +20,7 @@ import { UserInputForm } from "../components/UserInputForm"
 
 type ProjectTab = "brainstorm" | "requirements" | "tasks" | "board" | "kpis" | "braindev"
 
-const COLUMNS = [
-  { key: "triage",       label: "Triage" },
-  { key: "go",           label: "GO" },
-  { key: "in_progress",  label: "In Progress" },
-  { key: "review",       label: "Review" },
-  { key: "rueckfrage",   label: "Rückfrage" },
-  { key: "warten",       label: "Warten" },
-  { key: "done",         label: "Done" },
-] as const
+const COLUMNS = KANBAN_PHASES
 
 // Farben je Status (linker Akzent-Border der Spalten-Karten)
 const STATUS_COLORS: Record<string, string> = {
@@ -323,10 +315,6 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
         <button className={`subtab ${tab === "kpis" ? "active" : ""}`} onClick={() => setTabAndUrl("kpis")}>
           <BarChart3 size={14} /> KPIs
         </button>
-        <button className={`subtab ${tab === "braindev" ? "active" : ""}`} onClick={() => setTabAndUrl("braindev")}>
-          <Brain size={14} /> Brain DEV
-        </button>
-
         <div style={{ flex: 1 }} />
 
         <span className="badge badge-blue" style={{ fontSize: 10 }}>{project.name}</span>
@@ -356,10 +344,6 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
       {tab === "kpis" && (
         <KpisTab projectId={project.id} />
       )}
-      {tab === "braindev" && (
-        <BrainDevTab />
-      )}
-
       {selectedTaskId && (
         <TaskDetailPanel
           taskId={selectedTaskId}
@@ -699,67 +683,6 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
 }
 
 // ─────────────── Task Card (Board) ───────────────
-function TaskWaitingBadge({ taskId }: { taskId: string }) {
-  // Prueft, ob fuer diesen Task gerade eine offene Transition laeuft
-  // (transition_at gesetzt, processing_at = +5s, completed_at = null).
-  // Wenn ja: zeige animierten "wartet 5s"-Badge mit Countdown.
-  const { data } = useQuery({
-    queryKey: ["task-waiting", taskId],
-    queryFn: () => api.listTransitions({ task_id: taskId, limit: 5 }),
-    refetchInterval: 1000, // alle 1s aktualisieren fuer Countdown
-  })
-  const transitions: any[] = (data as any)?.items || []
-  const pending = transitions.find((t: any) => t.completed_at == null && t.delay_s > 0)
-  const [remaining, setRemaining] = useState<number>(0)
-
-  useEffect(() => {
-    if (!pending) {
-      setRemaining(0)
-      return
-    }
-    const update = () => {
-      const processingAt = new Date(pending.processing_at).getTime()
-      const now = Date.now()
-      const left = Math.max(0, processingAt - now)
-      setRemaining(Math.ceil(left / 1000))
-    }
-    update()
-    const id = setInterval(update, 250)
-    return () => clearInterval(id)
-  }, [pending?.id, pending?.processing_at])
-
-  if (!pending) return null
-  // === Bugfix 19.06.2026 (Task 921bba39d13f) ===
-  // Display-Namen vom Backend verwenden, damit der User "GO → In Progress"
-  // sieht statt "todo → in_progress".
-  const from = pending.from_status_display || pending.from_status || "—"
-  const to = pending.to_status_display || pending.to_status || "—"
-  return (
-    <div
-      style={{
-        background: "linear-gradient(90deg, var(--color-hermes-accent-blue), var(--color-hermes-accent))",
-        color: "#fff",
-        fontSize: 10,
-        fontWeight: 600,
-        padding: "2px 8px",
-        borderRadius: 3,
-        marginBottom: 6,
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-        animation: "pulse-wait 1s ease-in-out infinite",
-      }}
-      title={`Warte-Periode: ${from} -> ${to} (transition_started). Auto-Claim / Verarbeitung in ${remaining}s`}
-    >
-      <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 4, background: "#fff", animation: "blink 0.5s ease-in-out infinite" }} />
-      <span>⏱ wartet {remaining}s</span>
-      <span style={{ opacity: 0.85, fontWeight: 400 }}>
-        ({from} → {to})
-      </span>
-    </div>
-  )
-}
-
 function TaskCard({ task, onClick, onUserInputClick }: {
   task: any
   onClick: () => void
@@ -792,8 +715,6 @@ function TaskCard({ task, onClick, onUserInputClick }: {
       }}
       style={{ cursor: "grab", ...(isOpen ? { borderLeft: "3px solid var(--color-hermes-accent-orange)" } : {}) }}
     >
-      {/* Warte-Badge: zeigt 5s-Delay visuell an, wenn Task gerade transitiert */}
-      <TaskWaitingBadge taskId={task.id} />
       {/* OFFEN-Badge fuer Tasks mit CIO-Fragen oder fehlenden Erfolgskriterien (User-Direktive 16.06.2026) */}
       {isOpen && (
         <div style={{
@@ -842,6 +763,11 @@ function TaskCard({ task, onClick, onUserInputClick }: {
       )}
       <div className="meta">
         {task.assigned_role && <span className="badge badge-blue">💻 {task.assigned_role}</span>}
+        {(task.subagent_readiness?.model || task.meta?.code_agent?.model) && (
+          <span className="badge badge-purple" title="Modell, mit dem der Task bearbeitet wird">
+            🤖 {(task.subagent_readiness?.model || task.meta?.code_agent?.model)}
+          </span>
+        )}
         {task.level && <span className="badge badge-gray">Level {task.level}</span>}
         {Array.isArray(task.success_criteria) && task.success_criteria.length > 0 && (
           <span className="badge badge-green" style={{ fontSize: 10 }}>
