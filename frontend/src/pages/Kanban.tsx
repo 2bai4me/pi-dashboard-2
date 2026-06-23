@@ -300,17 +300,11 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
       </div>
 
       <div className="subtab-bar">
-        <button className={`subtab ${tab === "brainstorm" ? "active" : ""}`} onClick={() => setTabAndUrl("brainstorm")}>
-          <Sparkles size={14} /> Brainstorm
-        </button>
-        <button className={`subtab ${tab === "requirements" ? "active" : ""}`} onClick={() => setTabAndUrl("requirements")}>
-          <ClipboardList size={14} /> Requirements
+        <button className={`subtab ${tab === "board" ? "active" : ""}`} onClick={() => setTabAndUrl("board")}>
+          <ListChecks size={14} /> Board
         </button>
         <button className={`subtab ${tab === "tasks" ? "active" : ""}`} onClick={() => setTabAndUrl("tasks")}>
           <ListTodo size={14} /> Tasks
-        </button>
-        <button className={`subtab ${tab === "board" ? "active" : ""}`} onClick={() => setTabAndUrl("board")}>
-          <ListChecks size={14} /> Board
         </button>
         <button className={`subtab ${tab === "kpis" ? "active" : ""}`} onClick={() => setTabAndUrl("kpis")}>
           <BarChart3 size={14} /> KPIs

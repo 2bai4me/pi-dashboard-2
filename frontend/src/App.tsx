@@ -2,7 +2,9 @@ import { HashRouter, Routes, Route, Navigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "./Layout";
 import { TTSProvider } from "./TTSContext";
+import { DevSettingsProvider } from "./DevSettingsContext";
 import Kanban from "./pages/Kanban";
+import Idee from "./pages/Idee";
 import Status from "./pages/Status";
 import SysInfo from "./pages/SysInfo";
 import Models from "./pages/Models";
@@ -23,10 +25,8 @@ import CronJobs from "./pages/CronJobs";
 import Mcp from "./pages/Mcp";
 import Webhooks from "./pages/Webhooks";
 import SelfImprovement from "./pages/SelfImprovement";
-import ApiKeys from "./pages/ApiKeys";
 import BrainGraph from "./pages/BrainGraph";
 import RacWorkflow from "./pages/RacWorkflow";
-import Selfimprovment from "./pages/Selfimprovment";
 import Performance from "./pages/Performance";
 import SubAgents from "./pages/SubAgents";
 
@@ -45,10 +45,12 @@ export default function App() {
     <TTSProvider>
       <QueryClientProvider client={queryClient}>
         <HashRouter>
-          <Layout>
+          <DevSettingsProvider>
+            <Layout>
             <Routes>
               <Route path="/" element={<Navigate to="/kanban" replace />} />
               <Route path="/kanban" element={<Kanban />} />
+              <Route path="/idee" element={<Idee />} />
               <Route path="/status" element={<Status />} />
               <Route path="/system" element={<SysInfo />} />
               <Route path="/models" element={<Models />} />
@@ -72,13 +74,12 @@ export default function App() {
               <Route path="/self-improve" element={<SelfImprovement />} />
               <Route path="/performance" element={<Performance />} />
               <Route path="/subagents" element={<SubAgents />} />
-              <Route path="/api-keys" element={<ApiKeys />} />
               <Route path="/brain-graph" element={<BrainGraph />} />
               <Route path="/raci" element={<RacWorkflow />} />
-              <Route path="/selfimprovment" element={<Selfimprovment />} />
               <Route path="*" element={<Navigate to="/kanban" replace />} />
             </Routes>
           </Layout>
+          </DevSettingsProvider>
         </HashRouter>
       </QueryClientProvider>
     </TTSProvider>
