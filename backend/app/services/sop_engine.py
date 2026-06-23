@@ -715,10 +715,59 @@ class SOPEngine:
             # Vorher: gab immer ok=True zurueck, was dazu fuehrte, dass die
             # Rule "step_ok == true" IMMER feuerte, auch wenn der Task eigentlich
             # nicht OK war (z.B. "Komplexe Negation in der Description").
+            #
+            # User-Direktive 23.06.2026 (Task 4bf7146b0780): Decompose-Check
+            # Prueft, ob die User-Anforderung zerlegt werden sollte.
+            # Wenn ja: Subtasks automatisch erstellen, Parent bleibt in 'go'.
             if task:
                 try:
                     from ..routers.workflow import _check_cio_heuristic
                     result = _check_cio_heuristic(self.db, task)
+
+                    # Decompose-Check (Phase Go)
+                    decompose_result = None
+                    try:
+                        from ..services.task_decomposer import (
+                            should_decompose, create_subtasks_from_decomposition,
+                        )
+                        decomp = should_decompose(task.title or "", task.description or "")
+                        if decomp.should_split:
+                            # Subtasks erstellen (Parent bleibt in go)
+                            subtask_ids = create_subtasks_from_decomposition(
+                                parent_task_id=task.id,
+                                decomposition=decomp,
+                                project_id=task.project_id,
+                            )
+                            # Task-Status auf 'go' setzen (bleibt dort waehrend Subtasks laufen)
+                            from .task_service import TaskService
+                            TaskService.set_status_sync(
+                                self.db, task.id, "go",
+                                agent=step.agent,
+                                reason=f"decomposed:{len(subtask_ids)}_subtasks",
+                                delay_s=0.0,
+                            )
+                            # Decompose-Info in task.meta ablegen
+                            if not isinstance(task.meta, dict):
+                                task.meta = {}
+                            task.meta["decomposition"] = {
+                                "themes": decomp.detected_themes,
+                                "subtask_ids": subtask_ids,
+                                "rationale": decomp.rationale,
+                            }
+                            self.db.commit()
+                            decompose_result = {
+                                "decomposed": True,
+                                "subtask_count": len(subtask_ids),
+                                "subtask_ids": subtask_ids,
+                                "themes": decomp.detected_themes,
+                            }
+                            logger.info(
+                                f"Task {task.id[:8]} decomposed into {len(subtask_ids)} subtasks "
+                                f"(themes: {', '.join(decomp.detected_themes)})"
+                            )
+                    except Exception as dec_err:
+                        logger.warning(f"Decompose-Check fehlgeschlagen: {dec_err}")
+
                     return {
                         "ok": result["ok"],
                         "action": "review_task",
@@ -731,6 +780,7 @@ class SOPEngine:
                         ),
                         "issues": result.get("issues", []),
                         "questions": result.get("questions", []),
+                        "decomposition": decompose_result,
                     }
                 except (ValueError, TypeError, OSError) as e:
                     logger.warning(f"review_task: Heuristik fehlgeschlagen: {e}")
@@ -991,6 +1041,13 @@ class SOPEngine:
             return {"ok": True, "action": "evaluate_outcome",
                     "task_id": task.id, "new_status": t.status,
                     "swarm_consolidated": bool((task.meta or {}).get("swarm_consolidated"))}
+
+        # === User-Direktive 23.06.2026: Task-Decomposition (Phase Go) ===
+        # Prueft ob Task zerlegt werden sollte (mehrere Themen in Anforderung).
+        # Wenn ja: Subtasks erstellen, Parent bleibt in 'go'.
+        # Wenn nein: kein Split, normal weiter.
+        if action == "decompose_task":
+            return self._execute_decompose_task(instance, step, task, params)
 
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
@@ -1543,6 +1600,16 @@ class SOPEngine:
                 )
                 # Konsolidierten Swarm-Output in task.meta ablegen
                 self._persist_swarm_outputs_to_task(task)
+                # User-Direktive 23.06.2026 (Task 4bf7146b0780): Port-Bloecke freigeben
+                try:
+                    from ..services.port_manager import release_block, find_block_for_task
+                    block = find_block_for_task(task.id)
+                    if block and block.status == "active":
+                        released = release_block(block.id)
+                        if released:
+                            logger.info(f"Port-Block {block.id} fuer Task {task.id[:8]} freigegeben")
+                except Exception as port_rel_err:
+                    logger.warning(f"Port-Release fehlgeschlagen: {port_rel_err}")
         # Parent-Instance (falls Sub-SOP) reaktivieren
         if instance.parent_instance_id:
             parent = self.db.get(SOPInstance, instance.parent_instance_id)
@@ -1690,6 +1757,56 @@ class SOPEngine:
         if isinstance(merged, dict):
             consensus_score = merged.get("avg_score")
             auto_approved = merged.get("auto_approve", False)
+
+        # === User-Direktive 23.06.2026 (Task 4bf7146b0780): Port-Reservation ===
+        # Bei jedem Swarm-Spawn automatisch einen Port-Block reservieren.
+        # Bei Task-Completion wird der Block wieder freigegeben.
+        if task is not None:
+            try:
+                from ..services.port_manager import (
+                    reserve_block, release_block, find_block_for_task,
+                )
+                # Nur einmal pro Task reservieren (re-uses existierenden Block)
+                existing = find_block_for_task(task.id)
+                if existing and existing.status == "active":
+                    block_info = {
+                        "block_id": existing.id,
+                        "port_start": existing.port_start,
+                        "port_end": existing.port_end,
+                        "status": "reused",
+                    }
+                else:
+                    block = reserve_block(
+                        app_name="pi-dashboard-2",
+                        task_id=task.id,
+                        count=10,
+                        notes=f"Swarm {swarm_id} (auto-reserved)",
+                    )
+                    block_info = {
+                        "block_id": block.id,
+                        "port_start": block.port_start,
+                        "port_end": block.port_end,
+                        "status": "new",
+                    }
+                # Port-Info in task.meta ablegen
+                if not isinstance(task.meta, dict):
+                    task.meta = {}
+                if "port_allocations" not in task.meta:
+                    task.meta["port_allocations"] = []
+                task.meta["port_allocations"].append({
+                    "swarm_id": swarm_id,
+                    "block_id": block_info["block_id"],
+                    "port_start": block_info["port_start"],
+                    "port_end": block_info["port_end"],
+                    "status": block_info["status"],
+                })
+                self.db.commit()
+                logger.info(
+                    f"Port-Block fuer Task {task.id[:8]} Swarm {swarm_id[:8]}: "
+                    f"{block_info['port_start']}-{block_info['port_end']} ({block_info['status']})"
+                )
+            except Exception as port_err:
+                logger.warning(f"Port-Reservation fehlgeschlagen: {port_err}")
 
         # Kosten-Check
         if result["total_cost_usd"] > config.max_cost_usd:

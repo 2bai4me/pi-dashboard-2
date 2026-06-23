@@ -44,6 +44,8 @@ ALLOWED_ACTIONS = frozenset(
         "spawn_swarm",
         # Self-Evaluation (User-Direktive 23.06.2026)
         "evaluate_outcome",
+        # Task-Decomposition (User-Direktive 23.06.2026, Task 4bf7146b0780)
+        "decompose_task",
     }
 )
 
