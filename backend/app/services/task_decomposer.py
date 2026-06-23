@@ -18,16 +18,27 @@ logger = logging.getLogger("pi-dashboard-2.task_decomposer")
 # === Themen-Marker (kann erweitert werden) ===
 
 THEME_KEYWORDS = {
-    "frontend": ["frontend", "ui", "react", "vue", "angular", "css", "html", "ux", "design"],
-    "backend": ["backend", "api", "server", "endpoint", "route", "fastapi", "flask"],
-    "database": ["datenbank", "database", "db", "sql", "migration", "schema", "model"],
-    "tests": ["test", "tests", "testing", "pytest", "vitest", "unittest"],
-    "deployment": ["deploy", "deployment", "docker", "ci/cd", "build", "release"],
+    "frontend": ["frontend", "ui", "react", "vue", "angular", "css", "html", "ux", "design",
+                  "komponente", "seite", "page", "view"],
+    "backend": ["backend", "api", "server", "endpoint", "route", "fastapi", "flask",
+                 "logik", "service", "controller"],
+    "database": ["datenbank", "database", "db", "sql", "migration", "schema", "model",
+                  "tabelle", "spalte"],
+    "tests": ["test", "tests", "testing", "pytest", "vitest", "unittest",
+               "abdeckung", "coverage"],
+    "deployment": ["deploy", "deployment", "docker", "ci/cd", "build", "release",
+                     "build-pipeline", "container"],
     "documentation": ["dokumentation", "docs", "readme", "documentation", "doc"],
-    "security": ["security", "auth", "jwt", "oauth", "berechtigung", "permission"],
-    "performance": ["performance", "optimierung", "optimization", "cache", "speed"],
-    "monitoring": ["monitoring", "logging", "telemetry", "metric", "observability"],
-    "infrastructure": ["infra", "infrastructure", "server", "cloud", "kubernetes"],
+    "security": ["security", "auth", "jwt", "oauth", "berechtigung", "permission",
+                  "authentifizierung"],
+    "performance": ["performance", "optimierung", "optimization", "cache", "speed",
+                      "performance-test", "benchmark"],
+    "monitoring": ["monitoring", "logging", "telemetry", "metric", "observability",
+                     "metriken"],
+    "infrastructure": ["infra", "infrastructure", "server", "cloud", "kubernetes",
+                        "docker", "helm"],
+    "api": ["api", "endpoint", "rest", "graphql", "schnittstelle"],
+    "openbrain": ["openbrain", "open-brain", "brain-mcp", "capturing-thought"],
 }
 
 
