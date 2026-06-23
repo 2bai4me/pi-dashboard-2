@@ -411,7 +411,7 @@ if settings.RATE_LIMIT_PER_MINUTE > 0:  # type: ignore
 # - agent_questions:         User<->Agent Interaktionstool
 # - subagents:              SubAgent-Konfig
 # - board_operators/test_runner: Live-Watchdog + Test-Navigator
-from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials, smproducer, swarm, swarm_events  # noqa: E402
+from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials, smproducer, swarm, swarm_events, ideas  # noqa: E402
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
@@ -429,6 +429,7 @@ app.include_router(board_operators.router)  # User-Direktive 17.06.2026: Live-Bo
 app.include_router(test_runner.router)  # User-Direktive 17.06.2026: Navigator-Service fuer Test-Aktionen
 app.include_router(swarm.router)  # User-Direktive 22.06.2026: Multi-Agent-Swarm (Phase 0-2)
 app.include_router(swarm_events.router)  # Phase 14: SSE-Events für Live-Updates
+app.include_router(ideas.router)  # Phase 19: Idee-Page CRUD
 app.include_router(tts.router)  # MiniMax Text-to-Audio V2
 app.include_router(auth.router)  # JWT Login
 app.include_router(provider_credentials.router)  # Zentrale API-Key-Verwaltung

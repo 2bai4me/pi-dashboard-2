@@ -942,6 +942,40 @@ class SOPEngine:
             return {"ok": True, "action": "cio_final_reject",
                     "task_id": task.id, "new_status": t.status}
 
+        # User-Direktive 23.06.2026: Self-Evaluation als Phase-7-Action.
+        # Konsolidiert Swarm-Outputs in task.meta und setzt Task auf done.
+        if action == "evaluate_outcome":
+            if task is None:
+                return {"ok": False, "error": "evaluate_outcome: no task"}
+            self._persist_swarm_outputs_to_task(task)
+            from .task_service import TaskService
+            t = await TaskService.change_status_with_delay(
+                self.db, t=task, new_status="done",
+                agent=step.agent,
+                reason=f"sop:evaluate_outcome:{instance.id}",
+                delay_s=0.0,
+            )
+            # Score + Iteration-Counter aus task.meta in History loggen
+            try:
+                from ..models.history import TaskHistory
+                th = TaskHistory(
+                    task_id=task.id,
+                    event="swarm_consolidated",
+                    agent="system",
+                    details={
+                        "consensus_score": (task.meta or {}).get("consensus_score"),
+                        "stages": list(((task.meta or {}).get("swarm_consolidated", {}) or {}).get("stages", {}).keys()),
+                        "total_cost_usd": ((task.meta or {}).get("swarm_consolidated", {}) or {}).get("total_cost_usd", 0),
+                    },
+                )
+                self.db.add(th)
+                self.db.commit()
+            except Exception:
+                pass
+            return {"ok": True, "action": "evaluate_outcome",
+                    "task_id": task.id, "new_status": t.status,
+                    "swarm_consolidated": bool((task.meta or {}).get("swarm_consolidated"))}
+
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     # === Rules: Wenn-Dann-Logik ===
@@ -1482,6 +1516,17 @@ class SOPEngine:
             event="instance_completed", agent="system",
             details={"step_result": step_result or {}},
         )
+        # User-Direktive 23.06.2026: Task-Status auf done setzen, NICHT in triage lassen
+        if instance.task_id:
+            task = self.db.get(Task, instance.task_id)
+            if task and task.status != "done":
+                from .task_service import TaskService
+                TaskService.set_status_sync(
+                    self.db, task.id, "done",
+                    agent="system", reason=f"sop_completed:{instance.id}", delay_s=0.0,
+                )
+                # Konsolidierten Swarm-Output in task.meta ablegen
+                self._persist_swarm_outputs_to_task(task)
         # Parent-Instance (falls Sub-SOP) reaktivieren
         if instance.parent_instance_id:
             parent = self.db.get(SOPInstance, instance.parent_instance_id)
@@ -1494,6 +1539,64 @@ class SOPEngine:
                 )
         self.db.commit()
         return {"ok": True, "action": "completed", "instance_id": instance.id}
+
+    def _persist_swarm_outputs_to_task(self, task) -> None:
+        """Konsolidiert alle Swarm-Outputs einer Task-Instance in task.meta.
+
+        User-Direktive 23.06.2026: Subagent-Ergebnisse muessen am Haupttask
+        konsolidiert werden. Wir laden alle swarm_workers der Task, gruppieren
+        nach Swarm-Typ und schreiben einen konsolidierten Output in task.meta.
+        """
+        try:
+            from ..models.swarm import SwarmRun as SwarmRunModel, SwarmWorker as SwarmWorkerModel
+            runs = self.db.query(SwarmRunModel).filter_by(task_id=task.id).all()
+            if not runs:
+                return
+            consolidated = {
+                "total_swarms": len(runs),
+                "total_cost_usd": sum(float(r.total_cost_usd or 0) for r in runs),
+                "stages": {},
+                "all_worker_outputs": [],
+            }
+            for run in runs:
+                stage_key = (run.result or {}).get("stage_key") if isinstance(run.result, dict) else None
+                stage_key = stage_key or f"swarm_{run.swarm_type}"
+                consolidated["stages"][stage_key] = {
+                    "swarm_run_id": run.id,
+                    "swarm_type": run.swarm_type,
+                    "merge_strategy": run.merge_strategy,
+                    "consensus_score": (run.result or {}).get("merged_output", {}).get("avg_score")
+                        if isinstance(run.result, dict) else None,
+                    "auto_approved": (run.result or {}).get("merged_output", {}).get("auto_approve")
+                        if isinstance(run.result, dict) else None,
+                    "cost_usd": float(run.total_cost_usd or 0),
+                }
+                # Worker-Outputs sammeln
+                for worker in self.db.query(SwarmWorkerModel).filter_by(swarm_run_id=run.id).all():
+                    consolidated["all_worker_outputs"].append({
+                        "swarm_run_id": run.id,
+                        "stage_key": stage_key,
+                        "role": worker.subagent_role,
+                        "variant": worker.variant,
+                        "status": worker.status,
+                        "output": worker.output,
+                        "cost_usd": float(worker.cost_usd or 0),
+                    })
+            # In task.meta schreiben
+            if not isinstance(task.meta, dict):
+                task.meta = {}
+            task.meta["swarm_consolidated"] = consolidated
+            # Konsens-Score als Top-Level-Feld fuer schnellen Zugriff
+            last_score = None
+            for stage_data in consolidated["stages"].values():
+                if stage_data.get("consensus_score") is not None:
+                    last_score = stage_data["consensus_score"]
+            if last_score is not None:
+                task.meta["consensus_score"] = last_score
+                task.meta["swarm_iteration_count"] = task.meta.get("swarm_iteration_count", 0) + 1
+            self.db.commit()
+        except Exception as e:
+            logger.warning(f"Swarm-Output-Konsolidierung fehlgeschlagen: {e}")
 
     def fail_instance(
         self, instance: SOPInstance, reason: str

@@ -43,6 +43,18 @@ export const api = {
     get: (id: string) => request<any>("GET", `/api/swarms/${id}`),
     spawn: (config: any) => request<any>("POST", "/api/swarms", config),
   },
+  // Idee-Page (User-Direktive 23.06.2026)
+  ideas: {
+    list: (status?: string) =>
+      request<any>("GET", `/api/ideas${status ? `?status=${status}` : ""}`),
+    get: (id: string) => request<any>("GET", `/api/ideas/${id}`),
+    create: (data: any) => request<any>("POST", "/api/ideas", data),
+    update: (id: string, data: any) =>
+      request<any>("PUT", `/api/ideas/${id}`, data),
+    delete: (id: string) => request<any>("DELETE", `/api/ideas/${id}`),
+    convertToTask: (id: string) =>
+      request<any>("POST", `/api/ideas/${id}/umsetzen`, {}),
+  },
   // Projects
   listProjects: () => request<any>("GET", "/api/kanban/projects"),
   getProject: (id: string) => request<any>("GET", `/api/kanban/projects/${id}`),
