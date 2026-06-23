@@ -239,6 +239,16 @@ class TaskService:
         db.commit()
         db.refresh(t)
 
+        # === User-Direktive 23.06.2026: Auto-Complete-Parent ===
+        # Wenn ein Subtask auf 'done' wechselt, prüfen ob alle Geschwister auch done sind.
+        # Wenn ja: Parent automatisch auf 'done' setzen.
+        if new_status == "done" and t.parent_id:
+            try:
+                from .parent_completion import check_and_complete_parent
+                check_and_complete_parent(db, t.id)
+            except Exception as pc_err:
+                logger.warning(f"Auto-Complete-Parent fehlgeschlagen fuer {t.id}: {pc_err}")
+
         # === Background-Delay: 5s warten + Auto-Claim + Watchdog ===
         if delay_seconds > 0:
             TaskService._schedule_background_delay(
@@ -286,12 +296,12 @@ class TaskService:
                         bg_t.claimed_at = processing_started_at
                         auto_claim_triggered = True
                     if auto_claim_triggered:
-                        # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
-                        # Wenn die SOP-Engine noch keine assigned_role gesetzt hat,
-                        # setzen wir hier explizit pi-coder, damit Auto-Claim-Records
-                        # (History + Transition) den echten Coding-Agent zeigen.
-                        if not bg_t.assigned_role and not bg_t.assigned_subagent:
-                            bg_t.assigned_role = "pi-coder"
+                        # Auto-Claim orientiert sich an der SOP: fuer Status in_progress
+                        # wird der Agent des Steps mit Trigger 'status_changed:in_progress'
+                        # verwendet (z.B. pi-coder). Nur wenn die SOP nichts definiert,
+                        # fallback auf pi-coder. Ein gesetzter Sub-Agent hat Vorrang.
+                        if not bg_t.assigned_subagent:
+                            bg_t.assigned_role = TaskService._resolve_sop_agent_for_status(bg_db, bg_t, "in_progress") or bg_t.assigned_role or "pi-coder"
                         take_pricing_snapshot(bg_t, db=bg_db)
                         # Agent aus dem Task ableiten, damit die Auto-Claim-Records
                         # den echten Coding-Agent zeigen (z.B. pi-coder), nicht "system".
@@ -549,6 +559,38 @@ class TaskService:
             return t.assigned_role
         return None
 
+    @staticmethod
+    def _resolve_sop_agent_for_status(db: Session, t: Task, status: str) -> Optional[str]:
+        """Ermittelt den zustaendigen Agenten aus der laufenden SOP-Instance
+        anhand des Trigger-Musters 'status_changed:<status>'.
+
+        Damit uebernimmt der Auto-Claim-Fallback den Worker, den die SOP
+        fuer den jeweiligen Status vorsieht, anstatt hart pi-coder zu setzen.
+        """
+        if not t.project_id:
+            return None
+        from ..models.sop import SOPInstance, SOPStep
+        row = db.execute(
+            select(SOPInstance.sop_id)
+            .where(
+                SOPInstance.task_id == t.id,
+                SOPInstance.status.in_(["running", "pending", "waiting_sub_sop"]),
+            )
+            .order_by(SOPInstance.started_at.desc())
+        ).first()
+        if not row:
+            return None
+        sop_id = row[0]
+        agent = db.execute(
+            select(SOPStep.agent)
+            .where(
+                SOPStep.sop_id == sop_id,
+                SOPStep.trigger == f"status_changed:{status}",
+            )
+            .order_by(SOPStep.step_order)
+        ).scalar_one_or_none()
+        return agent
+
     # === Transition-Logging (User-Direktive 15.06.2026) ===
     @staticmethod
     def _log_transition(
@@ -691,12 +733,12 @@ class TaskService:
             t.claimed_at = processing_started_at
             auto_claim_triggered = True
         if auto_claim_triggered:
-            # === Bugfix 19.06.2026 (Task 921bba39d13f) ===
-            # Wenn die SOP-Engine noch keine assigned_role gesetzt hat,
-            # setzen wir hier explizit pi-coder, damit Auto-Claim-Records
-            # den echten Coding-Agent zeigen.
-            if not t.assigned_role and not t.assigned_subagent:
-                t.assigned_role = "pi-coder"
+            # Auto-Claim orientiert sich an der SOP: fuer Status in_progress
+            # wird der Agent des Steps mit Trigger 'status_changed:in_progress'
+            # verwendet (z.B. pi-coder). Nur wenn die SOP nichts definiert,
+            # fallback auf pi-coder. Ein gesetzter Sub-Agent hat Vorrang.
+            if not t.assigned_subagent:
+                t.assigned_role = TaskService._resolve_sop_agent_for_status(db, t, "in_progress") or t.assigned_role or "pi-coder"
             take_pricing_snapshot(t, db=db)
             # Auto-Claim-Agent aus dem Task ableiten (assigned_subagent/assigned_role),
             # damit die Performance-Tabelle den echten Coding-Agent anzeigt.
