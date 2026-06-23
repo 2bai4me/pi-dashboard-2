@@ -149,7 +149,18 @@ function ProjectList({ projects, onSelect, onNew }: { projects: any[]; onSelect:
               onClick={() => onSelect(p.id)}
               style={{ borderLeftColor: p.mode === "execution" ? "var(--color-hermes-accent)" : p.mode === "completed" ? "var(--color-hermes-accent-blue)" : "var(--color-hermes-text-secondary)" }}
             >
-              <div className="project-card-name">{p.name}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                <div className="project-card-name" style={{ marginBottom: 0 }}>{p.name}</div>
+                {p.project_number && (
+                  <span
+                    className="badge badge-blue"
+                    style={{ fontSize: 10, fontWeight: 700 }}
+                    data-testid="project-card-number"
+                  >
+                    {p.project_number}
+                  </span>
+                )}
+              </div>
               <div className="project-card-desc">{p.description || "(keine Beschreibung)"}</div>
               <div className="project-card-meta">
                 <span className="badge badge-gray">{p.category}</span>
@@ -267,6 +278,16 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
           <ListChecks size={20} color="var(--color-hermes-accent-blue)" />
           <h1>Projekte</h1>
           <span className="workspace-breadcrumb">/ {project.name}</span>
+          {/* User-Direktive 23.06.2026, Task 260326669e82: Projektnummer prominent unter Titel */}
+          {project.project_number && (
+            <span
+              className="badge badge-blue"
+              style={{ marginLeft: 8, fontSize: 14, fontWeight: 700, letterSpacing: 0.5 }}
+              data-testid="project-number"
+            >
+              {project.project_number}
+            </span>
+          )}
           {/* Live-Indikator (User-Direktive 17.06.2026: minimalistisch) - nur ein Punkt, kein blinkender Text */}
           <span
             className={`live-indicator live-indicator-${sseStatus}`}
@@ -296,7 +317,12 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
             />
           </span>
         </div>
-        <p>Projekt-Management mit Brainstorming, Anforderungen, Tasks & Board</p>
+        {/* User-Direktive 23.06.2026: projektnummer ersetzt den bisherigen Beschreibungstext */}
+        {project.project_number && (
+          <p style={{ color: "var(--color-hermes-accent-blue)", fontWeight: 600, fontSize: 13 }}>
+            Projektnummer: <code style={{ fontSize: 13 }}>{project.project_number}</code>
+          </p>
+        )}
       </div>
 
       <div className="subtab-bar">

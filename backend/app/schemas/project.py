@@ -65,6 +65,7 @@ class ProjectRead(ProjectBase):
     closed_at: Optional[datetime] = None
     completion_report: Optional[str] = None
     default_sop_id: Optional[str] = None  # User-Direktive 15.06.2026
+    project_number: Optional[str] = None  # User-Direktive 23.06.2026, Task 260326669e82
     task_count: int = 0
     tasks_done: int = 0
     tasks_in_progress: int = 0

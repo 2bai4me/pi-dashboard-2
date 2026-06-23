@@ -34,6 +34,10 @@ class Project(Base):
     mode: Mapped[str] = mapped_column(String(32), default="preparation", nullable=False)
     category: Mapped[str] = mapped_column(String(32), default="new_request", nullable=False)
 
+    # === Projektnummer (User-Direktive 23.06.2026, Task 260326669e82) ===
+    # Format: PROJ-YYYY-NNN (z.B. PROJ-2026-001), eindeutig pro Projekt
+    project_number: Mapped[Optional[str]] = mapped_column(String(32), index=True)
+
     # === Timestamps ===
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

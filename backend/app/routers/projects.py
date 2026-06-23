@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..db.base import get_db
-from ..auth import require_auth
+from ..auth import require_auth, require_admin, require_cio
 from ..schemas.project import (
     ProjectRead, ProjectCreate, ProjectUpdate, ProjectList,
     ProjectModeUpdate, ProjectCategoryUpdate, CompletionReport,
@@ -26,11 +26,16 @@ async def list_projects(
     projects = ProjectService.list_projects(db)
     items = []
     for p in projects:
+        from ..services.project_number import ensure_project_number
+        if not p.project_number:
+            ensure_project_number(p.id)
+            db.refresh(p)
         stats = ProjectService.project_stats(db, p)
         items.append(ProjectRead(
             id=p.id, name=p.name, description=p.description,
             status=p.status, mode=p.mode, category=p.category,
             default_sop_id=p.default_sop_id,
+            project_number=p.project_number,
             created_at=p.created_at, updated_at=p.updated_at,
             closed_at=p.closed_at, completion_report=p.completion_report,
             **stats,
@@ -42,13 +47,17 @@ async def list_projects(
 async def create_project(
     req: ProjectCreate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     p = ProjectService.create_project(db, name=req.name, description=req.description,
                                        mode=req.mode, category=req.category)
+    from ..services.project_number import ensure_project_number
+    ensure_project_number(p.id)
+    db.refresh(p)
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
                               ["id", "name", "description", "status", "mode", "category", "default_sop_id",
+                               "project_number",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 
@@ -62,9 +71,14 @@ async def get_project(
     p = ProjectService.get_project(db, project_id)
     if not p:
         raise HTTPException(404, "Project not found")
+    from ..services.project_number import ensure_project_number
+    if not p.project_number:
+        ensure_project_number(p.id)
+        db.refresh(p)
     stats = ProjectService.project_stats(db, p)
     return ProjectRead(**{**{k: getattr(p, k) for k in
                               ["id", "name", "description", "status", "mode", "category", "default_sop_id",
+                               "project_number",
                                "created_at", "updated_at", "closed_at", "completion_report"]},
                           **stats})
 
@@ -74,7 +88,7 @@ async def update_project(
     project_id: str,
     req: ProjectUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     p = ProjectService.update_project(db, project_id, **req.model_dump(exclude_unset=True))
     if not p:
@@ -95,7 +109,7 @@ async def set_project_mode(
     project_id: str,
     req: ProjectModeUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt Modus (preparation/execution/paused/completed).
 
@@ -119,7 +133,7 @@ async def set_project_category(
     project_id: str,
     req: ProjectCategoryUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt ITIL-Klassifizierung (new_request/ticket/change)."""
     p = ProjectService.update_project(db, project_id, category=req.category)
@@ -151,7 +165,7 @@ async def get_completion_report(
 async def delete_project(
     project_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     ok = ProjectService.delete_project(db, project_id)
     if not ok:
