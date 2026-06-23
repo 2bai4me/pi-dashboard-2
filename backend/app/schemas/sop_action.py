@@ -42,6 +42,8 @@ ALLOWED_ACTIONS = frozenset(
         "decide_triage",
         # Multi-Agent-Swarm (User-Direktive 22.06.2026)
         "spawn_swarm",
+        # Self-Evaluation (User-Direktive 23.06.2026)
+        "evaluate_outcome",
     }
 )
 

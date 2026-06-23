@@ -633,6 +633,18 @@ class SOPEngine:
         # Startet einen Swarm von SubAgents (parallel/competitive) fuer
         # hoechste Qualitaet durch Diversitaet und Konsens-Bewertung.
         if action == "spawn_swarm":
+            # Bugfix 23.06.2026 (Task 61ab3dfe26d3): Task sofort auf in_progress,
+            # damit die UI nicht faelschlicherweise in 'triage' stehen bleibt,
+            # obwohl Code-Bearbeitung bereits laeuft.
+            if task is not None and task.status == "triage":
+                task.status = "in_progress"
+                self.db.commit()
+                self._log_execution(
+                    instance, step_id=step.id,
+                    event="task_status_changed_to_in_progress",
+                    agent=step.agent,
+                    details={"reason": "spawn_swarm_started"},
+                )
             return await self._execute_spawn_swarm(instance, step, task, params)
 
         if action == "spawn_sop":
@@ -647,6 +659,10 @@ class SOPEngine:
 
         # === LLM-Call Action (Multi-Provider Phase 2) ===
         if action == "llm_call":
+            # Bugfix 23.06.2026: Task in in_progress sobald Agent arbeitet
+            if task is not None and task.status == "triage":
+                task.status = "in_progress"
+                self.db.commit()
             system_prompt = params.get("system_prompt", "Du bist ein hilfreicher Assistent.")
             user_prompt = params.get("user_prompt", "")
             if not user_prompt:

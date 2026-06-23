@@ -55,6 +55,18 @@ export const api = {
     convertToTask: (id: string) =>
       request<any>("POST", `/api/ideas/${id}/umsetzen`, {}),
   },
+  // Sub-Tasks mit Planung (User-Direktive 23.06.2026, Task 61ab3dfe26d3)
+  subtasks: {
+    list: (parentTaskId: string) =>
+      request<any>("GET", `/api/subtasks?parent_task_id=${parentTaskId}`),
+    get: (id: string) => request<any>("GET", `/api/subtasks/${id}`),
+    create: (data: any) => request<any>("POST", "/api/subtasks", data),
+    updatePlan: (id: string, plan: any) =>
+      request<any>("PUT", `/api/subtasks/${id}/plan`, plan),
+    submitResult: (id: string, result: any) =>
+      request<any>("POST", `/api/subtasks/${id}/result`, result),
+    delete: (id: string) => request<any>("DELETE", `/api/subtasks/${id}`),
+  },
   // Projects
   listProjects: () => request<any>("GET", "/api/kanban/projects"),
   getProject: (id: string) => request<any>("GET", `/api/kanban/projects/${id}`),

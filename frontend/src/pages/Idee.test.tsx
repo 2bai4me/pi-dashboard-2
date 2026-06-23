@@ -23,7 +23,7 @@ function renderWithProviders(ui: React.ReactElement) {
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/idee"]}>
         <Routes>
-          <Route path="/idee" element={<ui.type {...ui.props} />} />
+          <Route path="/idee" element={<Idee />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>

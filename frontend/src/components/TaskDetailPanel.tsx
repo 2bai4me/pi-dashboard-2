@@ -10,6 +10,7 @@ import {
 } from "lucide-react"
 import { CioTriageSection } from "./CioTriageSection"
 import { SpeakButton } from "./SpeakButton"
+import { PlanningSection } from "./PlanningSection"
 
 export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: string; projectName: string; onClose: () => void }) {
   const qc = useQueryClient()
@@ -217,6 +218,9 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
             <div className="description-box">{task.description}</div>
           </AccordionSection>
         )}
+
+        {/* User-Direktive 23.06.2026: Planung-Section nach Beschreibung */}
+        <PlanningSection taskId={task.id} />
 
         {/* Accordion-Section 3: Success Criteria (immer sichtbar, auch bei 0 Kriterien) */}
         <AccordionSection
