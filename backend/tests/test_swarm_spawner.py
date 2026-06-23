@@ -17,6 +17,14 @@ import pytest
 def temp_db(monkeypatch, tmp_path):
     db_path = tmp_path / "test_pi.db"
     monkeypatch.setenv("PI_DB_PATH", str(db_path))
+    # FIX 23.06.2026 (Task b2155f9cae64, pi-fixer):
+    # PI_SWARM_USE_REAL ist in der globalen Shell-Umgebung auf "1" gesetzt
+    # (Production-Mode "Phase 11 = echte Worker"). In Tests wuerde das den
+    # Mock-Worker ueberschreiben, sodass execute_worker_real versucht
+    # SubAgents zu spawnen - was ohne DB/SubagentService fehlschlaegt.
+    # Tests muessen daher explizit Mock-Workers erzwingen.
+    monkeypatch.delenv("PI_SWARM_USE_REAL", raising=False)
+    monkeypatch.setenv("PI_SWARM_USE_REAL", "0")
     # Schema minimal erstellen (nur swarm_runs + swarm_workers werden benoetigt)
     import sqlite3
     conn = sqlite3.connect(str(db_path))
