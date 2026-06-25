@@ -18,3 +18,8 @@ bcrypt==4.3.0
 slowapi==0.1.10
 cryptography==47.0.0
 python-jose==3.5.0
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pyzmq==27.1.0
+mcp==1.28.0
+tornado==6.5.7

@@ -1,0 +1,16 @@
+{
+  "title": "E2E-Test: SOP-Step-Chaining Bugfix (Auto-Resolve on next run)",
+  "description": "TEST-TASK fuer End-to-End-Verifikation des BUGFIX (Task 7ce2066d5bd5):\n\nVerifikation, dass die SOP 7c86692be939 (Standard-Workflow) jetzt sauber durchlaeuft:\n  - Step 0: CIO Triage Review (llm_call) -> next Step 1\n  - Step 1: Worker Assignment (llm_call) -> next Step 2\n  - Step 2: Worker Implementation (spawn_swarm) -> next Step 3\n  - Step 3: Tester Code-Review (spawn_swarm) -> next Step 4\n  - Step 4: CIO Final-Review (spawn_swarm) -> next Step 5\n  - Step 5: Done (llm_call) -> next Step 6\n  - Step 6: Final Approval (cio_final_review) -> next Step 7\n  - Step 7: Self-Evaluation (evaluate_outcome) -> END\n\nDieser Task ist bewusst klein gehalten, damit die SOP-Engine ihn moeglichst schnell durchlaeuft.\nDer Watchdog (Prio>=90) sollte diesen Task auto-claimen.\n\nERWARTUNG NACH FIX:\n  - Task bleibt NICHT nach Triage auf 'done' haengen\n  - Defense-in-Depth: wenn SOP unvollstaendig, Task auf 'block'\n  - Bei vollstaendigem Durchlauf: Task auf 'done' am Ende",
+  "status": "triage",
+  "priority": 50,
+  "category": "test",
+  "project_id": "d5976e76247c",
+  "assigned_role": "CIO",
+  "success_criteria": [
+    "Task durchlaeuft alle 8 SOP-Schritte",
+    "Defense-in-Depth blockiert bei unvollstaendiger SOP",
+    "Task endet auf 'done' (nicht vor Step 5)",
+    "Mindestens 1 step_completed Eintrag pro Step in History"
+  ],
+  "tags": ["test", "e2e", "sop-chaining", "bugfix-verification", "PROJ-2026-001"]
+}

@@ -223,6 +223,55 @@
 - **Auth-Tokens:** Separate `auth.json` (außerhalb)
 - **Backups:** Verschlüsselt + Off-site empfohlen
 
+## SOP-Engine (Standard-Workflow)
+
+**Modul:** `backend/app/services/sop_engine.py`
+**Standard-SOP:** `7c86692be939` (8 Steps)
+
+### Schritt-Verkettung
+
+Die SOP `7c86692be939` ("Standard-Workflow Task") durchläuft **8 verkettete Steps**:
+
+| Order | Step | Action | Agent | next_step_id | fail_step_id |
+|-------|------|--------|-------|--------------|--------------|
+| 0 | CIO Triage Review | llm_call | CIO | Step 1 | - |
+| 1 | Worker Assignment | llm_call | pi-coder | Step 2 | Step 0 |
+| 2 | Worker Implementation | spawn_swarm | pi-coder | Step 3 | Step 1 |
+| 3 | Tester Code-Review | spawn_swarm | pi-tester | Step 4 | Step 2 |
+| 4 | CIO Final-Review | spawn_swarm | CIO | Step 5 | Step 3 |
+| 5 | Done | llm_call | system | Step 6 | - |
+| 6 | Final Approval (CIO) | cio_final_review | CIO | Step 7 | Step 4 |
+| 7 | Self-Evaluation | evaluate_outcome | system | - (End) | - |
+
+### Defense-in-Depth: `_check_sop_completion()` (Task 7ce2066d5bd5, 25.06.2026)
+
+**Problem:** Vor dem Fix hatten alle 8 Steps `next_step_id=None`. Damit endete die SOP-Instance nach dem ersten Step, und `_complete_instance()` setzte den Task pauschal auf `done` — **OHNE** dass Implementation, Review und Tests durchlaufen wurden.
+
+**Fix:** Migration `scripts/migrate_sop_step_chaining.py` setzt `next_step_id` und `fail_step_id` für alle 8 Steps. Zusätzlich prüft `_check_sop_completion()` (Defense-in-Depth), ob die Instance alle Steps durchlaufen hat:
+
+```python
+if instance.task_id:
+    sop_incomplete_reason = self._check_sop_completion(instance, step)
+    if sop_incomplete_reason:
+        # SOP unvollständig -> Task auf 'block', NICHT auf 'done'
+        TaskService.set_status_sync(self.db, task.id, "block",
+            reason=f"sop_incomplete:{instance.id}:{sop_incomplete_reason}")
+```
+
+**Verhalten:**
+- Wenn `current_step.step_order < max_step_order`: Task auf `block` mit Reason `sop_incomplete`
+- Wenn vorherige Steps fehlen in `sop_executions`: Task auf `block`
+- Wenn alles OK: Task auf `done` (Normal-Flow)
+
+**Migration-Script ausführen:**
+```bash
+python backend/scripts/migrate_sop_step_chaining.py --dry-run
+python backend/scripts/migrate_sop_step_chaining.py  # Echter Lauf
+python backend/scripts/migrate_sop_step_chaining.py --verify
+```
+
+**Regression-Tests:** `backend/tests/test_sop_step_chaining.py` (7 Tests, alle grün).
+
 ## Nächste Schritte
 
 1. ✅ Schema-Design (dieses Dokument)

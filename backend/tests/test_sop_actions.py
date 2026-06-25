@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+from decimal import Decimal
+from unittest.mock import patch
 
 # Env-Defaults MUSSEN vor dem Import von app-Modulen gesetzt werden,
 # da config.py settings beim Laden instanziiert.
@@ -15,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.base import Base
 from app.models.sop import SOPStep
+from app.models.token_usage import TokenUsage
 from app.services.sop_engine import SOPEngine, ALLOWED_SOP_ACTIONS
 from app.schemas.sop_action import ALLOWED_ACTIONS
 
@@ -158,18 +161,144 @@ class TestSOPActionWhitelist:
         assert result["action"] in ("noop", "completed")
 
     def test_whitelist_contains_expected_actions(self):
-        """Die Engine-Whitelist enthaelt die geforderten Actions."""
+        """Die Engine-Whitelist enthaelt alle implementierten Actions."""
         expected = {
             "noop",
-            "set_status",
-            "ask_user",
             "llm_call",
             "spawn_sop",
             "review_task",
             "assign_worker",
-            "implement",
-            "test",
             "cio_final_review",
             "tester_code_review",
+            "move_status",
+            "approve_triage",
+            "start_work",
+            "submit_review",
+            "tester_approve",
+            "tester_reject",
+            "cio_final_approve",
+            "cio_final_reject",
+            "check_title",
+            "check_description",
+            "check_success_criteria",
+            "check_architecture",
+            "check_consistency",
+            "decide_triage",
         }
         assert expected.issubset(ALLOWED_SOP_ACTIONS)
+
+    def test_whitelist_matches_schema(self):
+        """Engine-Whitelist und Schema-Whitelist sind synchron."""
+        assert ALLOWED_SOP_ACTIONS == ALLOWED_ACTIONS
+
+
+class TestSOPExecutionGuards:
+    """Tests fuer Timeout-, Budget- und Iterations-Guards in der SOP-Engine."""
+
+    def test_step_execution_timeout(self, db):
+        """Ein Step, der das Timeout ueberschreitet, wird abgebrochen."""
+        engine = SOPEngine(db)
+
+        sop = engine.create_sop(
+            name="Timeout SOP",
+            description="SOP with slow llm_call",
+            steps=[
+                {
+                    "name": "Slow Step",
+                    "action": "llm_call",
+                    "agent": "system",
+                    "delay_s": 0.0,
+                    "action_params": {
+                        "user_prompt": "test",
+                        "timeout_sec": 0.05,
+                    },
+                }
+            ],
+        )
+        instance = engine.create_instance(sop.id, task_id="task-123")
+
+        async def slow_chat_completion(*args, **kwargs):
+            await asyncio.sleep(0.2)
+            return "never"
+
+        with patch("app.services.sop_engine.chat_completion", side_effect=slow_chat_completion):
+            result = asyncio.run(engine.run_step(instance))
+
+        assert result["ok"] is False or result.get("action") == "failed"
+        assert instance.status == "failed"
+
+    def test_budget_guard_blocks_expensive_instance(self, db):
+        """Wenn das Task-Budget ueberschritten ist, darf kein LLM-Call laufen."""
+        engine = SOPEngine(db)
+
+        sop = engine.create_sop(
+            name="Budget SOP",
+            description="SOP with tight budget",
+            steps=[
+                {
+                    "name": "LLM Step",
+                    "action": "llm_call",
+                    "agent": "system",
+                    "delay_s": 0.0,
+                    "action_params": {
+                        "user_prompt": "test",
+                        "max_cost_usd": 1.0,
+                    },
+                }
+            ],
+        )
+        instance = engine.create_instance(sop.id, task_id="task-budget")
+
+        # Budget bereits ueberschritten
+        db.add(TokenUsage(
+            task_id="task-budget",
+            model="test",
+            provider="test",
+            tokens_in=100,
+            tokens_out=100,
+            cost_usd=Decimal("5.00"),
+        ))
+        db.commit()
+
+        with patch("app.services.sop_engine.chat_completion") as mock_llm:
+            result = asyncio.run(engine.run_step(instance))
+
+        mock_llm.assert_not_called()
+        assert result["ok"] is False or result.get("action") == "failed"
+        assert "budget" in result.get("reason", "").lower() or "budget" in str(result).lower()
+
+    def test_iteration_guard_triggers_after_limit(self, db):
+        """Ein Step darf nicht beliebig oft ausgefuehrt werden."""
+        engine = SOPEngine(db)
+
+        sop = engine.create_sop(
+            name="Loop SOP",
+            description="SOP with low iteration limit",
+            steps=[
+                {
+                    "name": "Noop Step",
+                    "action": "noop",
+                    "agent": "system",
+                    "delay_s": 0.0,
+                    "action_params": {"max_step_iterations": 3},
+                    "next_step": 0,  # auf sich selbst zeigen
+                }
+            ],
+        )
+        instance = engine.create_instance(sop.id)
+        # SOPStep.next_step_id ist eine Beziehung; setze explizit auf eigenes id
+        step = db.get(SOPStep, instance.current_step_id)
+        step.next_step_id = step.id
+        db.commit()
+
+        for _ in range(3):
+            asyncio.run(engine.run_step(instance))
+            instance.status = "running"
+            instance.current_step_id = step.id
+            db.commit()
+
+        # 4. Lauf muss vom Guard blockiert werden
+        result = asyncio.run(engine.run_step(instance))
+
+        assert result["ok"] is False or result.get("action") == "failed"
+        assert "iteration" in str(result).lower()

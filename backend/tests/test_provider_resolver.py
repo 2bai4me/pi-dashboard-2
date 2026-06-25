@@ -133,8 +133,9 @@ class TestProviderResolver:
     def test_error_when_nothing_configured(
         self, db_session, resolver_session, monkeypatch
     ):
-        """Fehler, wenn weder Role noch ENV konfiguriert ist."""
+        """Fehler, wenn weder Role noch ENV noch auth.json konfiguriert ist."""
         from app.config import settings
+        from app.services import provider_resolver as pr
         from app.services.provider_resolver import resolve_model_config
 
         # Alle bekannten API-Keys in Settings und ENV leeren.
@@ -142,6 +143,9 @@ class TestProviderResolver:
             if hasattr(settings, key):
                 monkeypatch.setattr(settings, key, "")
             monkeypatch.delenv(key, raising=False)
+
+        # Auch auth.json leeren, damit der Test isoliert bleibt.
+        monkeypatch.setattr(pr, "_read_auth_json", lambda: {})
 
         with pytest.raises(RuntimeError, match="Keine Provider-Konfiguration"):
             resolve_model_config("unknown-role")

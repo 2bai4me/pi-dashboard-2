@@ -10,6 +10,7 @@ os.environ.setdefault("AUTH_ENABLED", "true")
 os.environ.setdefault("ADMIN_USER", "admin")
 os.environ.setdefault("ADMIN_PASSWORD", "admin")
 
+import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
@@ -25,6 +26,12 @@ app.include_router(auth_router.router)
 @app.get("/protected")
 def protected_endpoint(user: str = Depends(require_auth)):
     return {"user": user}
+
+
+@pytest.fixture(autouse=True)
+def enable_auth(monkeypatch):
+    """Auth fuer dieses Modul explizit aktivieren."""
+    monkeypatch.setattr(settings, "AUTH_ENABLED", True)
 
 
 client = TestClient(app)
