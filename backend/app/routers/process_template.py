@@ -11,13 +11,13 @@ Endpoints:
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
 from ..db.base import get_db
-from ..auth import require_auth
+from ..auth import require_auth, require_admin, require_cio
 from ..models.process_template import ProcessTemplate
 from ..models.task import Task
 from ..models.history import TaskHistory
@@ -73,7 +73,7 @@ def list_templates(project_id: Optional[str] = None, db: Session = Depends(get_d
 
 
 @router.post("", status_code=201)
-def create_template(body: CreateTemplateBody, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
+def create_template(body: CreateTemplateBody, db: Session = Depends(get_db), _user: str = Depends(require_admin)):
     """Erstellt ein neues Process-Template (leeres oder mit nodes/edges)."""
     t = ProcessTemplate(
         project_id=body.project_id,
@@ -102,7 +102,7 @@ def get_template(template_id: str, db: Session = Depends(get_db), _user: str = D
 
 
 @router.put("/{template_id}")
-def update_template(template_id: str, body: UpdateTemplateBody, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
+def update_template(template_id: str, body: UpdateTemplateBody, db: Session = Depends(get_db), _user: str = Depends(require_admin)):
     """Update name/description/nodes/edges."""
     t = db.get(ProcessTemplate, template_id)
     if not t:
@@ -116,14 +116,14 @@ def update_template(template_id: str, body: UpdateTemplateBody, db: Session = De
     if body.edges is not None:
         t.edges = [e.model_dump(by_alias=True) for e in body.edges]
         t.edge_count = len(body.edges)
-    t.updated_at = datetime.utcnow()
+    t.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(t)
     return t.to_dict()
 
 
 @router.delete("/{template_id}", status_code=204)
-def delete_template(template_id: str, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
+def delete_template(template_id: str, db: Session = Depends(get_db), _user: str = Depends(require_admin)):
     """Loescht ein Process-Template (nicht die damit erstellten Sub-Tasks)."""
     t = db.get(ProcessTemplate, template_id)
     if not t:
@@ -140,7 +140,7 @@ class ActivateBody(BaseModel):
     note: Optional[str] = None
 
 @router.post("/{template_id}/activate")
-def activate_template(template_id: str, body: ActivateBody, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
+def activate_template(template_id: str, body: ActivateBody, db: Session = Depends(get_db), _user: str = Depends(require_cio)):
     """Template 'freischalten' — ab sofort steuert dieses Template den Workflow fuer das Projekt.
 
     - Setzt is_active=True und activated_at
@@ -161,7 +161,7 @@ def activate_template(template_id: str, body: ActivateBody, db: Session = Depend
     )
 
     t.is_active = True
-    t.activated_at = datetime.utcnow()
+    t.activated_at = datetime.now(timezone.utc)
     t.activated_by = body.agent
     t.activated_for_project_id = body.project_id
     t.activation_note = body.note
@@ -180,7 +180,7 @@ def activate_template(template_id: str, body: ActivateBody, db: Session = Depend
 
 
 @router.post("/{template_id}/deactivate")
-def deactivate_template(template_id: str, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
+def deactivate_template(template_id: str, db: Session = Depends(get_db), _user: str = Depends(require_cio)):
     """Template wieder deaktivieren — Operator faellt auf Standard-Workflow zurueck."""
     t = db.get(ProcessTemplate, template_id)
     if not t:
@@ -211,7 +211,7 @@ def get_active_template(project_id: str, db: Session = Depends(get_db), _user: s
 
 
 @router.post("/{template_id}/apply-to-task/{task_id}")
-def apply_to_task(template_id: str, task_id: str, db: Session = Depends(get_db), _user: str = Depends(require_auth)):
+def apply_to_task(template_id: str, task_id: str, db: Session = Depends(get_db), _user: str = Depends(require_cio)):
     """Wendet das Process-Template als Sub-Tasks auf einen Board-Task an.
 
     Erstellt fuer jeden 'task'-Node einen Sub-Task mit:

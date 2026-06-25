@@ -117,7 +117,9 @@ def list_subtasks(
     """Liste aller Sub-Tasks (gefiltert nach parent_task_id)."""
     import os
     import sqlite3
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -167,7 +169,9 @@ def create_subtask(
     import sqlite3
     import json
 
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper.
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -232,7 +236,9 @@ def get_subtask(subtask_id: str, _user: str = Depends(require_auth)):
     """Einen Sub-Task abrufen."""
     import os
     import sqlite3
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper.
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -263,7 +269,9 @@ def update_subtask_plan(
     import os
     import sqlite3
     import json
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper.
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     plan_json = json.dumps(req.dict())
@@ -289,7 +297,9 @@ def submit_subtask_result(
     import os
     import sqlite3
     import json
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper.
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()

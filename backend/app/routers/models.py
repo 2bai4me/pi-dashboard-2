@@ -1,7 +1,7 @@
 """Models + Pricing Router (Providers, Modelle, Preise)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from ..db.base import get_db
-from ..auth import require_auth
+from ..auth import require_auth, require_admin
 from ..config import settings, get_models_json_path, get_auth_json_path, get_settings_json_path
 from ..models.pricing import ModelPricing
 from ..schemas.pricing import (
@@ -124,7 +124,7 @@ async def get_pricing(
 @router.post("/pricing/refresh", response_model=PricingRefreshResult)
 async def refresh_pricing(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Aktualisiert alle Provider-Preise aus der statischen Preisdatenbank."""
     result = PricingService.refresh_all(db)
@@ -135,7 +135,7 @@ async def refresh_pricing(
 async def update_pricing(
     req: PricingUpdateRequest,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Manuelles Override pro Provider/Modell."""
     key = req.model_id or "default"
@@ -150,14 +150,14 @@ async def update_pricing(
             provider=req.provider, model_id=key,
             input_per_1m=req.input_per_1m, output_per_1m=req.output_per_1m,
             currency="USD", source="manual",
-            last_updated=datetime.utcnow(), is_default=(key == "default"),
+            last_updated=datetime.now(timezone.utc), is_default=(key == "default"),
         )
         db.add(row)
     else:
         row.input_per_1m = req.input_per_1m
         row.output_per_1m = req.output_per_1m
         row.source = "manual"
-        row.last_updated = datetime.utcnow()
+        row.last_updated = datetime.now(timezone.utc)
     if req.note:
         row.note = req.note
     db.commit()

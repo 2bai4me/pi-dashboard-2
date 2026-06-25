@@ -139,7 +139,9 @@ def list_swarms(
     import sqlite3
     import json
     import os
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     where = []

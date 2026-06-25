@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger("pi-dashboard-2.provider-credentials-router")
 
-from ..auth import require_auth
+from ..auth import require_admin
 from ..db.base import get_db
 from ..models.provider_credential import ProviderCredential
 from ..schemas.provider_credential import (
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/provider-credentials", tags=["provider-credentia
 @router.get("", response_model=ProviderCredentialListResponse)
 async def list_provider_credentials(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Liste aller Provider-Credentials (inkl. inaktiver)."""
     credentials = (
@@ -42,7 +42,7 @@ async def list_provider_credentials(
 async def create_provider_credential(
     req: ProviderCredentialCreate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Neue Credential anlegen."""
     credential = ProviderCredential(**req.model_dump())
@@ -56,7 +56,7 @@ async def create_provider_credential(
 async def get_provider_credential(
     credential_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Einzelne Credential abrufen."""
     credential = db.get(ProviderCredential, credential_id)
@@ -70,7 +70,7 @@ async def update_provider_credential(
     credential_id: str,
     req: ProviderCredentialUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Credential aktualisieren."""
     credential = db.get(ProviderCredential, credential_id)
@@ -89,7 +89,7 @@ async def update_provider_credential(
 async def delete_provider_credential(
     credential_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Credential löschen.
 
@@ -108,7 +108,7 @@ async def delete_provider_credential(
 async def refresh_provider_credential_pricing(
     credential_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Aktualisiert die Kosten (USD pro 1M Token) per KI.
 
@@ -125,8 +125,8 @@ async def refresh_provider_credential_pricing(
         raise HTTPException(404, str(e))
     except RuntimeError as e:
         raise HTTPException(502, str(e))
-    except Exception as e:
-        logger.exception("Unerwarteter Fehler bei Preisaktualisierung")
-        raise HTTPException(500, f"Preisaktualisierung fehlgeschlagen: {e}")
+    except (OSError, ConnectionError, TimeoutError) as e:
+        logger.exception("Netzwerk-/System-Fehler bei Preisaktualisierung")
+        raise HTTPException(502, f"Preisaktualisierung nicht erreichbar: {e}")
 
     return result

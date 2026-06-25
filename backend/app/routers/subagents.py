@@ -1,7 +1,7 @@
 """SubAgent Router - Konfiguration und Aufbau von Sub-Agenten.
 
 User-Direktive 18.06.2026: Sub-Agenten sollen konfigurierbar sein mit Modell
-pro Rolle. Standard ist ollama/gemma4:12b.
+pro Rolle. Standard ist minimax-direct/minimax-m3 (User-Direktive 24.06.2026).
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..db.base import get_db
-from ..auth import require_auth
+from ..auth import require_auth, require_role
 from ..services.subagent_service import SubAgentService, SubAgent
 
 logger = logging.getLogger("pi-dashboard-2.subagent-router")
@@ -23,6 +23,7 @@ router = APIRouter(prefix="/api/subagents", tags=["subagents"])
 
 class AgentConfigRead(BaseModel):
     name: str
+    display_name: Optional[str] = None
     role_id: str
     role_type: Optional[str] = None
     is_subagent: bool
@@ -34,6 +35,8 @@ class AgentConfigRead(BaseModel):
     emoji: Optional[str] = None
     system_prompt: Optional[str] = None
     description: Optional[str] = None
+    assigned_sop_id: Optional[str] = None
+    user_modified: bool = False  # User-Direktive 24.06.2026: Override-Schutz-Flag
 
 
 class AgentRead(BaseModel):
@@ -58,6 +61,24 @@ class PromptUpdate(BaseModel):
     system_prompt: str
 
 
+class NameUpdate(BaseModel):
+    display_name: str  # leerer String => zurueck auf `name`
+
+
+class SopUpdate(BaseModel):
+    sop_id: Optional[str] = None  # None oder leer => zuruecksetzen
+
+
+class ConfigUpdate(BaseModel):
+    """Alle editierbaren Felder einer Rolle in einem Aufruf."""
+    display_name: Optional[str] = None
+    sop_id: Optional[str] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    api_key_id: Optional[str] = None
+    system_prompt: Optional[str] = None
+
+
 # === Endpoints ===
 
 @router.get("/configs", response_model=List[AgentConfigRead])
@@ -79,7 +100,7 @@ async def build_agent(
     task_id: Optional[str] = Query(None, description="Optional Task-ID fuer task-spezifischen System-Prompt"),
     override_model: Optional[str] = Query(None, description="Modell-Override fuer Tests"),
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("cio")),
 ):
     """Baut einen Sub-Agent mit dem aus der Role konfigurierten Modell.
 
@@ -109,12 +130,12 @@ async def update_role_model(
     role_name: str,
     body: ModelUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Aktualisiert das Modell einer Rolle (User-Direktive 18.06.2026).
 
     Beispiel: PATCH /api/subagents/pi-coder/model
-              Body: {"model": "ollama/gemma4:12b", "provider": "ollama"}
+              Body: {"model": "minimax-m3", "provider": "minimax-direct"}
     """
     try:
         role = SubAgentService.update_role_model(
@@ -136,11 +157,109 @@ async def update_role_prompt(
     role_name: str,
     body: PromptUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Aktualisiert den System-Prompt / die Rollenbeschreibung einer Rolle."""
     try:
         role = SubAgentService.update_role_prompt(db, role_name, body.system_prompt)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    configs = SubAgentService.list_agent_configs(db)
+    for c in configs:
+        if c["name"] == role_name:
+            return c
+    raise HTTPException(500, "Config nicht gefunden nach Update")
+
+
+@router.patch("/{role_name}/name", response_model=AgentConfigRead)
+async def update_role_name(
+    role_name: str,
+    body: NameUpdate,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_role("admin")),
+):
+    """Aktualisiert den editierbaren Anzeigenamen (display_name) einer Rolle.
+
+    Der technische `name` (z.B. pi-coder) bleibt unveraendert, damit
+    bestehende Lookups stabil bleiben. Ein leerer String setzt
+    display_name zurueck – die UI faellt dann auf `name` zurueck.
+    """
+    try:
+        SubAgentService.update_role_name(db, role_name, body.display_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    configs = SubAgentService.list_agent_configs(db)
+    for c in configs:
+        if c["name"] == role_name:
+            return c
+    raise HTTPException(500, "Config nicht gefunden nach Update")
+
+
+@router.patch("/{role_name}/sop", response_model=AgentConfigRead)
+async def update_role_sop(
+    role_name: str,
+    body: SopUpdate,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_role("admin")),
+):
+    """Ordnet der Rolle einen SOP zu (rein informativ, keine Prozess-Auswirkung)."""
+    try:
+        SubAgentService.update_role_sop(db, role_name, body.sop_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    configs = SubAgentService.list_agent_configs(db)
+    for c in configs:
+        if c["name"] == role_name:
+            return c
+    raise HTTPException(500, "Config nicht gefunden nach Update")
+
+
+@router.delete("/{role_name}", response_model=dict)
+async def delete_role(
+    role_name: str,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_role("admin")),
+):
+    """Loescht eine Rolle unwiderruflich aus der DB.
+
+    Andere Tabellen referenzieren Rollen nur als String (z.B.
+    task.assigned_role, token_usage.role); historische Eintraege bleiben
+    erhalten und zeigen weiterhin den Rollennamen an. Nur die
+    Konfiguration (Modell, Provider, Prompt, Tools) geht verloren.
+    """
+    try:
+        snapshot = SubAgentService.delete_role(db, role_name)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"deleted": True, "role": snapshot}
+
+
+@router.patch("/{role_name}/config", response_model=AgentConfigRead)
+async def update_role_config(
+    role_name: str,
+    body: ConfigUpdate,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_role("admin")),
+):
+    """Aktualisiert mehrere Felder einer Rolle in einem atomaren Aufruf.
+
+    Alle Felder sind optional; nicht angegebene Felder bleiben unveraendert.
+    Fuer display_name und sop_id gilt: leerer String setzt auf None zurueck.
+    """
+    try:
+        SubAgentService.update_role_config(
+            db,
+            role_name,
+            display_name=body.display_name,
+            sop_id=body.sop_id,
+            model=body.model,
+            provider=body.provider,
+            api_key_id=body.api_key_id,
+            system_prompt=body.system_prompt,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -203,7 +322,7 @@ async def get_agent_for_task_endpoint(
 @router.post("/spawned/cleanup")
 async def cleanup_dead_agents_endpoint(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_role("admin")),
 ):
     """Entfernt abgestuerzte Sub-Agent-Prozesse aus der In-Memory-Registry."""
     cleaned = _cleanup_dead()

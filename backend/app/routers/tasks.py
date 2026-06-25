@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..db.base import get_db
-from ..auth import require_auth
+from ..auth import require_auth, require_admin, require_cio
 from ..schemas.task import (
     TaskRead, TaskCreate, TaskUpdate, TaskList, TaskStats,
     TaskStatusUpdate, TaskPriorityUpdate, TaskDispatchUpdate, TaskTokenReport,
@@ -36,17 +36,104 @@ router = APIRouter(prefix="/api/kanban/tasks", tags=["tasks"])
 @router.get("")  # kein response_model -> spart doppeltes Pydantic-Encoding
 async def list_tasks(
     project_id: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=500),
+    status: Optional[str] = Query(None, description="Filter auf einen bestimmten Status (z.B. 'triage', 'done'). Leer = Standard-Verhalten."),
+    limit: int = Query(50, ge=1, le=500, description="Max Anzahl Tasks pro Seite"),
     offset: int = Query(0, ge=0),
+    include_recent_done: int = Query(10, ge=0, le=100, description="Anzahl der letzten done-Tasks, die zusaetzlich zu aktiven Tasks geladen werden (User-Direktive 24.06.2026). 0 = nur aktive."),
+    active_only: bool = Query(False, description="Wenn True: nur aktive Tasks (kein done, kein cancelled), keine letzten done. Fuer Board-Ansicht."),
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
-    tasks = TaskService.list_tasks(db, project_id=project_id, status=status)
-    paginated = tasks[offset:offset + limit]
+    """Listet Tasks.
+
+    Standard-Verhalten (User-Direktive 24.06.2026, Performance-Audit):
+      - Aktive Tasks (status != done und != cancelled)
+      - PLUS die letzten include_recent_done done-Tasks
+      - Resultat wird zusammengefuehrt und nach priority/created_at sortiert
+      - Aeltere done-Tasks sind bereits im Archiv und werden hier NICHT geladen
+
+    Override-Moeglichkeiten:
+      - ?status=done: nur done-Tasks
+      - ?status=triage: nur Triage-Tasks
+      - ?active_only=true: nur aktive Tasks (kein done)
+      - ?include_recent_done=0: nur aktive Tasks
+      - ?include_recent_done=100: 100 letzte done-Tasks
+    """
+    # Performance-Fix: limit/offset DIREKT in SQL
+    from ..cache import get_cache
+    cache = get_cache()
+    cache_key = f"tasks:list:{project_id or 'all'}:{status or 'default'}:a{int(active_only)}:r{include_recent_done}:{limit}:{offset}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from sqlalchemy import or_, and_, not_
+
+    if status:
+        # Expliziter Status-Filter: nur dieser Status
+        tasks = TaskService.list_tasks(
+            db, project_id=project_id, status=status,
+            limit=limit, offset=offset,
+        )
+        total_count = None  # Nicht relevant bei explizitem Status
+    elif active_only or include_recent_done == 0:
+        # Nur aktive Tasks (kein done, kein cancelled)
+        ACTIVE_STATUSES = ("triage", "in_progress", "review", "block", "rueckfrage", "todo", "go", "wait", "failed")
+        from sqlalchemy.orm import selectinload
+        from app.models.task import Task as TaskModel
+        stmt = (
+            select(TaskModel)
+            .where(TaskModel.status.in_(ACTIVE_STATUSES))
+            .order_by(TaskModel.priority.desc(), TaskModel.created_at.asc())
+        )
+        if project_id:
+            stmt = stmt.where(TaskModel.project_id == project_id)
+        if offset:
+            stmt = stmt.offset(offset)
+        stmt = stmt.limit(limit)
+        tasks = list(db.execute(stmt).scalars())
+    else:
+        # Standard: aktive Tasks + letzte include_recent_done done-Tasks
+        # Zwei separate Queries, dann zusammenfuehren
+        ACTIVE_STATUSES = ("triage", "in_progress", "review", "block", "rueckfrage", "todo", "go", "wait", "failed")
+        from app.models.task import Task as TaskModel
+
+        # Aktive Tasks
+        active_stmt = (
+            select(TaskModel)
+            .where(TaskModel.status.in_(ACTIVE_STATUSES))
+            .order_by(TaskModel.priority.desc(), TaskModel.created_at.asc())
+        )
+        if project_id:
+            active_stmt = active_stmt.where(TaskModel.project_id == project_id)
+        if offset:
+            active_stmt = active_stmt.offset(offset)
+        active_stmt = active_stmt.limit(limit)
+        active_tasks = list(db.execute(active_stmt).scalars())
+
+        # Letzte N done-Tasks (frisch archivierte sind schon weg)
+        if include_recent_done > 0:
+            done_stmt = (
+                select(TaskModel)
+                .where(TaskModel.status == "done")
+                .order_by(TaskModel.updated_at.desc())
+            )
+            if project_id:
+                done_stmt = done_stmt.where(TaskModel.project_id == project_id)
+            done_stmt = done_stmt.limit(include_recent_done)
+            recent_done = list(db.execute(done_stmt).scalars())
+        else:
+            recent_done = []
+
+        # Zusammenfuehren + sortiert (priorisiert, dann created_at)
+        # Aktive zuerst, dann done
+        tasks = list(active_tasks) + list(recent_done)
+        # Nach priority DESC, created_at ASC sortieren
+        tasks.sort(key=lambda t: (-(t.priority or 0), t.created_at or datetime.min))
+
     # Performance: direkter dict-Build statt model_validate (Pydantic-Overhead)
     items = []
-    for t in paginated:
+    for t in tasks:
         items.append({
             "id": t.id, "title": t.title, "description": t.description or "",
             "status": t.status,
@@ -67,12 +154,57 @@ async def list_tasks(
             "pricing_snapshot": t.pricing_snapshot,
             "meta": t.meta or {},
         })
-    return {
+
+    result = {
         "items": items,
-        "total": len(tasks),
+        "total": len(items),
         "limit": limit,
         "offset": offset,
+        "include_recent_done": include_recent_done if not status else 0,
     }
+    # Cache 2s
+    cache.set(cache_key, result, ttl=2.0)
+    return result
+
+
+# === Archivierung (User-Direktive 24.06.2026) ===
+@router.post("/archive", response_model=dict)
+async def archive_done_tasks(
+    keep_last_n_done: int = Query(10, ge=0, le=1000, description="Die letzten N done-Tasks in der operativen DB behalten"),
+    keep_last_n_cancelled: int = Query(10, ge=0, le=1000, description="Die letzten N cancelled-Tasks in der operativen DB behalten"),
+    archive_older_than_days: float = Query(1.0, ge=0.0, le=365.0, description="Nur Tasks aelter als X Tage archivieren (default: 1 Tag)"),
+    dry_run: bool = Query(False, description="Nur zaehlen, nicht tatsaechlich archivieren"),
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_admin),
+):
+    """Verschiebt fertige Tasks (done + cancelled) in die Archiv-DB.
+
+    User-Direktive 24.06.2026: Auch cancelled-Tasks archivieren, aber nur
+    wenn sie aelter als 1 Tag sind. Die letzten 10 done und 10 cancelled
+    bleiben in der operativen DB fuer die UI-Anzeige.
+
+    Reduziert die operative DB auf nur aktive Tasks fuer schnellere Queries.
+    Wird auch automatisch als Cron-Job taeglich ausgefuehrt.
+    """
+    from ..services.archive_service import archive_done_tasks, get_archive_stats
+    result = archive_done_tasks(
+        db,
+        keep_last_n_done=keep_last_n_done,
+        keep_last_n_cancelled=keep_last_n_cancelled,
+        archive_older_than_days=archive_older_than_days,
+        dry_run=dry_run,
+    )
+    result["archive_stats"] = get_archive_stats()
+    return result
+
+
+@router.get("/archive/stats", response_model=dict)
+async def get_archive_stats_endpoint(
+    _user: str = Depends(require_auth),
+):
+    """Gibt Statistiken ueber die Archiv-DB zurueck."""
+    from ..services.archive_service import get_archive_stats
+    return get_archive_stats()
 
 
 @router.post("", response_model=TaskRead, status_code=201)
@@ -81,13 +213,27 @@ async def create_task(
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
+    # CIO Auto-Routing (User-Direktive 24.06.2026): Wenn component_id fehlt,
+    # entscheidet der CIO (LLM) anhand Title/Description, welche Component zustaendig ist.
+    component_id = req.component_id
+    if not component_id and req.project_id and req.title:
+        try:
+            from .auto_component_router import route_task_to_component
+            component_id = await route_task_to_component(
+                db, req.project_id, f"{req.title}\n\n{req.description or ''}"
+            )
+        except Exception as e:
+            log.warning(f"Auto-Routing fehlgeschlagen: {e}")
+
     t = TaskService.create_task(
         db, title=req.title, project_id=req.project_id, description=req.description,
         status=req.status, priority=req.priority, category=req.category,
         parent_id=req.parent_id, assigned_role=req.assigned_role,
+        component_id=component_id,
     )
     await _events.publish_event(t.project_id or "", "task_created",
-                                {"task_id": t.id, "title": t.title, "status": t.status})
+                                {"task_id": t.id, "title": t.title, "status": t.status,
+                                 "component_id": component_id})
     return TaskRead.model_validate(t)
 
 
@@ -124,7 +270,23 @@ async def update_task(
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
-    t = TaskService.update_task(db, task_id, **req.model_dump(exclude_unset=True))
+    # === FIX 23.06.2026 (Task 0973563537c4): project_id-Validierung beim Update ===
+    # Erlaubt das Korrigieren von Orphan-Tasks (project_id=null).
+    # Self-Tracking-Tasks (z.B. Service-Self-Tracking) bleiben mit null legitim.
+    update_data = req.model_dump(exclude_unset=True)
+    if "project_id" in update_data:
+        pid = update_data["project_id"]
+        if pid is not None and pid != "":
+            # Validierung: Projekt muss existieren
+            from ..models.project import Project
+            proj = db.get(Project, pid)
+            if not proj:
+                raise HTTPException(404, f"Project {pid} not found")
+            update_data["project_id"] = pid
+        else:
+            # None oder leerer String -> explizit auf None setzen (loescht Zuordnung)
+            update_data["project_id"] = None
+    t = TaskService.update_task(db, task_id, **update_data)
     if not t:
         raise HTTPException(404, "Task not found")
     return TaskRead.model_validate(t)
@@ -137,7 +299,7 @@ async def set_task_type(
     task_id: str,
     body: dict,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt den Task-Typ (vom CIO in Schritt 0 klassifiziert).
 
@@ -157,16 +319,50 @@ async def set_implementation_plan(
     task_id: str,
     body: dict,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt den strukturierten Implementierungs-Plan (vom CIO in Schritt 0 ergaenzt).
 
-    Body: { "implementation_plan": { "files": [...], "routes": [...], "api_changes": [...], "notes": "..." } }
+    Body: { "implementation_plan": { "summary": "...", "affected_files": [...], ... } }
+    Validierung gegen ImplementationPlan-Schema (FIX 23.06.2026, Task 9f2f473bf1cc).
     """
-    plan = body.get("implementation_plan")
-    if plan is not None and not isinstance(plan, dict):
+    from ..schemas.task import ImplementationPlan
+    from pydantic import ValidationError
+
+    plan_raw = body.get("implementation_plan")
+    if plan_raw is None:
+        # Erlaubt: leeren Plan loeschen
+        t = TaskService.update_task(db, task_id, implementation_plan=None)
+        if not t:
+            raise HTTPException(404, "Task not found")
+        return TaskRead.model_validate(t)
+
+    if not isinstance(plan_raw, dict):
         raise HTTPException(400, "implementation_plan must be an object")
-    t = TaskService.update_task(db, task_id, implementation_plan=plan)
+
+    # Validierung gegen Pydantic-Schema
+    try:
+        plan = ImplementationPlan.model_validate(plan_raw)
+    except ValidationError as e:
+        # Detaillierte Fehler-Liste zurueckgeben
+        errors = [
+            {"loc": ".".join(str(x) for x in err["loc"]), "msg": err["msg"], "type": err["type"]}
+            for err in e.errors()
+        ]
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "implementation_plan validation failed", "validation_errors": errors},
+        )
+
+    # Metadata ergaenzen
+    plan_dict = plan.model_dump(exclude_none=True)
+    if "created_at" not in plan_dict:
+        from datetime import datetime as _dt
+        plan_dict["created_at"] = _dt.utcnow().isoformat()
+    if "version" not in plan_dict:
+        plan_dict["version"] = 1
+
+    t = TaskService.update_task(db, task_id, implementation_plan=plan_dict)
     if not t:
         raise HTTPException(404, "Task not found")
     return TaskRead.model_validate(t)
@@ -177,7 +373,7 @@ async def set_standards_check(
     task_id: str,
     body: dict,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt das Ergebnis der OpenBrain-Standardvorgaben-Pruefung (CIO bewertet).
 
@@ -197,7 +393,7 @@ async def set_subagent_readiness(
     task_id: str,
     body: dict,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt die Subagent-Readiness-Bewertung (CIO prueft).
 
@@ -207,9 +403,6 @@ async def set_subagent_readiness(
     if readiness is not None and not isinstance(readiness, dict):
         raise HTTPException(400, "subagent_readiness must be an object")
     t = TaskService.update_task(db, task_id, subagent_readiness=readiness)
-    if not t:
-        raise HTTPException(404, "Task not found")
-    return TaskRead.model_validate(t)
     if not t:
         raise HTTPException(404, "Task not found")
     return TaskRead.model_validate(t)
@@ -656,7 +849,7 @@ async def aggregate_subtasks(
     else:
         return TaskRead.model_validate(parent)
     parent.status = new_status
-    parent.updated_at = datetime.utcnow()
+    parent.updated_at = datetime.now(timezone.utc)
     TaskService._add_history(db, parent, "subtasks_aggregated", agent="system",
                              details={"new_status": new_status, "sub_count": len(subs)})
     # Task-Transition-Record + 5s Background-Delay (User-Direktive 16.06.2026)
@@ -673,7 +866,7 @@ async def aggregate_subtasks(
 async def delete_task(
     task_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_auth),  # User-Direktive 24.06.2026: require_auth statt require_admin, damit der Frontend-Loesch-Button funktioniert
 ):
     ok = TaskService.delete_task(db, task_id)
     if not ok:
@@ -704,7 +897,10 @@ class TaskValidationResponse(BaseModel):
 
 
 @router.post("/validate-with-llm", response_model=TaskValidationResponse)
-async def validate_task_with_llm(req: TaskValidationRequest):
+async def validate_task_with_llm(
+    req: TaskValidationRequest,
+    _user: str = Depends(require_auth),
+):
     """Laesst die KI die Task-Beschreibung pruefen und Verbesserungen vorschlagen.
 
     Ziel: Bestmoegliche Task-Description, damit der Task nach Triage OHNE
@@ -800,7 +996,6 @@ Pruefe diesen Task und schlage Verbesserungen vor."""
             model="minimax-m3",
             temperature=0.3,
             max_tokens=2000,
-            role="CIO",
         )
         # Content extrahieren
         if isinstance(result, dict):
@@ -838,11 +1033,11 @@ Pruefe diesen Task und schlage Verbesserungen vor."""
         )
     except Exception as e:
         logger.error(f"LLM-Validation fehlgeschlagen: {e}")
-        # Fallback: Task kann erstellt werden
+        # Fallback: Task kann trotzdem erstellt werden, Hinweis als Refinement-Frage.
         return TaskValidationResponse(
             ok=True,
             score=50,
-            quality_issues=["LLM-Validation fehlgeschlagen"],
+            quality_issues=[],
             suggested_criteria=[
                 f"Task '{req.title}' ist vollstaendig implementiert",
                 "Bestehende Unit-Tests laufen alle gruen",
@@ -852,7 +1047,9 @@ Pruefe diesen Task und schlage Verbesserungen vor."""
             suggested_title=req.title,
             suggested_category=req.category,
             suggested_priority=req.priority,
-            refinement_questions=[],
+            refinement_questions=[
+                "LLM-Validierung war voruebergehend nicht verfuegbar. Bitte pruefe, ob die Beschreibung vollstaendig und messbar ist."
+            ],
             ready_to_create=True,
         )
 
@@ -862,7 +1059,7 @@ Pruefe diesen Task und schlage Verbesserungen vor."""
 async def bulk_set_tasks_triage(
     project_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Setzt ALLE Tasks eines Projekts auf Status 'triage'."""
     tasks = list(db.execute(
@@ -873,7 +1070,7 @@ async def bulk_set_tasks_triage(
         if t.status != "triage":
             old = t.status
             t.status = "triage"
-            t.updated_at = datetime.utcnow()
+            t.updated_at = datetime.now(timezone.utc)
             TaskService._add_history(db, t, "status_changed", agent="system",
                                      details={"from": old, "to": "triage", "reason": "bulk_triage"})
             # Task-Transition-Record + 5s Background-Delay (User-Direktive 16.06.2026)
@@ -892,7 +1089,7 @@ async def bulk_set_tasks_triage(
 async def process_triage(
     project_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Process Triage: setzt Prio basierend auf Description-Laenge.
 
@@ -918,7 +1115,7 @@ async def process_triage(
         # assigned_role wird NICHT mehr hier gesetzt. SOP-Engine (Step 0 = CIO,
         # Step 1 = CIO, Step 2 = pi-coder, Step 3 = pi-tester) setzt ihn pro Step.
         t.status = "todo"
-        t.updated_at = datetime.utcnow()
+        t.updated_at = datetime.now(timezone.utc)
         TaskService._add_history(db, t, "status_changed", agent="system",
                                  details={"from": old_status, "to": "todo", "reason": "process_triage",
                                           "new_priority": t.priority, "new_role": t.assigned_role})

@@ -15,7 +15,7 @@ User-Direktive 17.06.2026 / 19.06.2026.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..auth import require_auth
+from ..auth import require_auth, require_cio
 from ..db.base import get_db
 from ..models.board_operator import BoardOperator
 from ..models.project import Project
@@ -88,7 +88,7 @@ async def list_active_agents(
     from ..models.transition import TaskTransition
     from sqlalchemy import func as sqlfunc
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # 1) Board-Operatoren (live)
     operators = list(db.execute(
@@ -100,7 +100,7 @@ async def list_active_agents(
     for op in operators:
         age_s = None
         if op.last_heartbeat:
-            age_s = int((now - op.last_heartbeat.replace(tzinfo=None)).total_seconds())
+            age_s = int((now - op.last_heartbeat.replace(tzinfo=timezone.utc)).total_seconds())
         operator_items.append({
             "type": "board_operator",
             "agent": f"kanban-operator-{op.id[:8]}",
@@ -264,7 +264,7 @@ async def get_operator(
 async def start_operator(
     board_id: str,
     db: Session = Depends(get_db),
-    user: str = Depends(require_auth),
+    user: str = Depends(require_cio),
 ) -> dict:
     """Startet den Operator fuer ein Board manuell.
 
@@ -289,7 +289,7 @@ async def stop_operator(
     board_id: str,
     reason: str = Query("user_request", min_length=1),
     db: Session = Depends(get_db),
-    user: str = Depends(require_auth),
+    user: str = Depends(require_cio),
 ) -> dict:
     """Stoppt den Operator fuer ein Board."""
     op = await svc.stop_operator(board_id, reason)

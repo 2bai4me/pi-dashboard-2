@@ -438,6 +438,42 @@ def start_scheduler() -> None:
         name="Daily SQLite Backup",
         replace_existing=True,
     )
+
+    # Taeglich um 03:00 UTC: Task-Archivierung (User-Direktive 24.06.2026)
+    # Verschiebt done- und cancelled-Tasks aelter als 1 Tag in die Archiv-DB
+    # um die operative DB klein zu halten.
+    try:
+        from .services.archive_service import archive_done_tasks
+        from .db.base import SessionLocal as _ArchSessionLocal
+
+        def _archive_job():
+            """Cron-Job: Archive done/cancelled tasks older than 1 day."""
+            try:
+                with _ArchSessionLocal() as arch_db:
+                    result = archive_done_tasks(
+                        arch_db,
+                        keep_last_n_done=10,
+                        keep_last_n_cancelled=10,
+                        archive_older_than_days=1.0,
+                    )
+                    logger.info(
+                        f"Auto-Archivierung: done={result.get('done_archived', 0)}, "
+                        f"cancelled={result.get('cancelled_archived', 0)}, "
+                        f"errors={len(result.get('errors', []))}"
+                    )
+            except Exception as e:
+                logger.error(f"Auto-Archivierung fehlgeschlagen: {e}")
+
+        _scheduler.add_job(
+            _archive_job,
+            CronTrigger(hour=3, minute=0, timezone="UTC"),
+            id="daily_task_archive",
+            name="Daily Task Archive (>1d old)",
+            replace_existing=True,
+        )
+        logger.info("Task-Archivierung aktiviert (taeglich 03:00 UTC, done+cancelled > 1 Tag)")
+    except ImportError as ie:
+        logger.warning(f"Task-Archivierung konnte nicht geladen werden: {ie}")
     # Alle 30s: Auto-Triage-Operator (CIO auto-evaluate)
     if TRIAGE_OPERATOR_ENABLED:
         from apscheduler.triggers.interval import IntervalTrigger

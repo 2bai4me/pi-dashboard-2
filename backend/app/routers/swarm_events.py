@@ -22,7 +22,9 @@ router = APIRouter(prefix="/api/swarms", tags=["swarms-sse"])
 
 def _get_swarm_status(swarm_id: str) -> dict:
     """Laedt aktuellen Swarm-Status aus der DB."""
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("SELECT * FROM swarm_runs WHERE id = ?", (swarm_id,))

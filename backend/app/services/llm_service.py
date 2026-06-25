@@ -16,6 +16,23 @@ from .provider_resolver import resolve_model_config
 logger = logging.getLogger("pi-dashboard-2.llm")
 
 
+class LLMTransientError(RuntimeError):
+    """Temporaerer LLM-Fehler (z.B. 429, 5xx, Timeout). Wiederholbar."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+class LLMPermanentError(RuntimeError):
+    """Permanenter LLM-Fehler (z.B. 401/403/404). Nicht wiederholbar."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 # === Konfiguration (nur noch aus Umgebungsvariablen / .env) ===
 DEFAULT_PROVIDER = "minimax-direct"
 DEFAULT_MODEL = "minimax-m3"
@@ -38,6 +55,9 @@ async def chat_completion(
     response_format: Optional[Dict[str, str]] = None,
     timeout_sec: float = 60.0,
     role: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """OpenAI-kompatibler Chat-Completion-Aufruf.
 
@@ -59,17 +79,17 @@ async def chat_completion(
     }
     """
     # === Provider-Resolution via Role (Multi-Provider Phase 2) ===
-    resolved_api_key: Optional[str] = None
-    resolved_base_url: Optional[str] = None
+    resolved_api_key: Optional[str] = api_key
+    resolved_base_url: Optional[str] = base_url
     resolved_model = model
-    resolved_provider: Optional[str] = None
+    resolved_provider: Optional[str] = provider
 
     if role:
         config = resolve_model_config(role)
-        resolved_api_key = config.get("api_key") or None
-        resolved_base_url = config.get("base_url") or None
+        resolved_api_key = resolved_api_key or config.get("api_key") or None
+        resolved_base_url = resolved_base_url or config.get("base_url") or None
         resolved_model = config.get("model", model)
-        resolved_provider = config.get("provider")
+        resolved_provider = resolved_provider or config.get("provider")
 
     if resolved_model.startswith("ollama/"):
         return await _chat_ollama(
@@ -121,14 +141,21 @@ async def _chat_ollama(
             r.raise_for_status()
             data = r.json()
     except httpx.ConnectError as e:
-        raise RuntimeError(
+        raise LLMTransientError(
             f"Ollama nicht erreichbar unter {url}. "
             f"Stelle sicher, dass Ollama laeuft (ollama serve) und Modell '{ollama_model}' gepullt ist "
             f"(ollama pull {ollama_model})."
         ) from e
+    except httpx.TimeoutException as e:
+        raise LLMTransientError(f"Ollama-Timeout unter {url}.", status_code=408) from e
     except httpx.HTTPStatusError as e:
-        raise RuntimeError(
-            f"Ollama-Fehler {e.response.status_code}: {e.response.text[:200]}"
+        status = e.response.status_code
+        if status == 429 or status >= 500:
+            raise LLMTransientError(
+                f"Ollama-Fehler {status}: {e.response.text[:200]}", status_code=status
+            ) from e
+        raise LLMPermanentError(
+            f"Ollama-Fehler {status}: {e.response.text[:200]}", status_code=status
         ) from e
     # Ollama liefert prompt_eval_count + eval_count im Response
     ollama_model_full = model if not model.startswith("ollama/") else model.split("/", 1)[1] if "/" in model else model
@@ -168,7 +195,7 @@ async def _chat_openai_compatible(
     api_key = api_key or env_api_key
     base_url = base_url or env_base_url
     if not api_key:
-        raise RuntimeError("API-Key nicht gesetzt")
+        raise LLMPermanentError("API-Key nicht gesetzt")
 
     # Model-Name-Normalisierung: MiniMax API erwartet 'MiniMax-M3' (CamelCase),
     # wir akzeptieren aber auch 'minimax-m3' (klein) als User-Input.
@@ -207,10 +234,36 @@ async def _chat_openai_compatible(
     if "minimax" in base_url.lower() and api_model.lower().startswith("minimax"):
         payload["thinking"] = {"type": "disabled"}
 
-    async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        text = e.response.text[:200]
+        if status == 429:
+            retry_after = None
+            try:
+                retry_after = float(e.response.headers.get("Retry-After", ""))
+            except (ValueError, TypeError):
+                pass
+            raise LLMTransientError(
+                f"Client error '429 Too Many Requests' for url '{url}'",
+                status_code=status,
+                retry_after=retry_after,
+            ) from e
+        if status >= 500:
+            raise LLMTransientError(
+                f"Server error '{status}' for url '{url}': {text}", status_code=status
+            ) from e
+        raise LLMPermanentError(
+            f"Client error '{status}' for url '{url}': {text}", status_code=status
+        ) from e
+    except httpx.TimeoutException as e:
+        raise LLMTransientError(f"Timeout for url '{url}'", status_code=408) from e
+    except (httpx.ConnectError, httpx.NetworkError) as e:
+        raise LLMTransientError(f"Connection error for url '{url}': {e}") from e
 
     content = data["choices"][0]["message"]["content"]
     # OpenAI-kompatible APIs liefern Token-Usage im `usage`-Feld
@@ -301,3 +354,131 @@ Antworte NUR mit dem JSON-Objekt, ohne zusaetzlichen Text."""
         {"role": "user", "content": user_prompt},
     ]
     return messages, user_input
+
+
+def build_bpmn_from_description_prompt(sop_data: dict) -> tuple[List[Dict[str, str]], str]:
+    """Baut den System+User-Prompt fuer die LLM-gestuetzte BPMN-Generierung
+    aus den Freitext-Beschreibungen einer SOP (Name, Description, alle Step-Descriptions).
+
+    Args:
+        sop_data: {
+            "id": str,
+            "name": str,
+            "description": Optional[str],
+            "steps": [{"order": int, "name": str, "phase": str,
+                       "agent": Optional[str], "trigger": Optional[str],
+                       "action": Optional[str], "description": Optional[str],
+                       "expected_result": Optional[str]}, ...] (sortiert)
+        }
+
+    Returns: (messages, raw_user_input)
+    """
+    system_prompt = """Du bist ein BPMN-2.0-Architekt. Deine einzige Aufgabe: Aus den nachfolgenden Freitext-Beschreibungen einer SOP (Standard Operating Procedure) generierst du **valides, vollstaendiges BPMN 2.0 XML**, das im bpmn-js Renderer ohne Fehler dargestellt werden kann.
+
+KRITISCHE REGELN:
+
+1. **Antworte NUR mit dem XML**, kein Vor- oder Nachtext, keine Erklaerung, kein Markdown-Codeblock (```xml) drumherum. Beginne direkt mit `<?xml version="1.0" encoding="UTF-8"?>` und ende mit `</bpmn:definitions>`.
+
+2. **Verwende exakt diese Namespaces** (alle 5 sind PFLICHT, damit bpmn-js das XML korrekt einliest):
+   - xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+   - xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+   - xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+   - xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+   - xmlns:bpmnjs="http://www.omg.io/schema/bpmn-js" (PFLICHT fuer <bpmnjs:isExpanded>)
+
+3. **Top-Level-Struktur** (in dieser Reihenfolge):
+   - `<bpmn:definitions>` mit `id="Definitions_<sop_id>"` und `targetNamespace="http://bpmn.io/schema/bpmn"`
+   - `<bpmn:process>` mit `id="Process_<sop_id>"`, `name="<sop-name>"`, `isExecutable="false"`
+   - `<bpmn:documentation>` mit der vollstaendigen SOP-Beschreibung (XML-escaped)
+   - `<bpmn:startEvent>` mit `id="start_<sop_id>"` und `name="SOP Start"`
+   - Beliebig viele `<bpmn:subProcess>` (kollabiert, mit `<bpmnjs:isExpanded>false</bpmnjs:isExpanded>`)
+   - `<bpmn:endEvent>` mit `id="end_<sop_id>"` und `name="SOP End"`
+   - Dazwischen `<bpmn:sequenceFlow>` Elemente, die die Elemente verbinden
+   - NACH `</bpmn:process>` (aber INNERHALB `<bpmn:definitions>`!): ein einzelner Block:
+     ```
+     <bpmndi:BPMNDiagram id="BPMNDiagram_<sop_id>">
+       <bpmndi:BPMNPlane id="BPMNPlane_<sop_id>" bpmnElement="Process_<sop_id>">
+         <!-- HIER alle <bpmndi:BPMNShape> und <bpmndi:BPMNEdge> -->
+       </bpmndi:BPMNPlane>
+     </bpmndi:BPMNDiagram>
+     ```
+   - WICHTIG: Die DI-Shapes und DI-Edges gehoeren NICHT in die BPMN-Tasks, sondern ALLE zusammen in den BPMNPlane-Block oben!
+
+4. **Innerhalb jedes SubProcess** (alle Elemente haben 6-space indent):
+   - `<bpmn:serviceTask>` oder `<bpmn:userTask>` mit `id="step_<step_id>"` und `name="<step-name>"` (XML-escaped)
+   - Optional `<bpmn:exclusiveGateway>` mit `id="gw_<step_id>"` und `name="?"` (nur wenn der Step eine Verzweigung hat)
+   - `<bpmn:sequenceFlow>` Elemente, die Tasks/Gateways innerhalb des SubProcess verbinden
+   - Pro Gateway: ein sequenceFlow mit `<bpmn:conditionExpression>` (Bedingung als Text im Tag)
+
+5. **Jedes Element MUSS eine BPMN-DI-Darstellung haben** (sonst zeigt bpmn-js es nicht an!):
+   - **WICHTIG:** Alle `<bpmndi:BPMNShape>` und `<bpmndi:BPMNEdge>` Elemente MUESSEN innerhalb EINES EINZIGEN `<bpmndi:BPMNDiagram>` -> `<bpmndi:BPMNPlane>` Blocks stehen, NICHT innerhalb der BPMN-Tasks/SubProcesses!
+   - `<bpmndi:BPMNShape>` mit `<dc:Bounds x=".." y=".." width=".." height=".." />`
+   - SubProcesses zusaetzlich: `<bpmndi:BPMNLabel/>` und `<bpmnjs:isExpanded>false</bpmnjs:isExpanded>`
+   - Jeder Edge (`<bpmn:sequenceFlow>`) braucht einen `<bpmndi:BPMNEdge>` mit mindestens 2 `<di:waypoint>` Elementen
+
+6. **Layout-Konventionen** (wichtig fuer gute Lesbarkeit):
+   - Top-Level horizontal: StartEvent (x=80, y=280), SubProcesses (width=240, height=110) mit Abstand 240 dazwischen, EndEvent am Ende
+   - Start-/EndEvents: 50x50 px Box
+   - SubProcess Y-Position: 280 - 55 = 225 (mittig zu Y_CENTER=280)
+   - Innerhalb SubProcess: Tasks/Gateways vertikal staffeln (z.B. y=40, 110, 180, ...)
+   - Sequence-Flows: waypoints entlang der Kanten
+
+7. **Schritt-Logik aus Beschreibungen ableiten**:
+   - Wenn ein Step mehrere Verzweigungen, Entscheidungen oder Bedingungen erwaehnt: fuege ein `<bpmn:exclusiveGateway>` ein
+   - Wenn ein Step User-Eingaben erfordert (Frage, Genehmigung, Review): verwende `<bpmn:userTask>` statt `<bpmn:serviceTask>`
+   - Gruppere logisch zusammengehoerige Steps in eigene `<bpmn:subProcess>` mit aussagekraeftigem Namen
+   - Verbinde alle Elemente in sinnvoller Reihenfolge (step_order)
+   - Der letzte Step sollte auf das `<bpmn:endEvent>` zeigen
+
+8. **XML-Escaping** (PFLICHT):
+   - `<` -> `&lt;`
+   - `>` -> `&gt;`
+   - `&` -> `&amp;`
+   - `"` -> `&quot;` (in Attributen)
+   - `' (Apostroph)` -> `&apos;` (in Attributen)
+
+9. **Vollstaendigkeit**: Jeder Step MUSS als Task im XML erscheinen. Jeder Task MUSS eine SequenceFlow-Verbindung haben (Eingang oder Ausgang oder beides). Keine "verwaisten" Elemente.
+
+10. **Keine Kommentare** im XML (bpmn-js kann sie nicht parsen).
+
+11. **VOLLSTAENDIGKEIT IST PFLICHT**: Das XML MUSS mit `</bpmn:definitions>` enden. NIEMALS mitten im Element aufhoeren! Wenn du merkst, dass der Text knapp wird, schliesse zuerst alle offenen SubProcesses/Tasks/Edges und beende dann mit `</bpmn:process>` und `</bpmn:definitions>`. Lieber weniger Schritte vollstaendig als viele halb!"""
+
+    # User-Prompt: SOP-Kontext + alle Step-Beschreibungen
+    user_lines = [
+        f"## SOP-Metadaten",
+        f"- **ID:** {sop_data.get('id', '?')}",
+        f"- **Name:** {sop_data.get('name', '?')}",
+        f"- **Beschreibung (Freitext):**",
+        (sop_data.get('description') or '(keine)').strip() or '(keine)',
+        "",
+        "## SOP-Steps (in Reihenfolge mit Beschreibungen):",
+    ]
+    steps = sop_data.get("steps", [])
+    if not steps:
+        user_lines.append("(keine Steps vorhanden)")
+    else:
+        for i, s in enumerate(steps, 1):
+            user_lines.append(f"\n### Step {i}: {s.get('name', '?')}")
+            user_lines.append(f"- **Phase:** {s.get('phase', '?')}")
+            user_lines.append(f"- **Agent:** {s.get('agent') or '(nicht gesetzt)'}")
+            user_lines.append(f"- **Trigger:** {s.get('trigger') or '(nicht gesetzt)'}")
+            user_lines.append(f"- **Action:** {s.get('action') or '(nicht gesetzt)'}")
+            if s.get("description"):
+                user_lines.append(f"- **Beschreibung (was passiert hier?):**\n{s['description'].strip()}")
+            if s.get("expected_result"):
+                user_lines.append(f"- **Erwartetes Ergebnis:**\n{s['expected_result'].strip()}")
+
+    user_lines.extend([
+        "",
+        "---",
+        "",
+        "Generiere jetzt das vollstaendige BPMN-2.0-XML. Antworte NUR mit dem XML, ohne zusaetzlichen Text.",
+    ])
+
+    user_prompt = "\n".join(user_lines)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return messages, user_prompt

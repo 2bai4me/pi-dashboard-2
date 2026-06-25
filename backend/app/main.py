@@ -251,6 +251,42 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as e:
             logger.warning(f"Sub-Agent Provider-Validierung fehlgeschlagen: {e}")
+
+        # User-Direktive 24.06.2026: WAL-Checkpoint beim Startup
+        # Schreibt alle offenen WAL-Daten in die Haupt-DB und verhindert Datenverlust
+        # bei Crash/Reload.
+        try:
+            with engine.connect() as conn:
+                from sqlalchemy import text
+                result = conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+                checkpoint = result.fetchone()
+                logger.info(
+                    f"WAL-Checkpoint: busy={checkpoint[0]}, log_pages={checkpoint[1]}, "
+                    f"checkpointed_pages={checkpoint[2]}"
+                )
+        except Exception as wal_err:
+            logger.warning(f"WAL-Checkpoint fehlgeschlagen: {wal_err}")
+        # CLEANUP-AUDIT 23.06.2026: Realer API-Health-Check (erkennt 401 sofort)
+        try:
+            from .services.worker_service import _health_check_code_agent_provider
+            hc = _health_check_code_agent_provider()
+            if hc.get("status") == "ok":
+                logger.info(
+                    f"Sub-Agent Provider-Health-Check OK: {hc['provider']}/"
+                    f"{hc['model']} ({hc.get('latency_ms')}ms)"
+                )
+            elif hc.get("status") == "warn":
+                logger.warning(
+                    f"Sub-Agent Provider-Health-Check WARN: {hc.get('error','')}"
+                )
+            else:
+                logger.error(
+                    f"Sub-Agent Provider-Health-Check FEHLGESCHLAGEN: "
+                    f"{hc.get('provider')}/{hc.get('model')} -> "
+                    f"{hc.get('error','')} (HTTP {hc.get('http_status','?')})"
+                )
+        except Exception as e:
+            logger.warning(f"Sub-Agent Health-Check fehlgeschlagen: {e}")
         # Session-IDs fuer die Background-Prozesse initialisieren
         try:
             from .services.session_helper import init_session_id
@@ -411,7 +447,7 @@ if settings.RATE_LIMIT_PER_MINUTE > 0:  # type: ignore
 # - agent_questions:         User<->Agent Interaktionstool
 # - subagents:              SubAgent-Konfig
 # - board_operators/test_runner: Live-Watchdog + Test-Navigator
-from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials, smproducer, swarm, swarm_events, ideas, subtasks, ports  # noqa: E402
+from .routers import projects, tasks, models, roles, brainstorm, workflow, selfimprovement, transitions, sops, architecture_rules, process_template, agent_questions, board_operators, test_runner, subagents, tts, auth, provider_credentials, smproducer, swarm, swarm_events, ideas, subtasks, ports, status_extended, grill_me  # noqa: E402
 app.include_router(projects.router)
 app.include_router(tasks.router)
 app.include_router(models.router)
@@ -436,6 +472,8 @@ app.include_router(tts.router)  # MiniMax Text-to-Audio V2
 app.include_router(auth.router)  # JWT Login
 app.include_router(provider_credentials.router)  # Zentrale API-Key-Verwaltung
 app.include_router(smproducer.router)  # OpenBrain-konforme SMproducer 3.0 Bridge
+app.include_router(status_extended.router)  # User-Direktive 24.06.2026: PG-071-STATUS erweiterte Status-Info
+app.include_router(grill_me.router)  # User-Direktive 24.06.2026: Grill-Me-Skill (PRD-Analyst vor Task-Erstellung)
 
 
 # === Health-Check ===

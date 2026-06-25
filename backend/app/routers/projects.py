@@ -23,14 +23,38 @@ async def list_projects(
     db: Session = Depends(get_db),
     _user: str = Depends(require_auth),
 ):
+    # Performance-Fix (User-Direktive 24.06.2026): Bulk-Stats statt N+1
+    # Statt N Queries (eine pro Projekt) wird EINE aggregierte Query genutzt.
+    # Mit In-Memory-Cache (5s TTL) wird wiederholtes Laden vermieden.
+    from ..services.project_number import ensure_project_number
+    from ..cache import get_cache
+
+    cache = get_cache()
+    cache_key = "projects:list:all"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
     projects = ProjectService.list_projects(db)
-    items = []
+    if not projects:
+        return ProjectList(items=[], total=0)
+
+    # Project-Numbers einmalig sicherstellen (nicht bei jedem Request)
     for p in projects:
-        from ..services.project_number import ensure_project_number
         if not p.project_number:
             ensure_project_number(p.id)
-            db.refresh(p)
-        stats = ProjectService.project_stats(db, p)
+    db.commit()  # Alle project_numbers auf einmal committen
+
+    # EINE Query fuer ALLE Projekt-Stats (statt N Queries)
+    project_ids = [p.id for p in projects]
+    stats_map = ProjectService.project_stats_bulk(db, project_ids)
+
+    items = []
+    for p in projects:
+        stats = stats_map.get(p.id, {
+            "task_count": 0, "tasks_done": 0, "tasks_cancelled": 0,
+            "tasks_in_progress": 0, "tasks_open": 0, "total_cost_usd": 0.0,
+        })
         items.append(ProjectRead(
             id=p.id, name=p.name, description=p.description,
             status=p.status, mode=p.mode, category=p.category,
@@ -40,7 +64,9 @@ async def list_projects(
             closed_at=p.closed_at, completion_report=p.completion_report,
             **stats,
         ))
-    return ProjectList(items=items, total=len(items))
+    result = ProjectList(items=items, total=len(items))
+    cache.set(cache_key, result, ttl=5.0)  # 5 Sekunden Cache
+    return result
 
 
 @router.post("", response_model=ProjectRead, status_code=201)

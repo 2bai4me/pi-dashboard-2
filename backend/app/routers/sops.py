@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..db.base import get_db
-from ..auth import require_auth
+from ..auth import require_auth, require_admin, require_cio
 from ..models.sop import SOP, SOPStep, SOPStepRule, SOPInstance, SOPExecution
 from ..services.sop_engine import SOPEngine, seed_default_sops, DEFAULT_TASK_SOP, ALLOWED_SOP_ACTIONS
 from ..schemas.sop_action import ALLOWED_ACTIONS, ACTION_PARAM_SCHEMAS
@@ -67,6 +67,7 @@ class SOPStepInput(BaseModel):
     action: str
     action_params: Optional[Dict[str, Any]] = None
     agent: str
+    model: Optional[str] = Field(None, description="LLM-Modell fuer diesen Step (z.B. minimax-direct/minimax-m3)")
     expected_result: Optional[str] = None
     success_criteria: Optional[List[str]] = None
     delay_s: float = 5.0
@@ -138,6 +139,25 @@ class AiEvaluateBody(BaseModel):
     )
 
 
+class AiReviewBody(BaseModel):
+    """POST /api/sops/{sop_id}/steps/{step_id}/ai-review
+
+    User-Direktive 24.06.2026: KI-Pruefung der Anweisung im KI-Support-Designer.
+    Prueft 3 Dimensionen:
+      1. Redundanzen (unnötige Wiederholungen, sich-ueberschneidende Inhalte)
+      2. Widersprueche (sich gegenseitig ausschliessende Aussagen)
+      3. OpenBrain-Verstoesse (gegen architecture_rules in der DB)
+    Ergebnis erscheint im Chat-Bereich links (mit Loesungsvorschlag pro Issue).
+    """
+    text: str = Field(..., min_length=10, description="Zu pruefender MD-Text (ai_instructions_md)")
+    model: Optional[str] = Field(None, description="LLM-Modell (default: minimax-m3)")
+    check_dimensions: Optional[List[str]] = Field(
+        default=None,
+        description="Welche Dimensionen geprueft werden sollen. Default: alle 3. "
+                    "Moeglich: 'redundancy', 'contradiction', 'openbrain_compliance'",
+    )
+
+
 # === SOP-Endpoints ===
 
 @router.get("")
@@ -155,7 +175,7 @@ async def list_sops(
 async def create_sop(
     req: SOPCreate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     engine = SOPEngine(db)
     # Sicherheitspruefung: jeder Step muss eine erlaubte Action haben und
@@ -196,10 +216,37 @@ async def update_sop(
     sop_id: str,
     req: SOPUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     engine = SOPEngine(db)
-    sop = engine.update_sop(sop_id, **req.model_dump(exclude_none=True))
+    # User-Direktive 24.06.2026: Override-Schutz
+    # Wenn protected fields geaendert werden, automatisch user_modified=True setzen
+    update_data = req.model_dump(exclude_none=True)
+    protected_fields = {"name", "description", "category", "default_delay_s",
+                        "is_template", "version"}
+    if any(k in update_data for k in protected_fields):
+        # Nur automatisch setzen, wenn nicht explizit mitgeschickt
+        if "user_modified" not in update_data:
+            update_data["user_modified"] = True
+    sop = engine.update_sop(sop_id, **update_data)
+    if not sop:
+        raise HTTPException(404, f"SOP {sop_id} not found")
+    return sop.to_dict(include_steps=False)
+
+
+@router.post("/{sop_id}/reset-to-default")
+async def reset_sop_to_default_endpoint(
+    sop_id: str,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_admin),
+):
+    """Setzt eine SOP auf die Default-Werte zurueck (User-Direktive 24.06.2026).
+
+    ACHTUNG: Loescht ALLE Steps + Rules und legt sie neu an.
+    Nur fuer SOPs mit matchendem sop_key (task_workflow oder cio_triage).
+    """
+    from ..services.sop_engine import reset_sop_to_default
+    sop = reset_sop_to_default(db, sop_id)
     if not sop:
         raise HTTPException(404, f"SOP {sop_id} not found")
     return sop.to_dict(include_steps=False)
@@ -224,6 +271,13 @@ class StepDescriptionUpdate(BaseModel):
     action_params: Optional[dict] = None  # z.B. {"acceptance_criteria": ["coverage >= 80", "lint == 0"]}
     trigger: Optional[str] = None
     agent: Optional[str] = None
+    model: Optional[str] = Field(None, description="LLM-Modell fuer diesen Step (z.B. minimax-direct/minimax-m3)")
+    # Phase aus dem Kanban-Board (User-Direktive 22.06.2026).
+    # Erlaubte Werte: triage | go | in_progress | review | rueckfrage | warten | done
+    # plus Legacy-Werte (Sub-SOP | End | Decision | Task) fuer Migrations-Bestaende.
+    # Keine harte Whitelist im Backend — Frontend (constants/kanban.ts) ist Single Source of Truth
+    # und zeigt Legacy-Werte mit "(Legacy)"-Label. So koennen alte SOPs ohne Datenverlust migriert werden.
+    phase: Optional[str] = Field(None, description="Phase aus dem Kanban-Board (status des ausloesenden Tasks). Default 'Task'.")
 
     @field_validator("action", "action_params")
     @classmethod
@@ -255,6 +309,7 @@ class StepCreate(BaseModel):
     action: Optional[str] = Field("noop", description="z.B. noop | set_status | spawn_sop | ask_user | llm_call")
     action_params: Optional[dict] = Field(default_factory=dict)
     agent: Optional[str] = Field("pi-coder", description="Worker-Rolle (pi-coder, cio, ceo-digital, etc.)")
+    model: Optional[str] = Field("minimax-direct/minimax-m3", description="LLM-Modell fuer diesen Step")
     expected_result: Optional[str] = None
     success_criteria: Optional[list] = Field(default_factory=list)
     description: Optional[str] = None
@@ -306,7 +361,7 @@ async def create_step(
     sop_id: str,
     req: StepCreate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Erstellt einen neuen Step in einer SOP.
 
@@ -359,6 +414,7 @@ async def create_step(
         action=req.action or "noop",
         action_params=req.action_params or {},
         agent=req.agent or "pi-coder",
+        model=req.model,
         expected_result=req.expected_result,
         success_criteria=req.success_criteria or [],
         raci_r=req.raci_r or req.agent or "pi-coder",
@@ -401,7 +457,7 @@ async def update_step(
     step_id: str,
     req: StepDescriptionUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """Aktualisiert die Description (oder expected_result) eines SOP-Steps.
 
@@ -412,7 +468,6 @@ async def update_step(
     Optional kann auch ai_instructions_md (KI-Support-Designer Output)
     persistiert werden — wird in action_params gespeichert.
     """
-    from ..models.sop import SOPStep
     sop = db.get(SOP, sop_id)
     if not sop:
         raise HTTPException(404, f"SOP {sop_id} not found")
@@ -455,6 +510,16 @@ async def update_step(
         old = step.agent
         step.agent = req.agent
         changes.append(f"agent: {old!r} -> {req.agent!r}")
+    if req.model is not None:
+        old = step.model
+        step.model = req.model
+        changes.append(f"model: {old!r} -> {req.model!r}")
+    # Phase aus Kanban-Board (User-Direktive 22.06.2026)
+    # Wird ueber die StepDetailSidebar rechts in der SOP-Detailansicht gesetzt.
+    if req.phase is not None:
+        old = step.phase
+        step.phase = req.phase
+        changes.append(f"phase: {old!r} -> {req.phase!r}")
     # User-Input-Tool Felder (User-Direktive 17.06.2026)
     if req.input_tool_required is not None:
         old = step.input_tool_required
@@ -531,7 +596,7 @@ async def ai_step_helper(
     step_id: str,
     body: AiHelperBody,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """AI-gestuetzter Prompt-Helfer fuer SOP-Step-Description.
 
@@ -541,12 +606,11 @@ async def ai_step_helper(
     Returns: { ok, description, expected_result, questions, suggestions, usage }
     """
     import json as _json
-    from ..models.sop import SOPStep, SOP as _SOP
     from ..services.llm_service import chat_completion, build_sop_step_prompt
     from ..services.pricing_service import take_pricing_snapshot
     from ..models.token_usage import TokenUsage
 
-    sop = db.get(_SOP, sop_id)
+    sop = db.get(SOP, sop_id)
     if not sop:
         raise HTTPException(404, f"SOP {sop_id} not found")
     step = db.get(SOPStep, step_id)
@@ -621,7 +685,7 @@ async def ai_step_helper(
             cost_usd=Decimal("0"),
             input_per_1m=Decimal("0.30"), output_per_1m=Decimal("1.20"),
             pricing_source="static_fallback",
-            snapshot_at=datetime.utcnow(),
+            snapshot_at=datetime.now(timezone.utc),
         )
         db.add(tu)
     except Exception as e:
@@ -647,7 +711,7 @@ async def ai_step_evaluate(
     step_id: str,
     body: AiEvaluateBody,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_cio),
 ):
     """KI-Support-Designer (User-Direktive 16.06.2026): Aus User-Freitext wird
     eine vollstaendige Markdown-Anweisung fuer den PI-Agent erzeugt.
@@ -663,9 +727,7 @@ async def ai_step_evaluate(
 
     Returns: { ok, ai_instructions_md, model, raw_length, auto_saved }
     """
-    from ..models.sop import SOPStep, SOP as _SOP
-
-    sop = db.get(_SOP, sop_id)
+    sop = db.get(SOP, sop_id)
     if not sop:
         raise HTTPException(404, f"SOP {sop_id} not found")
     step = db.get(SOPStep, step_id)
@@ -755,7 +817,7 @@ async def ai_step_evaluate(
         ]
 
     try:
-        ai_md = await chat_completion(
+        result = await chat_completion(
             messages=messages, model=model, temperature=0.3, max_tokens=4000,
             timeout_sec=300.0,  # 5 Min — lokale Ollama-Modelle (gemma4:12b) brauchen oft 60-180s
             role=step.agent,
@@ -764,7 +826,14 @@ async def ai_step_evaluate(
         logger.error(f"AI-Evaluate Fehler: {e}")
         raise HTTPException(503, f"LLM-Aufruf fehlgeschlagen: {e}")
 
-    ai_md = (ai_md or "").strip()
+    # FIX 23.06.2026 (Task a0b5bc4834db): chat_completion gibt Dict zurueck, nicht String
+    # Vorher: ai_md = (ai_md or "").strip() warf AttributeError 'dict has no attribute strip'
+    # Jetzt: extrahiere 'content' aus Dict oder nutze String direkt
+    if isinstance(result, dict):
+        ai_md = result.get("content", "") or ""
+    else:
+        ai_md = result or ""
+    ai_md = ai_md.strip()
     # 1) Markdown-Codeblock auspacken falls vorhanden
     if ai_md.startswith("```"):
         lines_ = ai_md.split("\n")
@@ -793,7 +862,7 @@ async def ai_step_evaluate(
             cost_usd=Decimal("0"),
             input_per_1m=Decimal("0"), output_per_1m=Decimal("0"),
             pricing_source="local_ollama" if model.startswith("ollama/") else "static_fallback",
-            snapshot_at=datetime.utcnow(),
+            snapshot_at=datetime.now(timezone.utc),
         )
         db.add(tu)
     except Exception as e:
@@ -820,11 +889,198 @@ async def ai_step_evaluate(
     }
 
 
+# === KI-Support-Designer: Pruefung (User-Direktive 24.06.2026) ===
+@router.post("/{sop_id}/steps/{step_id}/ai-review")
+async def ai_step_review(
+    sop_id: str,
+    step_id: str,
+    body: AiReviewBody,
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_auth),
+):
+    """KI-Pruefung der SOP-Step-Anweisung (User-Direktive 24.06.2026).
+
+    Prueft 3 Dimensionen:
+      1. REDUNDANZ: Unnoetige Wiederholungen, sich-ueberschneidende Inhalte
+      2. WIDERSPRUCHE: Sich gegenseitig ausschliessende Aussagen
+      3. OPENBRAIN-COMPLIANCE: Verstoesse gegen architecture_rules (DB)
+
+    Output: Strukturierte Issues-Liste mit Loesungsvorschlag pro Issue.
+    Erscheint im Chat-Bereich links (Frontend). Bei ok=True: positives Feedback.
+
+    Returns: {
+        ok: bool,                  # True wenn keine 'must'-Issues gefunden
+        summary: str,              # Kurze Zusammenfassung
+        issues: [{
+            type: 'redundancy' | 'contradiction' | 'openbrain_compliance',
+            severity: 'must' | 'should' | 'may',
+            problem: str,          # Was ist das Problem?
+            location: str,         # Wo im Text (z.B. Zeile/Abschnitt)
+            suggestion: str,       # Konkreter Loesungsvorschlag
+            rule_ref: str | null,  # Bei OpenBrain-Verstoss: source_ref
+        }],
+        checked_dimensions: list,
+        model: str,
+        checked_at: str,           # ISO-Timestamp
+    }
+    """
+    from ..services.llm_service import chat_completion
+    from ..models.architecture_rule import ArchitectureRule
+    from datetime import datetime, timezone
+    import json as _json
+
+    # 1. OpenBrain-Vorgaben aus DB laden
+    openbrain_rules = db.execute(
+        select(ArchitectureRule).where(ArchitectureRule.is_active == True)
+    ).scalars().all()
+    rules_text = "\n".join(
+        f"- [{r.severity.upper()}] {r.name}: {r.description or ''} (Ref: {r.source_ref or 'n/a'})"
+        for r in openbrain_rules
+    )
+
+    # 2. Pruef-Dimensionen bestimmen
+    dimensions = body.check_dimensions or ["redundancy", "contradiction", "openbrain_compliance"]
+    dim_names_de = {
+        "redundancy": "Redundanzen",
+        "contradiction": "Widersprueche",
+        "openbrain_compliance": "OpenBrain-Compliance",
+    }
+    dim_list_text = ", ".join(dim_names_de.get(d, d) for d in dimensions)
+
+    # 3. System-Prompt: SOP-Reviewer
+    system_prompt = (
+        "Du bist ein SOP-Reviewer fuer das Pi Dashboard 2.0. Deine Aufgabe: "
+        "Pruefe die gegebene Anweisung (MD-Text) auf folgende Dimensionen:\n\n"
+        "1. **Redundanzen**: Unnoetige Wiederholungen, sich-ueberschneidende Inhalte, "
+        " Inhalte die das gleiche sagen aber anders formuliert sind. "
+        "Beispiel: 'Der Agent MUSS Tests schreiben' und 'Tests sind erforderlich'.\n\n"
+        "2. **Widersprueche**: Sich gegenseitig ausschliessende Aussagen. "
+        "Beispiel: 'Verwende KEIN TypeScript' vs 'Nutze TypeScript-Typen'.\n\n"
+        "3. **OpenBrain-Compliance**: Verstoesse gegen die gelisteten Vorgaben. "
+        "Pruefe JEDE Regel. Wenn die Anweisung z.B. 'Node.js' verwendet, aber die "
+        "Regel 'Kein Node.js im Backend' sagt -> Verstoess mit severity='should'.\n\n"
+        "WICHTIG: Antworte AUSSCHLIESSLICH mit valid JSON (kein Markdown-Codeblock).\n"
+        "Format: {\n"
+        "  'ok': bool,\n"
+        "  'summary': 'Kurze Zusammenfassung (1-2 Saetze)',\n"
+        "  'issues': [\n"
+        "    {\n"
+        "      'type': 'redundancy' | 'contradiction' | 'openbrain_compliance',\n"
+        "      'severity': 'must' | 'should' | 'may',\n"
+        "      'problem': 'Was ist das Problem (1 Satz)',\n"
+        "      'location': 'Wo im Text (z.B. \"Abschnitt Vorgehen, Schritt 3\")',\n"
+        "      'suggestion': 'Konkreter Loesungsvorschlag (1-2 Saetze)',\n"
+        "      'rule_ref': 'source_ref der OpenBrain-Regel (nur bei openbrain_compliance) oder null'\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Severity-Regeln:\n"
+        "- 'must' = blockierend (ok=false)\n"
+        "- 'should' = empfohlen (ok=false, wenn mehrere)\n"
+        "- 'may' = optional (ok=true bleibt)\n\n"
+        "Wenn keine Issues gefunden: ok=true, issues=[], summary='Keine Probleme gefunden.'\n\n"
+        f"Aktive OpenBrain-Vorgaben ({len(openbrain_rules)} Regeln):\n{rules_text}\n"
+    )
+
+    # 4. User-Prompt: Der zu pruefende Text
+    user_prompt = (
+        f"## Zu pruefender MD-Text (SOP-Step-Anweisung)\n\n"
+        f"```markdown\n{body.text}\n```\n\n"
+        f"---\n\n"
+        f"Pruefe diesen Text auf die folgenden Dimensionen: {dim_list_text}.\n"
+        f"Liefere JSON wie spezifiziert."
+    )
+
+    # 5. LLM-Call
+    model = body.model or "minimax-m3"
+    try:
+        result = await chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            model=model,
+            temperature=0.1,  # Niedrig fuer deterministische Reviews
+            max_tokens=3000,
+            response_format={"type": "json_object"},  # JSON erzwingen
+            timeout_sec=120.0,
+            role="CIO",  # CIO als Reviewer-Rolle
+        )
+    except Exception as e:
+        logger.error(f"AI-Review Fehler: {e}")
+        raise HTTPException(503, f"LLM-Aufruf fehlgeschlagen: {e}")
+
+    # 6. Response parsen
+    if isinstance(result, dict):
+        content = result.get("content", "") or ""
+    else:
+        content = result or ""
+    content = content.strip()
+
+    # Markdown-Codeblock entfernen falls vorhanden
+    if content.startswith("```"):
+        lines_ = content.split("\n")
+        if lines_[0].startswith("```"):
+            lines_ = lines_[1:]
+        if lines_ and lines_[-1].strip() == "```":
+            lines_ = lines_[:-1]
+        content = "\n".join(lines_).strip()
+    # think-Tags rausfiltern
+    import re as _re
+    if "<think>" in content and "</think>" in content:
+        content = _re.sub(r"<think>.*?</think>\s*", "", content, flags=_re.DOTALL).strip()
+
+    # JSON parsen
+    try:
+        parsed = _json.loads(content)
+    except Exception as json_err:
+        logger.error(f"AI-Review JSON-Parse-Fehler: {json_err}, content[:200]={content[:200]}")
+        return {
+            "ok": False,
+            "error": "LLM-Antwort war kein gueltiges JSON",
+            "raw_content": content[:1000],
+            "checked_dimensions": dimensions,
+            "model": model,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # 7. Output normalisieren
+    issues = parsed.get("issues", []) or []
+    # Validierung: jeder Issue MUSS die Pflichtfelder haben
+    normalized_issues = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        normalized_issues.append({
+            "type": issue.get("type", "unknown"),
+            "severity": issue.get("severity", "should"),
+            "problem": issue.get("problem", ""),
+            "location": issue.get("location", ""),
+            "suggestion": issue.get("suggestion", ""),
+            "rule_ref": issue.get("rule_ref"),
+        })
+
+    # 8. ok-Status ableiten: True wenn keine 'must'-Issues
+    has_must_issue = any(i.get("severity") == "must" for i in normalized_issues)
+    has_should_issue = any(i.get("severity") == "should" for i in normalized_issues)
+    final_ok = not has_must_issue and not has_should_issue
+
+    return {
+        "ok": final_ok,
+        "summary": parsed.get("summary", ""),
+        "issues": normalized_issues,
+        "checked_dimensions": dimensions,
+        "openbrain_rules_checked": len(openbrain_rules),
+        "model": model,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.delete("/{sop_id}", status_code=204)
 async def delete_sop(
     sop_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     engine = SOPEngine(db)
     if not engine.delete_sop(sop_id):
@@ -847,6 +1103,234 @@ async def get_bpmn(
     # BPMN automatisch generieren
     bpmn_xml = _generate_bpmn(sop)
     return {"sop_id": sop_id, "format": "bpmn20-xml", "xml": bpmn_xml, "auto_generated": True}
+
+
+# === BPMN aus Beschreibung (Freitext) regenerieren (User-Direktive 25.06.2026) ===
+class RegenerateBpmnBody(BaseModel):
+    model: Optional[str] = Field(None, description="LLM-Modell (default: minimax-direct/minimax-m3)")
+    save_to_sop: bool = Field(True, description="Wenn True, wird das Ergebnis in sop.bpmn_xml persistiert")
+
+
+def _extract_bpmn_xml(text: str) -> str:
+    """Extrahiert das BPMN-XML aus der LLM-Antwort.
+
+    - Entfernt Markdown-Codeblock-Wrapping (```xml ... ```)
+    - Findet das XML zwischen <?xml ... ?> und </bpmn:definitions>
+    """
+    text = text.strip()
+    # Markdown-Codeblock entfernen
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    # Falls LLM doch drumherum gequotet hat
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1].replace('\\n', '\n').replace('\\"', '"').strip()
+
+    # Versuche <?xml ... ?> bis </bpmn:definitions> zu extrahieren
+    import re
+    m = re.search(r"<\?xml[\s\S]*?</bpmn:definitions>", text)
+    if m:
+        return m.group(0).strip()
+    return text
+
+
+def _validate_and_repair_bpmn_xml(xml: str) -> tuple[bool, str, str]:
+    """Schnelle heuristische Validierung + Auto-Repair.
+
+    Returns: (ok, fehlerbeschreibung, repaired_xml)
+    """
+    if not xml or len(xml) < 200:
+        return False, "XML zu kurz", xml
+    # Pflicht-Namespaces
+    required_ns = [
+        'xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"',
+        'xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"',
+    ]
+    for ns in required_ns:
+        if ns not in xml:
+            return False, f"Pflicht-Namespace fehlt: {ns}", xml
+    # Pflicht-Elemente (ausser </bpmn:definitions>, das auto-repariert wird)
+    required_elements = [
+        "<bpmn:definitions",
+        "<bpmn:process",
+        "<bpmn:startEvent",
+        "<bpmn:endEvent",
+    ]
+    for elem in required_elements:
+        if elem not in xml:
+            return False, f"Pflicht-Element fehlt: {elem}", xml
+    # BPMN-DI muss vorhanden sein, sonst rendert bpmn-js nichts
+    if "<bpmndi:BPMNDiagram" not in xml:
+        return False, "BPMN-DI (Diagram Interchange) fehlt - bpmn-js kann nichts darstellen", xml
+    # Auto-Repair: Wenn </bpmn:definitions> fehlt -> ergaenzen
+    if "</bpmn:definitions>" not in xml:
+        stripped = xml.rstrip()
+        # Wenn mitten im Tag abgeschnitten: letzten kaputten Tag verwerfen
+        if stripped.endswith("</") or stripped.endswith("<"):
+            # Letzte Zeile abschneiden
+            last_newline = stripped.rfind("\n")
+            if last_newline > 0:
+                stripped = stripped[:last_newline]
+        # Offene Container-Tags schliessen (heuristisch: Top-Level-Reihenfolge)
+        for tag in ["bpmn:definitions", "bpmn:process", "bpmndi:BPMNDiagram",
+                    "bpmndi:BPMNPlane", "bpmn:subProcess"]:
+            open_count = stripped.count(f"<{tag}") - stripped.count(f"</{tag}>")
+            # Self-Closing-Tags nicht mitzaehlen
+            open_count -= stripped.count(f"<{tag} ")
+            for _ in range(open_count):
+                stripped += f"\n</{tag}>"
+        return True, "auto_repair: schliessendes </bpmn:definitions> ergaenzt", stripped
+    return True, "", xml
+
+
+@router.post("/{sop_id}/bpmn/regenerate-from-description")
+async def regenerate_bpmn_from_description(
+    sop_id: str,
+    body: RegenerateBpmnBody = RegenerateBpmnBody(),
+    db: Session = Depends(get_db),
+    _user: str = Depends(require_cio),
+):
+    """BPMN-XML aus den Freitext-Beschreibungen der SOP regenerieren.
+
+    User-Direktive 25.06.2026: Im BPMN-Tab gibt es einen Button 'Aus
+    Beschreibung regenerieren'. Bei Klick wird die SOP-Description + alle
+    Step-Descriptions an die KI (MiniMax-M3) geschickt, die daraus ein neues
+    BPMN-2.0-XML ableitet. Das Ergebnis ersetzt das bisherige (strukturell
+    generierte oder manuell gesetzte) BPMN-XML.
+
+    Workflow:
+      1. SOP laden (Name + Description + alle Steps mit Description)
+      2. Prompt bauen (System-Prompt mit BPMN-Regeln + User-Prompt mit Texten)
+      3. LLM aufrufen (default: minimax-direct/minimax-m3)
+      4. XML aus Antwort extrahieren (Markdown-Wrapping entfernen)
+      5. XML validieren (Namespaces + Pflicht-Elemente + BPMN-DI)
+      6. In sop.bpmn_xml speichern (commit)
+      7. Token-Usage dokumentieren (analog ai_step_helper)
+      8. XML + Metadaten zurueckgeben
+
+    Returns: { ok, sop_id, xml, model, raw_length, saved, validation }
+    """
+    import re
+    from ..services.llm_service import chat_completion, build_bpmn_from_description_prompt
+    from ..models.token_usage import TokenUsage
+    from decimal import Decimal
+
+    sop = db.get(SOP, sop_id)
+    if not sop:
+        raise HTTPException(404, f"SOP {sop_id} not found")
+
+    # SOP-Daten + Steps strukturiert aufbereiten
+    sorted_steps = sorted((sop.steps or []), key=lambda s: s.step_order)
+    sop_data = {
+        "id": sop.id,
+        "name": sop.name,
+        "description": sop.description,
+        "steps": [
+            {
+                "order": s.step_order,
+                "name": s.name,
+                "phase": s.phase,
+                "agent": s.agent,
+                "trigger": s.trigger,
+                "action": s.action,
+                "description": s.description,
+                "expected_result": s.expected_result,
+            }
+            for s in sorted_steps
+        ],
+    }
+
+    # LLM-Prompt bauen
+    messages, _ = build_bpmn_from_description_prompt(sop_data)
+    model = body.model or "minimax-direct/minimax-m3"
+
+    try:
+        raw_response = await chat_completion(
+            messages=messages, model=model, temperature=0.2, max_tokens=12000,
+            timeout_sec=180.0,
+            role=None,
+        )
+    except Exception as e:
+        logger.error(f"BPMN-Regenerate LLM-Fehler: {e}")
+        raise HTTPException(503, f"LLM-Aufruf fehlgeschlagen: {e}")
+
+    raw_content = raw_response if isinstance(raw_response, str) else raw_response.get("content", "")
+
+    # XML aus Antwort extrahieren
+    bpmn_xml = _extract_bpmn_xml(raw_content)
+
+    # XML validieren + ggf. auto-reparieren
+    is_valid, validation_err, final_xml = _validate_and_repair_bpmn_xml(bpmn_xml)
+    if not is_valid:
+        logger.warning(f"BPMN-Regenerate: ungueltiges XML von LLM ({validation_err})")
+        # Wir geben das XML trotzdem zurueck (User kann es manuell pruefen),
+        # speichern es aber NICHT in sop.bpmn_xml
+        return {
+            "ok": False,
+            "sop_id": sop_id,
+            "xml": bpmn_xml,
+            "model": model,
+            "raw_length": len(raw_content),
+            "saved": False,
+            "validation": {"ok": False, "error": validation_err},
+            "step_count": len(sorted_steps),
+        }
+
+    # Falls Auto-Repair gelaufen ist: kurzes Log
+    if validation_err and "auto_repair" in validation_err:
+        logger.info(f"BPMN-Regenerate: {validation_err}")
+        bpmn_xml = final_xml
+
+    # XML in SOP speichern (optional)
+    saved = False
+    if body.save_to_sop:
+        try:
+            sop.bpmn_xml = bpmn_xml
+            db.commit()
+            saved = True
+        except Exception as e:
+            logger.error(f"BPMN-Regenerate: Speichern fehlgeschlagen: {e}")
+            db.rollback()
+
+    # Token-Usage dokumentieren
+    try:
+        tu = TokenUsage(
+            task_id=None, history_id=None,
+            model=model, provider="minimax-direct",
+            role="bpmn-designer",
+            tokens_in=sum(len(m["content"]) // 4 for m in messages),
+            tokens_out=len(raw_content) // 4,
+            cost_usd=Decimal("0"),
+            input_per_1m=Decimal("0.30"), output_per_1m=Decimal("1.20"),
+            pricing_source="static_fallback",
+            snapshot_at=datetime.now(timezone.utc),
+        )
+        db.add(tu)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"TokenUsage konnte nicht erstellt werden: {e}")
+        db.rollback()
+
+    logger.info(
+        f"BPMN-Regenerate fuer SOP {sop_id} ({sop.name}): "
+        f"model={model}, raw_length={len(raw_content)}, "
+        f"xml_length={len(bpmn_xml)}, saved={saved}"
+    )
+
+    return {
+        "ok": True,
+        "sop_id": sop_id,
+        "xml": bpmn_xml,
+        "model": model,
+        "raw_length": len(raw_content),
+        "saved": saved,
+        "validation": {"ok": True, "error": None},
+        "step_count": len(sorted_steps),
+    }
 
 
 @router.get("/{sop_id}/uml")
@@ -968,7 +1452,7 @@ async def set_instance_context(
 @router.post("/seed-defaults", status_code=201)
 async def seed_defaults(
     db: Session = Depends(get_db),
-    _user: str = Depends(require_auth),
+    _user: str = Depends(require_admin),
 ):
     """Seeded die Standard-Task-SOP, falls noch nicht vorhanden."""
     count = seed_default_sops(db)
