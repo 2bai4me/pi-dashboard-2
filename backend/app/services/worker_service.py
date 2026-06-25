@@ -18,13 +18,15 @@ import json
 import logging
 import os
 import platform
+import random
 import shlex
 import shutil
 import subprocess
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
@@ -33,13 +35,15 @@ from sqlalchemy import select
 from ..db.base import SessionLocal
 from ..models.task import Task
 from ..models.history import TaskHistory
-from ..services.llm_service import chat_completion
+from ..services.llm_service import chat_completion, LLMTransientError, LLMPermanentError
+from ..services.provider_resolver import list_available_env_configs
+from ..config import settings
 
 logger = logging.getLogger("pi-dashboard-2.worker")
 
 # === PHASE 2: pi-CLI Sub-Agent Konfiguration ===
-# Default: MiniMax M3 (Pflicht laut Kanban-Operator Skill).
-# kimi-coding kann via ENV aktiviert werden, falls Authentifizierung funktioniert.
+# User-Direktive 24.06.2026: Default ist jetzt minimax-m3 / minimax-direct (Single Source of Truth).
+# Andere Provider koennen via ENV gewaehlt werden: CODE_AGENT_PROVIDER=kimi CODE_AGENT_MODEL=kimi-k2.7-code
 PI_BIN: str = os.environ.get("PI_BIN", shutil.which("pi") or "pi")
 CODE_AGENT_MODEL: str = os.environ.get("CODE_AGENT_MODEL", "minimax-m3")
 CODE_AGENT_PROVIDER: str = os.environ.get("CODE_AGENT_PROVIDER", "minimax-direct")
@@ -53,6 +57,135 @@ CODE_AGENT_LOG_DIR: Path = Path(os.environ.get(
 ))
 CODE_AGENT_MAX_COST_USD: float = float(os.environ.get("CODE_AGENT_MAX_COST_USD", "0.50"))
 
+# === Worker LLM Retry-Konfiguration ===
+WORKER_LLM_MAX_RETRIES: int = int(os.environ.get("WORKER_LLM_MAX_RETRIES", "3"))
+WORKER_LLM_RETRY_BASE_S: float = float(os.environ.get("WORKER_LLM_RETRY_BASE_S", "2.0"))
+WORKER_LLM_RETRY_MAX_S: float = float(os.environ.get("WORKER_LLM_RETRY_MAX_S", "60.0"))
+WORKER_LLM_FALLBACK_ENABLED: bool = os.environ.get("WORKER_LLM_FALLBACK_ENABLED", "true").lower() == "true"
+WORKER_MAX_TASK_RETRIES: int = int(os.environ.get("WORKER_MAX_TASK_RETRIES", "3"))
+
+
+def _normalize_code_agent_provider_model(provider: str, model: str) -> tuple[str, str]:
+    """Normalisiert Provider/Model fuer den pi-CLI Sub-Agent.
+
+    Vermeidet den historischen 'kimi-coding' Provider-Mismatch, bei dem
+    das CLI Provider 'kimi' mit Model 'kimi-coding' erhalten hat und
+    deshalb keinen API-Key aufloesen konnte (401).
+    """
+    p = (provider or "kimi").strip().lower()
+    m = (model or "kimi-k2.7-code").strip()
+
+    # Historische Alias-Namen auf den offiziellen 'kimi'-Provider mappen
+    if p in ("kimi-coding", "kimi_coding"):
+        p = "kimi"
+
+    # Gueltige kimi-Modelle; unbekannte Werte auf Default zurueckfallen
+    if p == "kimi":
+        valid_kimi_models = {
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+            "kimi-k2.5",
+            "kimi-k2-thinking",
+            "kimi-for-coding",
+            "k2p7",
+        }
+        if m.lower() not in valid_kimi_models:
+            logger.warning(
+                f"Unbekanntes Kimi-Model '{m}' -> Fallback auf 'kimi-k2.7-code'"
+            )
+            m = "kimi-k2.7-code"
+
+    return p, m
+
+
+def _health_check_code_agent_provider() -> dict:
+    """Prueft beim Startup, ob der konfigurierte Code-Agent-Provider erreichbar ist.
+
+    CLEANUP-AUDIT 23.06.2026: Verhindert stille 401-Fehler (siehe Kimi-Bug b8764c9f6f51).
+    Sendet einen minimalen API-Call (1 Token) und loggt das Ergebnis.
+    Bei 401/403/Netzwerkfehler: WARN-Log + Empfehlung fuer Alternative.
+
+    Returns:
+        Dict mit status (ok/warn/error), provider, model, latency_ms, error.
+    """
+    import urllib.request
+    import urllib.error
+
+    agent_provider, agent_model = _normalize_code_agent_provider_model(
+        CODE_AGENT_PROVIDER, CODE_AGENT_MODEL
+    )
+
+    # Mapping: Provider -> Test-URL + Auth-ENV
+    test_urls = {
+        "kimi": "https://api.moonshot.ai/v1/models",
+        "kimi-coding": "https://api.moonshot.ai/v1/models",
+        "openrouter": "https://openrouter.ai/api/v1/models",
+        "minimax-direct": "https://api.minimax.io/v1/models",
+        "anthropic": "https://api.anthropic.com/v1/models",
+        "openai": "https://api.openai.com/v1/models",
+    }
+
+    url = test_urls.get(agent_provider)
+    if not url:
+        return {
+            "status": "warn",
+            "provider": agent_provider,
+            "model": agent_model,
+            "error": f"Kein Test-URL-Mapping fuer Provider '{agent_provider}'",
+        }
+
+    # API-Key aus ENV (analog zur Provider-Resolution)
+    env_var_candidates = {
+        "kimi": ["KIMI_API_KEY"],
+        "kimi-coding": ["KIMI_API_KEY", "KIMI_CODING_API_KEY"],
+        "openrouter": ["OPENROUTER_API_KEY"],
+        "minimax-direct": ["MINIMAX_API_KEY"],
+        "anthropic": ["ANTHROPIC_API_KEY"],
+        "openai": ["OPENAI_API_KEY"],
+    }
+    api_key = ""
+    for var in env_var_candidates.get(agent_provider, []):
+        v = os.environ.get(var, "")
+        if v and v != "__CHANGE_ME__":
+            api_key = v
+            break
+
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            latency_ms = int((time.time() - t0) * 1000)
+            return {
+                "status": "ok",
+                "provider": agent_provider,
+                "model": agent_model,
+                "latency_ms": latency_ms,
+                "http_status": resp.status,
+            }
+    except urllib.error.HTTPError as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        return {
+            "status": "error",
+            "provider": agent_provider,
+            "model": agent_model,
+            "latency_ms": latency_ms,
+            "http_status": e.code,
+            "error": f"HTTP {e.code} {e.reason}",
+        }
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        return {
+            "status": "error",
+            "provider": agent_provider,
+            "model": agent_model,
+            "latency_ms": latency_ms,
+            "error": str(e)[:200],
+        }
+
 
 class WorkerService:
     """Worker-Service fuer automatische Task-Bearbeitung."""
@@ -61,8 +194,25 @@ class WorkerService:
     MAX_ITERATIONS = 5
 
     @staticmethod
+    def _get_worker_retry_at(task: Task) -> Optional[datetime]:
+        """Liest den Retry-Zeitpunkt aus task.meta (ISO-Format)."""
+        if not task.meta or not isinstance(task.meta, dict):
+            return None
+        raw = task.meta.get("worker_retry_at")
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+            return dt
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
     def claim_next_task(project_id: Optional[str] = None) -> Optional[Task]:
         """Holt den naechsten `todo`-Task mit hoechster Prioritaet.
+
+        Tasks mit zukuenftigem `worker_retry_at` werden uebersprungen
+        (Retry-Backoff nach transistenten LLM-Fehlern).
 
         Args:
             project_id: Optional, einschraenken auf ein Projekt
@@ -81,8 +231,16 @@ class WorkerService:
             if project_id:
                 query = query.filter(Task.project_id == project_id)
             # Hoechste Prioritaet zuerst
-            task = query.order_by(Task.priority.desc(), Task.created_at).first()
-            if task:
+            candidates = query.order_by(Task.priority.desc(), Task.created_at).all()
+            now = datetime.now(timezone.utc)
+            for task in candidates:
+                retry_at = WorkerService._get_worker_retry_at(task)
+                if retry_at and retry_at > now:
+                    logger.debug(
+                        f"Task {task.id[:8]} uebersprungen (Retry-Backoff bis {retry_at.isoformat()})"
+                    )
+                    continue
+                # Task ist bereit
                 # Atomic Update mit Optimistic Lock
                 old_status = task.status
                 task.status = "in_progress"
@@ -268,7 +426,7 @@ Erstelle einen detaillierten Umsetzungs-Plan."""
                     )
 
             # pi-CLI Code-Agent starten (asynchron, non-blocking)
-            agent_info = WorkerService._spawn_pi_code_agent(task, plan_data)
+            agent_info = WorkerService._spawn_pi_code_agent(task)
             if agent_info:
                 logger.info(
                     f"[PHASE 2] Task {task.id[:8]} bleibt in in_progress, Code-Agent PID {agent_info['pid']} arbeitet"
@@ -292,44 +450,118 @@ Erstelle einen detaillierten Umsetzungs-Plan."""
                     logger.warning(f"Task {task.id}: Engine-Trigger fehlgeschlagen: {e}")
                 return {"ok": True, "plan": plan_data, "phase": 1, "warning": "code_agent_spawn_failed"}
 
-        except Exception as e:
-            logger.error(f"Worker-Call fehlgeschlagen fuer Task {task.id}: {e}")
+        except LLMPermanentError as e:
+            logger.error(f"Permanenter Worker-Fehler fuer Task {task.id}: {e}")
             return WorkerService._fail_task(task, str(e))
+        except (LLMTransientError, Exception) as e:
+            logger.warning(f"Transiente Worker-Fehler fuer Task {task.id}: {e}")
+            retry_count = WorkerService._schedule_worker_retry(task, str(e))
+            if retry_count >= WORKER_MAX_TASK_RETRIES:
+                logger.error(
+                    f"Task {task.id}: Max Task-Retries ({WORKER_MAX_TASK_RETRIES}) "
+                    f"erschöpft -> rueckfrage"
+                )
+                return WorkerService._fail_task(
+                    task,
+                    f"LLM-Call nach {retry_count} Versuchen weiterhin fehlgeschlagen: {e}",
+                )
+            return {
+                "ok": False,
+                "error": str(e),
+                "retry_count": retry_count,
+                "phase": "retry_scheduled",
+            }
 
     @staticmethod
     async def _call_llm(messages: list) -> Dict[str, Any]:
-        """Synchroner LLM-Call (blockierend). Gibt Dict mit content + usage zurueck.
+        """LLM-Call mit Retry/Backoff und Provider-Fallback.
+
+        Versucht zuerst den Primaer-Provider (MiniMax), wiederholt bei
+        transienten Fehlern (429, 5xx, Timeout) und wechselt danach auf den
+        naechsten konfigurierten Provider.
 
         Returns: {
             "content": str (LLM-Response),
-            "model": "minimax-m3",
-            "provider": "minimax",
+            "model": str,
+            "provider": str,
             "usage": {"tokens_in": int, "tokens_out": int}
         }
         """
-        # chat_completion ist async — also blocking
-        result = await chat_completion(
-            messages=messages,
-            model="minimax-m3",
-            temperature=0.3,
-            max_tokens=2000,
-        )
-        # Wenn chat_completion schon ein Dict mit usage-Feld zurueckgibt
-        if isinstance(result, dict):
-            return {
-                "content": result.get("content", result.get("text", str(result))),
-                "model": "minimax-m3",
-                "provider": result.get("provider", "minimax"),
-                "usage": result.get("usage", {"tokens_in": 0, "tokens_out": 0}),
-            }
-        # Fallback: alter String-Return (falls llm_service noch nicht erweitert)
-        return {
-            "content": str(result),
+        primary_config = {
+            "provider": "minimax-direct",
             "model": "minimax-m3",
-            "provider": "minimax",
-            "usage": {"tokens_in": 0, "tokens_out": 0},
         }
-        return str(result)
+        fallback_configs: List[Dict[str, Any]] = []
+        if WORKER_LLM_FALLBACK_ENABLED:
+            fallback_configs = list_available_env_configs()
+
+        # Duplikate entfernen (Primaer-Provider kann in ENV-Liste vorkommen)
+        seen: set[tuple[str, str]] = set()
+        configs: List[Dict[str, Any]] = []
+        for cfg in [primary_config, *fallback_configs]:
+            key = (cfg.get("provider", ""), cfg.get("model", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            configs.append(cfg)
+
+        last_error: Optional[Exception] = None
+        for cfg in configs:
+            provider = cfg.get("provider", "minimax")
+            model = cfg.get("model", "minimax-m3")
+            api_key = cfg.get("api_key")
+            base_url = cfg.get("base_url")
+            for attempt in range(WORKER_LLM_MAX_RETRIES + 1):
+                try:
+                    result = await chat_completion(
+                        messages=messages,
+                        model=model,
+                        temperature=0.3,
+                        max_tokens=2000,
+                        api_key=api_key,
+                        base_url=base_url,
+                        provider=provider,
+                    )
+                    if isinstance(result, dict):
+                        return {
+                            "content": result.get("content", result.get("text", str(result))),
+                            "model": model,
+                            "provider": provider,
+                            "usage": result.get("usage", {"tokens_in": 0, "tokens_out": 0}),
+                        }
+                    return {
+                        "content": str(result),
+                        "model": model,
+                        "provider": provider,
+                        "usage": {"tokens_in": 0, "tokens_out": 0},
+                    }
+                except LLMPermanentError as e:
+                    logger.error(
+                        f"Permanenter LLM-Fehler fuer Task (provider={provider}, model={model}): {e}"
+                    )
+                    last_error = e
+                    break
+                except LLMTransientError as e:
+                    last_error = e
+                    if attempt >= WORKER_LLM_MAX_RETRIES:
+                        logger.warning(
+                            f"LLM-Retry erschoepft fuer provider={provider}, model={model}: {e}"
+                        )
+                        break
+                    backoff = min(
+                        WORKER_LLM_RETRY_BASE_S * (2 ** attempt) + random.uniform(0, 1),
+                        WORKER_LLM_RETRY_MAX_S,
+                    )
+                    if getattr(e, "retry_after", None):
+                        backoff = max(backoff, float(e.retry_after))
+                    logger.warning(
+                        f"LLM-TransientError fuer Task (provider={provider}, "
+                        f"model={model}, attempt={attempt + 1}/{WORKER_LLM_MAX_RETRIES + 1}): {e}. "
+                        f"Warte {backoff:.1f}s..."
+                    )
+                    await asyncio.sleep(backoff)
+
+        raise last_error or RuntimeError("LLM-Call nach allen Retries und Fallbacks fehlgeschlagen")
 
     @staticmethod
     def _extract_json(text: str) -> dict:
@@ -398,6 +630,58 @@ Erstelle einen detaillierten Umsetzungs-Plan."""
             )
 
     @staticmethod
+    def _schedule_worker_retry(task: Task, error: str) -> int:
+        """Setzt einen gescheiterten Task auf 'todo' mit Retry-Backoff zurueck.
+
+        Returns:
+            Aktueller Wert von worker_retry_count (nach Inkrement).
+        """
+        from .session_helper import get_session_id
+
+        with SessionLocal() as db:
+            t = db.get(Task, task.id)
+            if not t:
+                return 0
+            meta = dict(t.meta or {})
+            retry_count = int(meta.get("worker_retry_count", 0) or 0) + 1
+            backoff = min(
+                WORKER_LLM_RETRY_BASE_S * (2 ** (retry_count - 1)) + random.uniform(0, 1),
+                WORKER_LLM_RETRY_MAX_S,
+            )
+            retry_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+            meta["worker_retry_count"] = retry_count
+            meta["worker_retry_at"] = retry_at.isoformat()
+            meta["last_worker_error"] = error[:500]
+            t.meta = meta
+            flag_modified(t, "meta")
+            old_status = t.status
+            t.status = "todo"
+            t.claimed_at = None
+            t.updated_at = datetime.utcnow()
+            th = TaskHistory(
+                task_id=t.id,
+                ts=datetime.utcnow(),
+                session_id=get_session_id(),
+                event="worker_retry_scheduled",
+                agent="worker-auto",
+                details={
+                    "from": old_status,
+                    "to": "todo",
+                    "retry_count": retry_count,
+                    "backoff_s": round(backoff, 2),
+                    "retry_at": retry_at.isoformat(),
+                    "error": error[:500],
+                },
+            )
+            db.add(th)
+            db.commit()
+            logger.info(
+                f"Task {t.id[:8]}: Retry {retry_count}/{WORKER_MAX_TASK_RETRIES} "
+                f"eingeplant (backoff={backoff:.1f}s, retry_at={retry_at.isoformat()})"
+            )
+            return retry_count
+
+    @staticmethod
     def _fail_task(task: Task, error: str) -> dict:
         """Setzt Task auf rueckfrage mit Fehler-Log."""
         from .session_helper import get_session_id
@@ -416,6 +700,7 @@ Erstelle einen detaillierten Umsetzungs-Plan."""
             t.updated_at = datetime.utcnow()
             th = TaskHistory(
                 task_id=t.id,
+                ts=datetime.utcnow(),
                 session_id=get_session_id(),
                 event="worker_failed",
                 agent="worker-auto",
@@ -495,12 +780,13 @@ Erstelle einen detaillierten Umsetzungs-Plan."""
             }
 
     @staticmethod
-    def _spawn_pi_code_agent(task: Task, plan_data: dict) -> Optional[Dict[str, Any]]:
+    def _spawn_pi_code_agent(task: Task) -> Optional[Dict[str, Any]]:
         """Startet die externe pi-CLI als Code-Editor Sub-Agent (PHASE 2).
 
         Der Sub-Agent arbeitet asynchron im Hintergrund und fuehrt echte
-        Code-Edits durch (read/write/edit/bash). Er benutzt das kimi-coding
-        Modell. Der Prozess wird ueber agent_pid getrackt.
+        Code-Edits durch (read/write/edit/bash). Er benutzt das konfigurierte
+        Provider/Model (Default: kimi/kimi-k2.7-code). Der Prozess wird ueber
+        agent_pid getrackt.
 
         Returns:
             Dict mit pid, log_path, cmd, role, model bei Erfolg, sonst None.
@@ -513,74 +799,46 @@ Erstelle einen detaillierten Umsetzungs-Plan."""
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"pi-code-agent-{task_id}.log"
 
-        # Build prompt fuer pi-CLI
-        plan_json = json.dumps(plan_data, ensure_ascii=False, indent=2)
-        criteria = task.success_criteria or []
-        if isinstance(criteria, str):
-            try:
-                criteria = json.loads(criteria)
-            except Exception:
-                criteria = []
-        criteria_text = "\n".join(f"- {c}" for c in criteria) if criteria else "- (keine Kriterien)"
-
-        system_prompt = f"""Du bist {role}. Bearbeite den folgenden Task vollstaendig autonom.
-
-Task-ID: {task_id}
-Titel: {task.title}
-
-Beschreibung:
-{task.description or '(keine Beschreibung)'}
-
-Erfolgskriterien:
-{criteria_text}
-
-Geplanter Umsetzungsplan:
-{plan_json}
-
-Arbeitsanweisungen:
-1. Arbeite im Projekt-Verzeichnis: {CODE_AGENT_CWD}
-2. Lies relevante Dateien, verstehe den Kontext.
-3. Fuehre die Aenderungen aus dem Plan Schritt fuer Schritt durch.
-4. Nutze die Tools read, write, edit, bash.
-5. Schreibe/aktualisiere Tests falls im Plan vorgesehen.
-6. Fuehre Build/Type-Check/Lint aus, falls sinnvoll.
-7. Budget-Limit: {CODE_AGENT_MAX_COST_USD} USD. Wenn ueberschritten: stoppe und melde Fehler.
-8. Wenn fertig, melde Status zurueck:
-   curl -s -X PATCH "{CODE_AGENT_API_URL}/api/kanban/tasks/{task_id}/dispatch" \\
-     -H "Authorization: Bearer {CODE_AGENT_API_TOKEN}" \\
-     -H "Content-Type: application/json" \\
-     -d '{{"status":"review","role":"{role}","model":"{CODE_AGENT_PROVIDER}/{CODE_AGENT_MODEL}","reason":"pi-code-agent-done"}}'
-
-Arbeite vollautonom ohne Rueckfragen."""
+        # Provider/Model normalisieren (vermeidet historischen kimi-coding Mismatch)
+        agent_provider, agent_model = _normalize_code_agent_provider_model(
+            CODE_AGENT_PROVIDER, CODE_AGENT_MODEL
+        )
 
         # Wrapper-Script verwenden, um Bash-Quoting-Probleme mit langen
-        # System-Prompts zu vermeiden. Der Wrapper liest Task aus der API
-        # und startet pi-CLI sauber.
+        # System-Prompts zu vermeiden. Der Wrapper liest Task + Plan ueber den
+        # MCP-over-ZMQ-Bus und startet die pi-CLI sauber.
         wrapper_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "pi_code_agent_wrapper.py"
         cmd = [
-            "C:/Python314/python.exe",
+            sys.executable,
             str(wrapper_script),
             task_id,
-            "--api-url", CODE_AGENT_API_URL,
-            "--token", CODE_AGENT_API_TOKEN,
-            "--model", CODE_AGENT_MODEL,
-            "--provider", CODE_AGENT_PROVIDER,
+            "--model", agent_model,
+            "--provider", agent_provider,
             "--budget", str(CODE_AGENT_MAX_COST_USD),
             "--log", str(log_path),
         ]
+        # Optional: HTTP-Fallback, wenn kein MCP-Endpunkt konfiguriert ist
+        mcp_endpoint = settings.PI_MCP_ROUTER_ENDPOINT
+        mcp_api_key = settings.PI_MCP_API_KEY or ""
+        if mcp_endpoint:
+            cmd.extend(["--endpoint", mcp_endpoint, "--api-key", mcp_api_key])
+        else:
+            cmd.extend(["--api-url", CODE_AGENT_API_URL, "--token", CODE_AGENT_API_TOKEN])
 
         env = {
             **os.environ,
             "NO_COLOR": "1",
             "CODE_AGENT_API_URL": CODE_AGENT_API_URL,
             "CODE_AGENT_API_TOKEN": CODE_AGENT_API_TOKEN,
-            "CODE_AGENT_MODEL": CODE_AGENT_MODEL,
-            "CODE_AGENT_PROVIDER": CODE_AGENT_PROVIDER,
+            "CODE_AGENT_MODEL": agent_model,
+            "CODE_AGENT_PROVIDER": agent_provider,
             "CODE_AGENT_MAX_COST_USD": str(CODE_AGENT_MAX_COST_USD),
+            "PI_MCP_ROUTER_ENDPOINT": mcp_endpoint or "",
+            "PI_MCP_API_KEY": mcp_api_key,
         }
         try:
             with open(log_path, "w", encoding="utf-8") as lf:
-                lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START task={task_id} role={role} model={CODE_AGENT_PROVIDER}/{CODE_AGENT_MODEL}\n")
+                lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START task={task_id} role={role} model={agent_provider}/{agent_model}\n")
                 lf.write(f"CMD: {' '.join(str(c) for c in cmd)}\n")
                 lf.flush()
                 proc = subprocess.Popen(
@@ -602,7 +860,7 @@ Arbeite vollautonom ohne Rueckfragen."""
             "log_path": str(log_path),
             "cmd": " ".join(str(c) for c in cmd),
             "role": role,
-            "model": f"{CODE_AGENT_PROVIDER}/{CODE_AGENT_MODEL}",
+            "model": f"{agent_provider}/{agent_model}",
             "started_at": datetime.utcnow().isoformat(),
         }
 
@@ -614,7 +872,7 @@ Arbeite vollautonom ohne Rueckfragen."""
                 meta["code_agent"] = {
                     "pid": proc.pid,
                     "role": role,
-                    "model": f"{CODE_AGENT_PROVIDER}/{CODE_AGENT_MODEL}",
+                    "model": f"{agent_provider}/{agent_model}",
                     "log_path": str(log_path),
                     "status": "dispatched",
                     "started_at": datetime.utcnow().isoformat(),

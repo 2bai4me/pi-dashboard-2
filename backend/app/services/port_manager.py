@@ -53,7 +53,9 @@ class PortBlock:
 
 def _get_conn():
     import os
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     return sqlite3.connect(db_path)
 
 
@@ -87,7 +89,9 @@ def find_free_block(app_name: str, count: int = DEFAULT_BLOCK_SIZE,
         Tuple (port_start, port_end) oder None
     """
     import os
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("SELECT port_start, port_end FROM app_port_allocations WHERE status = 'active'")

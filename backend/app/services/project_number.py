@@ -21,7 +21,9 @@ def generate_next_project_number() -> str:
     Format: PROJ-YYYY-NNN (z.B. PROJ-2026-005)
     Thread-safe ueber SQLite (serialisierte Schreibvorgaenge).
     """
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path, timeout=30)
     cur = conn.cursor()
     current_year = datetime.now().year
@@ -60,7 +62,9 @@ def ensure_project_number(project_id: str) -> str:
     Falls vorhanden: zurueckgeben.
     Falls nicht: generieren und speichern.
     """
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path, timeout=30)
     cur = conn.cursor()
     cur.execute("SELECT project_number FROM projects WHERE id = ?", (project_id,))

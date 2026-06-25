@@ -26,13 +26,14 @@ from ..models.task import Task
 from ..models.provider_credential import ProviderCredential
 from .provider_resolver import get_role_config
 from .llm_service import chat_completion
+from .role_service import RoleService
 
 logger = logging.getLogger("pi-dashboard-2.subagent")
 
 
 # Fallback-Werte, falls eine Rolle in der DB unvollstaendig ist.
-_FALLBACK_MODEL = "ollama/gemma4:12b"
-_FALLBACK_PROVIDER = "ollama"
+_FALLBACK_MODEL = "minimax-m3"
+_FALLBACK_PROVIDER = "minimax-direct"
 _FALLBACK_TOOLS = ["read", "write", "bash", "grep"]
 _FALLBACK_TEMPERATURE = 0.3
 _FALLBACK_MAX_TOKENS = 4096
@@ -169,7 +170,20 @@ class SubAgentService:
 
     @staticmethod
     def list_agent_configs(db: Session) -> List[Dict[str, Any]]:
-        """Listet alle verfuegbaren Sub-Agent-Konfigurationen aus der DB."""
+        """Listet alle verfuegbaren Sub-Agent-Konfigurationen aus der DB.
+
+        Stellt sicher, dass alle Default-Rollen (pi-coder, pi-tester,
+        pi-reviewer, pi-fixer + Org-Rollen) vorhanden sind, bevor die
+        Konfigurationen zurueckgegeben werden. So kann eine versehentlich
+        geloeschte Standard-Rolle nicht stillschweigend fehlen — beim
+        naechsten GET kommt sie automatisch zurueck (idempotente Recovery).
+
+        Der Fix ist hier bewusst, weil die SubAgent-UI genau diesen
+        Endpoint aufruft. /api/roles/sub-agents macht es bereits analog.
+        """
+        # Idempotente Recovery: fehlende Standard-Rollen wiederherstellen
+        RoleService.seed_defaults(db)
+
         result = []
         roles = db.execute(select(Role)).scalars().all()
         for role in roles:
@@ -186,6 +200,7 @@ class SubAgentService:
 
             result.append({
                 "name": role.name,
+                "display_name": role.display_name,
                 "role_id": role.id,
                 "role_type": role.role_type,
                 "is_subagent": is_subagent,
@@ -197,6 +212,8 @@ class SubAgentService:
                 "emoji": role.emoji,
                 "system_prompt": role.system_prompt,
                 "description": role.description,
+                "assigned_sop_id": role.assigned_sop_id,
+                "user_modified": role.user_modified,  # User-Direktive 24.06.2026
             })
         return result
 
@@ -213,8 +230,8 @@ class SubAgentService:
         Args:
             db: SQLAlchemy Session
             role_name: z.B. "pi-coder"
-            model: z.B. "ollama/gemma4:12b" oder "minimax-m3"
-            provider: z.B. "ollama" oder "minimax-direct" (auto-erkannt wenn None)
+            model: z.B. "minimax-m3" (Standard, User-Direktive 24.06.2026) oder "ollama/gemma4:12b"
+            provider: z.B. "minimax-direct" (Standard) oder "ollama" (auto-erkannt wenn None)
             api_key_id: Optional ID einer ProviderCredential. Wenn gesetzt,
                         werden provider/model aus der Credential übernommen.
 
@@ -237,9 +254,16 @@ class SubAgentService:
             role.model = model
             role.provider = provider or _derive_provider(model, role.provider)
 
+        # User-Direktive 24.06.2026: Override-Schutz aktivieren
+        # Damit seed_defaults() beim Restart die Aenderung NICHT ueberschreibt.
+        role.user_modified = True
+
         db.commit()
         db.refresh(role)
-        logger.info(f"Role {role_name}: model={role.model}, provider={role.provider}, api_key_id={role.api_key_id}")
+        logger.info(
+            f"Role {role_name}: model={role.model}, provider={role.provider}, "
+            f"api_key_id={role.api_key_id}, user_modified=True"
+        )
         return role
 
     @staticmethod
@@ -258,7 +282,195 @@ class SubAgentService:
         if not role:
             raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
         role.system_prompt = system_prompt
+        # User-Direktive 24.06.2026: Override-Schutz
+        role.user_modified = True
         db.commit()
         db.refresh(role)
-        logger.info(f"Role {role_name}: system_prompt updated ({len(system_prompt)} chars)")
+        logger.info(
+            f"Role {role_name}: system_prompt updated ({len(system_prompt)} chars), user_modified=True"
+        )
         return role
+
+    @staticmethod
+    def update_role_name(
+        db: Session,
+        role_name: str,
+        display_name: Optional[str],
+    ) -> Role:
+        """Aktualisiert den editierbaren Anzeigenamen einer Rolle.
+
+        `name` (der technische Rollen-Identifier) bleibt unveraendert,
+        damit bestehende Lookups und SOP-Referenzen stabil bleiben.
+        Nur `display_name` wird gespeichert (kann auch auf None/leer
+        zurueckgesetzt werden, dann faellt die Anzeige auf `name`
+        zurueck).
+
+        Args:
+            db: SQLAlchemy Session
+            role_name: z.B. "pi-coder"
+            display_name: Neuer Anzeigename oder leerer String fuer Reset
+
+        Returns:
+            Aktualisierte Role
+        """
+        role = SubAgentService.get_role(db, role_name)
+        if not role:
+            raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
+
+        cleaned = (display_name or "").strip()
+        role.display_name = cleaned if cleaned else None
+        db.commit()
+        db.refresh(role)
+        logger.info(f"Role {role_name}: display_name={role.display_name!r}")
+        return role
+
+    @staticmethod
+    def update_role_sop(
+        db: Session,
+        role_name: str,
+        sop_id: Optional[str],
+    ) -> Role:
+        """Ordnet einer Rolle einen SOP zu (rein informativ).
+
+        Beeinflusst die Prozesssteuerung NICHT – der SOP kann hier nur als
+        Dokumentation hinterlegt werden, mit welcher Standard-Operating-
+        Procedure der Sub-Agent arbeitet.
+
+        Args:
+            db: SQLAlchemy Session
+            role_name: z.B. "pi-coder"
+            sop_id: SOP-ID (z.B. aus /api/sops) oder None zum Loeschen
+
+        Returns:
+            Aktualisierte Role
+        """
+        role = SubAgentService.get_role(db, role_name)
+        if not role:
+            raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
+
+        cleaned = (sop_id or "").strip() or None
+        if cleaned:
+            # Pruefen ob der SOP existiert (nur informativ)
+            from ..models.sop import SOP
+            exists = db.execute(select(SOP).where(SOP.id == cleaned)).scalar_one_or_none()
+            if not exists:
+                raise ValueError(f"SOP '{cleaned}' nicht gefunden.")
+        role.assigned_sop_id = cleaned
+        # User-Direktive 24.06.2026: Override-Schutz
+        role.user_modified = True
+        db.commit()
+        db.refresh(role)
+        logger.info(
+            f"Role {role_name}: assigned_sop_id={role.assigned_sop_id!r}, user_modified=True"
+        )
+        return role
+
+    @staticmethod
+    def update_role_config(
+        db: Session,
+        role_name: str,
+        display_name: Optional[str] = None,
+        sop_id: Optional[str] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        api_key_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+    ) -> Role:
+        """Aktualisiert mehrere Felder einer Rolle in einem atomaren Aufruf.
+
+        Felder die hier nicht explizit uebergeben werden, bleiben unveraendert.
+        """
+        role = SubAgentService.get_role(db, role_name)
+        if not role:
+            raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
+
+        from ..models.sop import SOP
+
+        if display_name is not None:
+            cleaned = (display_name or "").strip()
+            role.display_name = cleaned if cleaned else None
+
+        if sop_id is not None:
+            cleaned = (sop_id or "").strip() or None
+            if cleaned:
+                exists = db.execute(
+                    select(SOP).where(SOP.id == cleaned)
+                ).scalar_one_or_none()
+                if not exists:
+                    raise ValueError(f"SOP '{cleaned}' nicht gefunden.")
+            role.assigned_sop_id = cleaned
+
+        if api_key_id is not None:
+            cleaned = (api_key_id or "").strip() or None
+            if cleaned:
+                credential = db.get(ProviderCredential, cleaned)
+                if not credential:
+                    raise ValueError(f"ProviderCredential '{cleaned}' nicht gefunden.")
+                role.api_key_id = cleaned
+                role.provider = credential.provider
+                role.model = credential.model
+            else:
+                role.api_key_id = None
+
+        # Model/Provider nur setzen, wenn api_key_id nicht explizit gesetzt wurde
+        # (sonst wuerden sie durch das Credential ueberschrieben).
+        if model is not None and api_key_id is None:
+            role.model = (model or "").strip() or None
+            if provider is not None:
+                role.provider = (provider or "").strip() or None
+            elif role.model:
+                role.provider = _derive_provider(role.model, role.provider)
+
+        if system_prompt is not None:
+            role.system_prompt = system_prompt
+
+        # User-Direktive 24.06.2026: Override-Schutz aktivieren,
+        # sobald irgendein protected field geaendert wurde.
+        # Vorher wurde user_modified nur in /api/roles/{id} gesetzt — NICHT hier.
+        protected_changed = (
+            display_name is not None or
+            sop_id is not None or
+            api_key_id is not None or
+            model is not None or
+            provider is not None or
+            system_prompt is not None
+        )
+        if protected_changed:
+            role.user_modified = True
+
+        db.commit()
+        db.refresh(role)
+        logger.info(
+            f"Role {role_name}: config updated, user_modified={role.user_modified}"
+        )
+        return role
+
+    @staticmethod
+    def delete_role(db: Session, role_name: str) -> Dict[str, Any]:
+        """Loescht eine Rolle unwiderruflich aus der DB.
+
+        Andere Tabellen referenzieren Rollen nur als String (z.B.
+        task.assigned_role, token_usage.role), nicht per FK – daher
+        bleiben historische Eintraege erhalten und zeigen weiterhin den
+        Namen an. Nur die Konfiguration (Modell, Provider, Prompt, ...)
+        geht verloren.
+
+        Args:
+            db: SQLAlchemy Session
+            role_name: z.B. "pi-coder"
+
+        Returns:
+            Dict mit geloeschter Rolle
+
+        Raises:
+            ValueError: Wenn die Rolle nicht gefunden wurde
+        """
+        role = SubAgentService.get_role(db, role_name)
+        if not role:
+            raise ValueError(f"Role '{role_name}' nicht in DB gefunden.")
+
+        snapshot = role.to_dict() if hasattr(role, "to_dict") else {"name": role.name}
+        db.delete(role)
+        db.commit()
+        logger.info(f"Role {role_name} geloescht (Historische Referenzen bleiben erhalten)")
+        return snapshot

@@ -161,7 +161,9 @@ SWARM_CONFIGS = {
 def _get_conn() -> sqlite3.Connection:
     """Lazy-Connect zur DB. Konfiguration via env PI_DB_PATH."""
     import os
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     return sqlite3.connect(db_path)
 
 
@@ -464,23 +466,33 @@ async def execute_worker_real(
                     started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-            # System-Prompt mit Variant-Info erweitern (falls vorhanden)
-            variant_prompts = {
-                "minimalist": "Schreibe minimalen, lesbaren Code. Keine Over-Engineering.",
-                "robust": "Defensive Programmierung. Edge-Cases abdecken. Null-Checks.",
-                "performant": "Performance-optimiert. O(n)-Analyse. Memory-Profiling.",
-                "unit": "Unit-Tests schreiben. Coverage > 90%. Edge-Cases.",
-                "integration": "Integration-Tests. API-Contracts. End-to-End-Flows.",
-                "performance": "Performance-Tests. Load-Testing. Latenz-Messung.",
-                "quality": "Bewerte Code-Quality: Lesbarkeit, Patterns, Naming, DRY.",
-                "bugs": "Finde Bugs: Edge-Cases, Race-Conditions, Error-Handling.",
-                "robustness": "Pruefe Robustheit: Input-Validierung, Failure-Modes, Recovery.",
-            }
-            variant_prompt = variant_prompts.get(variant, "")
-            if variant_prompt and task.meta is None:
+            # System-Prompt mit Variant-Info erweitern (User-Direktive 24.06.2026):
+            # Worker-Prompts kommen aus dem SOP-Step (WorkerConfig.system_prompt) oder
+            # aus den Rollen-Definitionen (role.system_prompt + variant-Anweisung).
+            # NICHT mehr hardcoded in swarm_spawner.py.
+            if task.meta is None:
                 task.meta = {}
-            if variant_prompt:
-                task.meta["variant_prompt"] = variant_prompt
+            if not task.meta.get("variant_prompt"):
+                # Hole Worker-Prompt aus dem SOP-Context (von der SOP-Engine gesetzt)
+                variant_prompt = task_context.get("worker_prompts", {}).get(
+                    f"{worker_role}:{variant}", ""
+                ) or task_context.get("worker_prompts", {}).get(worker_role, "")
+                if variant_prompt:
+                    task.meta["variant_prompt"] = variant_prompt
+                else:
+                    # Letzter Fallback: Rollen-System-Prompt (aus roles-Tabelle)
+                    from app.models.role import Role
+                    from sqlalchemy import select
+                    role = db.execute(
+                        select(Role).where(Role.name == worker_role)
+                    ).scalar_one_or_none()
+                    if role and role.system_prompt:
+                        task.meta["variant_prompt"] = (
+                            f"## VARIANTE: {variant}\n"
+                            f"Setze die oben beschriebene Persona um unter Beruecksichtigung "
+                            f"der Variante '{variant}'.\n\n"
+                            f"### ROLLE\n{role.system_prompt}"
+                        )
             # assigned_subagent setzen damit spawn_sub_agent ihn nimmt
             task.assigned_subagent = worker_role
             db.commit()

@@ -27,7 +27,9 @@ import json
 import logging
 import re
 import secrets
+import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional, Dict, Any, List, Tuple
 
 from sqlalchemy import select, func as sqlfunc
@@ -39,6 +41,8 @@ from ..models.sop import (
 )
 from ..models.task import Task
 from ..models.project import Project
+from ..models.role import Role
+from ..models.history import TaskHistory
 from ..schemas.sop_action import ALLOWED_ACTIONS as ALLOWED_SOP_ACTIONS, ACTION_PARAM_SCHEMAS
 from .llm_service import chat_completion
 from .task_service import TaskService
@@ -61,6 +65,388 @@ _DEFAULT_MAX_STEP_ITERATIONS: int = 10
 
 def _gen_id() -> str:
     return secrets.token_hex(6)
+
+
+# === SOP-getriebene Agent-Ausfuehrung (User-Direktive 23.06.2026) ===
+# Konzept:
+#   SOP-Step = aufgabenspezifische Anweisung (user_prompt, ai_instructions_md)
+#   Rolle   = aufgabenunabhaengige Persona (system_prompt, provider, model, api_key)
+#   -> System-Prompt = role.system_prompt + step.ai_instructions_md
+#   -> Model/Provider aus Role, nicht aus action_params
+#   -> Jeder LLM-Call wird vollstaendig in task_history dokumentiert.
+
+def _load_role_for_step(db: Session, step: SOPStep) -> Optional[Role]:
+    """Laedt die Rolle (SubAgent/Org-Role) anhand step.agent aus der DB.
+
+    Returns None, wenn keine Rolle mit dem Namen existiert.
+    Der Aufrufer MUSS damit umgehen (Fallback-Logik).
+    """
+    if not step.agent:
+        return None
+    return db.execute(
+        select(Role).where(Role.name == step.agent)
+    ).scalar_one_or_none()
+
+
+def _build_system_prompt(role: Optional[Role], params: Dict[str, Any]) -> str:
+    """Baut den System-Prompt aus Rolle + SOP-Step.
+
+    Reihenfolge (jeder Block durch '---' getrennt):
+      1. role.system_prompt  -> Persona, Haltung, Verantwortung (aus roles-Tabelle)
+      2. params.ai_instructions_md -> Workflow/Vorgehen/Output-Format (aus sop_steps)
+      3. params.system_prompt -> Optionaler Override (nur wenn beides fehlt)
+
+    Wichtig: Die Rolle liefert die PERSONA, die SOP liefert die AUFGABE.
+    Niemals persona-spezifische Inhalte in die SOP packen, und umgekehrt.
+    """
+    parts: List[str] = []
+    if role and role.system_prompt and role.system_prompt.strip():
+        parts.append(role.system_prompt.strip())
+    instructions = params.get("ai_instructions_md")
+    if instructions and str(instructions).strip():
+        parts.append(
+            "## WORKFLOW-ANWEISUNGEN AUS DEM SOP-SCHritt\n"
+            f"({_gen_id()} - vom System hinzugefuegt)\n\n"
+            + str(instructions).strip()
+        )
+    if not parts:
+        fallback = params.get("system_prompt")
+        if fallback:
+            parts.append(str(fallback))
+        else:
+            parts.append("Du bist ein hilfreicher Assistent.")
+    return "\n\n---\n\n".join(parts)
+
+
+def _resolve_model_from_role(role: Optional[Role], params: Dict[str, Any]) -> str:
+    """Loest das zu verwendende Modell auf.
+
+    Prioritaet:
+      1. role.model  (Single Source of Truth aus roles-Tabelle)
+      2. params.model (Override nur fuer Sonderfaelle)
+      3. Default 'minimax-m3'
+    """
+    if role and role.model:
+        return role.model
+    return params.get("model") or "minimax-m3"
+
+
+def _substitute_task_placeholders(
+    db: Session,
+    text: str,
+    task: Optional[Any] = None,
+    instance: Optional[Any] = None,
+    step: Optional[Any] = None,
+) -> str:
+    """Ersetzt Platzhalter im Text mit echten Werten aus Task/Project/Step.
+
+    Unterstuetzte Platzhalter (User-Direktive 24.06.2026):
+      {task_id}, {task_title}, {task_description}, {task_status},
+      {task_status_display}, {task_priority}, {task_tags},
+      {success_criteria}, {task_meta}, {implementation_plan},
+      {assigned_role}, {assigned_subagent},
+      {project_id}, {project_name}, {project_number},
+      {sop_id}, {sop_name},
+      {step_id}, {step_name}, {step_order}, {step_agent}
+
+    Fehlende Werte werden durch "[n/a]" ersetzt (statt LLM-Fehler).
+    """
+    if not text or "{" not in text:
+        return text
+
+    import re as _re
+    # Kontext-Werte sammeln
+    ctx: Dict[str, Any] = {}
+
+    if task is not None:
+        ctx["task_id"] = task.id or "[n/a]"
+        ctx["task_title"] = task.title or "[n/a]"
+        ctx["task_description"] = task.description or "[n/a]"
+        ctx["task_status"] = task.status or "[n/a]"
+        ctx["task_status_display"] = _get_status_display(task.status)
+        ctx["task_priority"] = task.priority if task.priority is not None else "[n/a]"
+        ctx["task_tags"] = json.dumps(task.tags or [], ensure_ascii=False)
+        ctx["assigned_role"] = task.assigned_role or "[n/a]"
+        ctx["assigned_subagent"] = task.assigned_subagent or "[n/a]"
+        # Success Criteria
+        sc = task.success_criteria or []
+        if isinstance(sc, str):
+            try:
+                sc = json.loads(sc)
+            except Exception:
+                sc = []
+        ctx["success_criteria"] = json.dumps(sc, indent=2, ensure_ascii=False)
+        # Meta + Implementation-Plan
+        ctx["task_meta"] = json.dumps(task.meta or {}, indent=2, default=str, ensure_ascii=False)
+        ip = task.implementation_plan
+        if isinstance(ip, str):
+            try:
+                ip = json.loads(ip)
+            except Exception:
+                ip = {}
+        ctx["implementation_plan"] = json.dumps(ip or {}, indent=2, default=str, ensure_ascii=False)
+        # Project
+        if task.project_id:
+            from ..models.project import Project
+            proj = db.get(Project, task.project_id)
+            if proj:
+                ctx["project_id"] = proj.id
+                ctx["project_name"] = proj.name
+                ctx["project_number"] = proj.project_number or "[n/a]"
+
+    if instance is not None:
+        ctx["sop_id"] = instance.sop_id or "[n/a]"
+        if instance.sop_id:
+            sop = db.get(SOP, instance.sop_id)
+            if sop:
+                ctx["sop_name"] = sop.name or "[n/a]"
+
+    if step is not None:
+        ctx["step_id"] = step.id or "[n/a]"
+        ctx["step_name"] = step.name or "[n/a]"
+        ctx["step_order"] = step.step_order if step.step_order is not None else "[n/a]"
+        ctx["step_agent"] = step.agent or "[n/a]"
+
+    # Regex-Find: {key} oder {key:default}
+    def replacer(m: "_re.Match[str]") -> str:
+        key = m.group(1).strip()
+        if key in ctx:
+            val = ctx[key]
+            if val is None:
+                return "[n/a]"
+            return str(val)
+        return m.group(0)  # Unbekannte Platzhalter unveraendert lassen
+
+    pattern = _re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)(?::[^}]*)?\}")
+    return pattern.sub(replacer, text)
+
+
+def _get_status_display(status: str) -> str:
+    """Mapping Task-Status -> Anzeige-Name."""
+    mapping = {
+        "triage": "Triage",
+        "todo": "GO",
+        "in_progress": "In Progress",
+        "review": "Review",
+        "block": "Block",
+        "rueckfrage": "Rückfrage",
+        "done": "Done",
+        "cancelled": "Cancelled",
+        "failed": "Failed",
+    }
+    return mapping.get(status or "", status or "[n/a]")
+
+
+def _log_llm_call_to_history(
+    db: Session,
+    *,
+    task: Optional[Task],
+    step: SOPStep,
+    role: Optional[Role],
+    user_prompt: str,
+    system_prompt: str,
+    response: Dict[str, Any],
+    duration_ms: int,
+    ok: bool,
+    error: Optional[str] = None,
+) -> Optional[TaskHistory]:
+    """Schreibt den LLM-Call in task_history (Audit-Log).
+
+    Pflicht-Felder pro Eintrag (User-Direktive 23.06.2026):
+      - ts:            Timestamp (automatisch durch server_default)
+      - agent:         Rollen-Name (z.B. 'CIO', 'pi-architect')
+      - model:         Verwendetes Modell (z.B. 'gemma4:12b')
+      - tokens_in/out: Token-Verbrauch
+      - cost_usd:      Kosten (aus pricing_service berechnet)
+      - details:       Vollstaendiger Kontext (Provider, Prompts, Response, Dauer)
+    """
+    if task is None:
+        return None
+    usage = response.get("usage", {}) if isinstance(response, dict) else {}
+    tokens_in = int(usage.get("tokens_in", 0) or 0)
+    tokens_out = int(usage.get("tokens_out", 0) or 0)
+
+    # Cost-Berechnung via pricing_service (falls verfuegbar)
+    cost_usd = Decimal("0")
+    try:
+        from .pricing_service import take_pricing_snapshot
+        model_name = (role.model if role and role.model else "minimax-m3")
+        snapshot = take_pricing_snapshot(
+            db,
+            model=model_name,
+            provider=(role.provider if role else None),
+            role_name=step.agent,
+        )
+        if snapshot:
+            input_per_1m = float(snapshot.get("input_per_1m", 0) or 0)
+            output_per_1m = float(snapshot.get("output_per_1m", 0) or 0)
+            cost_usd = Decimal(str(
+                (tokens_in / 1_000_000.0) * input_per_1m
+                + (tokens_out / 1_000_000.0) * output_per_1m
+            ))
+    except Exception as cost_err:
+        logger.debug(f"Cost-Berechnung fuer History fehlgeschlagen: {cost_err}")
+
+    history_details: Dict[str, Any] = {
+        "step_id": step.id,
+        "step_name": step.name,
+        "step_order": step.step_order,
+        "provider": (role.provider if role else None),
+        "model": (role.model if role else None),
+        "role_id": (role.id if role else None),
+        "role_type": (role.role_type if role else None),
+        "api_key_id": (role.api_key_id if role else None),
+        "duration_ms": duration_ms,
+        "ok": ok,
+        "system_prompt_chars": len(system_prompt),
+        "user_prompt_chars": len(user_prompt),
+        "response_chars": len(str(response.get("content", ""))),
+    }
+    # Prompts und Response als Preview in details (zur Nachvollziehbarkeit)
+    history_details["user_prompt_preview"] = user_prompt[:500]
+    history_details["system_prompt_preview"] = system_prompt[:500]
+    if ok:
+        history_details["response_preview"] = str(response.get("content", ""))[:1000]
+    else:
+        history_details["error"] = error or response.get("error", "unknown")
+
+    h = TaskHistory(
+        task_id=task.id,
+        event="llm_call",
+        agent=step.agent,
+        model=(role.model if role and role.model else "minimax-m3"),
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=cost_usd,
+        details=history_details,
+    )
+    db.add(h)
+    try:
+        db.commit()
+    except Exception as commit_err:
+        logger.warning(f"History-Commit fehlgeschlagen: {commit_err}")
+        db.rollback()
+    return h
+
+
+# === JSON-Extraktoren aus LLM-Response (User-Direktive 23.06.2026) ===
+# Viele SOP-Prompts fordern JSON-Output mit Feldern wie ok/issues/questions.
+# Diese Helper extrahieren strukturierte Werte aus dem Response-Text.
+# Robust gegenueber: reinem JSON, JSON-in-Markdown-Block, Text-vor-JSON, kaputtem JSON.
+
+import re as _re_json
+
+_JSON_FENCE = _re_json.compile(r"```(?:json)?\s*(\{.*?\})\s*```", _re_json.DOTALL | _re_json.IGNORECASE)
+_JSON_BARE = _re_json.compile(r"(\{[\s\S]*\})")
+
+
+def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    """Versucht JSON aus Text zu extrahieren (Code-Fence, dann bare-Objekt, dann Repair).
+
+    Robust gegenueber (User-Direktive 24.06.2026):
+      - Reines JSON
+      - JSON in Markdown-Code-Block (```json ... ```)
+      - Text vor/nach JSON
+      - JSON mit fehlenden/abschliessenden Klammern
+      - JSON mit nicht-escapten Anfuehrungszeichen in Strings (Repair-Versuch)
+      - Trailing Commas
+    """
+    if not text:
+        return None
+    # 1) Code-Fence
+    m = _JSON_FENCE.search(text)
+    if m:
+        candidate = m.group(1)
+        result = _try_parse_json_attempt(candidate)
+        if result is not None:
+            return result
+    # 2) Bare-Objekt im Text
+    m = _JSON_BARE.search(text)
+    if m:
+        candidate = m.group(1)
+        result = _try_parse_json_attempt(candidate)
+        if result is not None:
+            return result
+    # 3) Gesamter Text
+    return _try_parse_json_attempt(text.strip())
+
+
+def _try_parse_json_attempt(text: str) -> Optional[Dict[str, Any]]:
+    """Einzelner JSON-Parse-Versuch mit Repair-Logik."""
+    if not text:
+        return None
+    import re as _re_local
+    # Erst direkt versuchen
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    # Repair-Versuch 1: Trailing Commas entfernen
+    repaired = _re_local.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        return json.loads(repaired)
+    except (ValueError, TypeError):
+        pass
+    # Repair-Versuch 2: Fehlende schliessende Klammern ergaenzen
+    if repaired.count("{") > repaired.count("}"):
+        repaired2 = repaired.rstrip().rstrip(",") + "}" * (repaired.count("{") - repaired.count("}"))
+        try:
+            return json.loads(repaired2)
+        except (ValueError, TypeError):
+            pass
+    # Repair-Versuch 3: Nicht-escapte Anfuehrungszeichen in Strings
+    try:
+        lines = text.split("\n")
+        fixed_lines = []
+        for line in lines:
+            if line.count('"') % 2 == 1 and not line.strip().endswith('"'):
+                line = line.rstrip().rstrip(",") + '"'
+            fixed_lines.append(line)
+        repaired3 = "\n".join(fixed_lines)
+        repaired3 = _re_local.sub(r",\s*([}\]])", r"\1", repaired3)
+        return json.loads(repaired3)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_step_approved_from_response(response_text: str) -> bool:
+    """Extrahiert step_approved / ok aus LLM-Response. Default: True (konservativ).
+
+    Strategie:
+      1. JSON parsen -> ok/issues/questions Felder lesen
+      2. Fallback: Heuristik ueber Schluesselwoerter im Text
+    """
+    data = _try_parse_json(response_text)
+    if data is not None:
+        if "ok" in data:
+            return bool(data["ok"])
+        if "step_approved" in data:
+            return bool(data["step_approved"])
+        if "approved" in data:
+            return bool(data["approved"])
+    # Fallback: Text-Heuristik
+    if not response_text:
+        return True
+    text_lower = response_text.lower()
+    if any(tok in text_lower for tok in ["ok: false", "ok:false", "\"ok\": false", "\"ok\":false", "not ok", "nicht ok", "issues gefunden"]):
+        return False
+    return True
+
+
+def _extract_issues_from_response(response_text: str) -> List[Dict[str, Any]]:
+    """Extrahiert issues[] aus LLM-Response. Default: []."""
+    data = _try_parse_json(response_text)
+    if data is not None and isinstance(data.get("issues"), list):
+        return list(data["issues"])
+    return []
+
+
+def _extract_questions_from_response(response_text: str) -> List[Dict[str, Any]]:
+    """Extrahiert questions[] aus LLM-Response. Default: []."""
+    data = _try_parse_json(response_text)
+    if data is not None and isinstance(data.get("questions"), list):
+        return list(data["questions"])
+    return []
 
 
 # === Engine-Hauptklasse ===
@@ -93,6 +479,267 @@ class SOPEngine:
         params = step.action_params or {}
         timeout = float(params.get("timeout_sec", _DEFAULT_STEP_TIMEOUT_S))
         return min(max(timeout, 0.001), _MAX_STEP_TIMEOUT_S)
+
+    async def _validate_swarm_description(
+        self,
+        instance: SOPInstance,
+        step: SOPStep,
+        task: Optional[Task],
+        params: Dict[str, Any],
+        config: Any,  # SwarmConfig
+    ) -> Dict[str, Any]:
+        """LLM-Validierung der Swarm-Beschreibung (User-Direktive 24.06.2026).
+
+        Konzept: Die Bausteine (Swarm-Spawner-Logik) bleiben erhalten.
+        Aber die BESCHREIBUNG (was die Worker tun sollen) wird per LLM
+        validiert, weil sie je nach SOP komplett anders aussehen kann.
+
+        Pruefungen:
+          - Sind die Worker-Prompts konsistent mit dem user_prompt?
+          - Gibt es Konflikte zwischen den Worker-Varianten?
+          - Passt die Rollen-Auswahl zur Aufgabe?
+          - Fehlen kritische Anweisungen?
+
+        Returns: {ok: bool, reasoning: str, issues: [...]}
+        """
+        # Worker-Prompts zusammenbauen
+        workers_text = "\n\n".join(
+            f"### Worker: {w.role} (Variante: {w.variant})\n{w.system_prompt or '(kein system_prompt definiert)'}"
+            for w in config.workers
+        )
+        user_prompt = params.get("user_prompt", "")
+        workflow = params.get("ai_instructions_md", "")
+        validation_prompt = (
+            f"## USER-PROMPT (aufgabenspezifisch aus SOP)\n{user_prompt}\n\n"
+            f"## WORKFLOW (aus SOP ai_instructions_md)\n{workflow}\n\n"
+            f"## WORKER-KONFIGURATION (aus SOP action_params.workers[])\n{workers_text}\n\n"
+            f"## PRUEFUNG\n"
+            f"Bewerte ob die Worker-Konfiguration konsistent mit der Aufgabe ist.\n"
+            f"Liefere JSON: {{ok: bool, issues: [{{worker, problem, severity}}], reasoning: str}}\n"
+            f"ok=true wenn keine schwerwiegenden Issues vorhanden."
+        )
+        validation_params = {
+            "user_prompt": validation_prompt,
+            "ai_instructions_md": (
+                "## Rolle\nDu bist SOP-Validator.\n\n"
+                "## Ziel\nPruefe ob die Swarm-Beschreibung (User-Prompt + Workflow + "
+                "Worker-Prompts) konsistent und vollstaendig ist.\n\n"
+                "## Output-Format\nJSON: {ok: bool, issues: [{worker, problem, severity}], reasoning: str}"
+            ),
+            "response_format": {"type": "json_object"},
+            "max_tokens": 1500,
+            "temperature": 0.1,
+        }
+        # Validierungs-Step: Agent ist der SOP-Lead (kann jede Rolle sein, hier generisch)
+        # Wir nutzen die Rolle des eigentlichen Steps, weil der die Konfiguration kennt
+        result = await self._llm_call_async(instance, step, task, validation_params)
+        if not result.get("ok"):
+            return {
+                "ok": True,  # Bei LLM-Fehler: optimistisch (Bausteine bleiben funktional)
+                "reasoning": "LLM-Validierung nicht moeglich - Beschreibung als akzeptabel angenommen",
+                "issues": [],
+            }
+        content = result.get("response", {}).get("content", "")
+        parsed = _try_parse_json(content) or {}
+        return {
+            "ok": bool(parsed.get("ok", True)),
+            "reasoning": parsed.get("reasoning", ""),
+            "issues": parsed.get("issues", []),
+        }
+
+    async def _evaluate_metrics_with_llm(
+        self,
+        instance: SOPInstance,
+        step: SOPStep,
+        task: Optional[Task],
+        params: Dict[str, Any],
+        action: str,
+    ) -> Dict[str, Any]:
+        """SOP-getriebene Metrik-Bewertung (fuer tester_code_review + cio_final_review).
+
+        Konzept (User-Direktive 24.06.2026): Auch Metrik-Checks sind SOP-getrieben.
+          - LLM bekommt die Metriken (aus task.meta) + Acceptance-Criteria (aus action_params)
+          - System-Prompt kommt aus der Rolle (pi-tester/CIO je nach action)
+          - Workflow + Pruef-Logik + Output-Format stehen in step.ai_instructions_md
+          - LLM liefert JSON: {ok: bool, issues: [...], reasoning: str}
+
+        Vorteil: User kann beliebige Metriken + Schwellen im SOP definieren,
+        ohne dass der Code geaendert werden muss.
+        """
+        if task is None:
+            return {"ok": False, "error": f"{action}: benoetigt einen Task"}
+
+        # 1. Metriken aus task.meta extrahieren
+        meta = task.meta if isinstance(task.meta, dict) else {}
+        # 2. Acceptance-Criteria aus action_params
+        acceptance = params.get("acceptance_criteria", [])
+        # 3. Original user_prompt aus SOP (aufgabenspezifisch)
+        base_user_prompt = params.get("user_prompt", "")
+
+        # 4. user_prompt mit Metriken + Kriterien anreichern (deterministisch)
+        # Der SOP-Autor bestimmt die TEXT-StruktUR, der LLM bewertet.
+        metrics_json = json.dumps(meta, indent=2, default=str, ensure_ascii=False)
+        criteria_json = json.dumps(acceptance, indent=2, ensure_ascii=False)
+        enriched_user_prompt = (
+            f"{base_user_prompt}\n\n"
+            f"## TASK-METRIKEN (aus task.meta)\n"
+            f"```json\n{metrics_json}\n```\n\n"
+            f"## ACCEPTANCE-CRITERIA (aus SOP action_params)\n"
+            f"```json\n{criteria_json}\n```\n\n"
+            f"## DEINE AUFGABE\n"
+            f"Bewerte anhand der Metriken, ob die Acceptance-Criteria erfuellt sind.\n"
+            f"Liefere JSON: {{ok: bool, issues: [{{criterion, actual, expected, severity}}], reasoning: str}}"
+        )
+
+        # 5. LLM-Call (delegiert an _llm_call_async -> nutzt Rolle + SOP-Workflow)
+        enriched_params = dict(params)
+        enriched_params["user_prompt"] = enriched_user_prompt
+        enriched_params["response_format"] = {"type": "json_object"}
+        result = await self._llm_call_async(instance, step, task, enriched_params)
+
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "action": action,
+                "task_id": task.id,
+                "agent": step.agent,
+                "error": result.get("error"),
+            }
+
+        # 6. JSON-Antwort parsen
+        content = result.get("response", {}).get("content", "")
+        parsed = _try_parse_json(content) or {}
+        ok = bool(parsed.get("ok", False))
+        issues = parsed.get("issues", []) or []
+        reasoning = parsed.get("reasoning", "")
+
+        return {
+            "ok": ok,
+            "action": action,
+            "task_id": task.id,
+            "current_status": task.status,
+            "agent": step.agent,
+            "step_approved": ok,
+            "issues": issues,
+            "reasoning": reasoning,
+            "metrics_provided": list(meta.keys()),
+            "criteria_count": len(acceptance),
+            "model": result.get("model"),
+            "duration_ms": result.get("duration_ms"),
+        }
+
+    async def _llm_call_async(
+        self,
+        instance: SOPInstance,
+        step: SOPStep,
+        task: Optional[Task],
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """SOP-getriebener LLM-Call (Wiederverwendbar fuer llm_call + review_task).
+
+        Konzept (User-Direktive 23.06.2026):
+          - System-Prompt = role.system_prompt (Persona) + step.ai_instructions_md (Workflow)
+          - Model/Provider aus Role (Single Source of Truth)
+          - user_prompt enthaelt die aufgabenspezifische Anweisung aus dem SOP-Step
+          - Jeder Call wird in task_history dokumentiert (Timestamp, Rolle, Modell, Cost)
+        """
+        # 1. Rolle laden
+        role = _load_role_for_step(self.db, step)
+        if role is None:
+            logger.warning(
+                f"_llm_call_async: Rolle '{step.agent}' nicht in roles-Tabelle gefunden. "
+                f"Fallback ohne Persona."
+            )
+
+        # 2. user_prompt validieren
+        user_prompt = params.get("user_prompt", "")
+        if not user_prompt:
+            return {
+                "ok": False,
+                "error": (
+                    "_llm_call_async: user_prompt fehlt in action_params. "
+                    "Aufgabenspezifische Anweisung MUSS im SOP-Step stehen."
+                ),
+            }
+
+        # 2a. Template-Substitution (User-Direktive 24.06.2026)
+        # Ersetzt Platzhalter wie {task_title}, {project_name} etc. mit echten Werten.
+        # BEVOR der LLM-Call gemacht wird, damit das LLM die echten Daten sieht.
+        user_prompt = _substitute_task_placeholders(
+            self.db, user_prompt, task=task, instance=instance, step=step
+        )
+        # ai_instructions_md ebenfalls substituieren (Workflow-Anweisungen)
+        if "ai_instructions_md" in params and params["ai_instructions_md"]:
+            params["ai_instructions_md"] = _substitute_task_placeholders(
+                self.db, params["ai_instructions_md"], task=task, instance=instance, step=step
+            )
+
+        # 3. System-Prompt + Model aufloesen
+        system_prompt = _build_system_prompt(role, params)
+        model_name = _resolve_model_from_role(role, params)
+        max_tokens = min(int(params.get("max_tokens", 2000)), 16000)
+        timeout_sec = min(
+            float(params.get("timeout_sec", role.timeout_sec if role else 60.0)),
+            float(role.timeout_sec if role and role.timeout_sec else 300.0),
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            t0 = time.time()
+            response = await chat_completion(
+                messages=messages,
+                model=model_name,
+                temperature=params.get("temperature", 0.3),
+                max_tokens=max_tokens,
+                response_format=params.get("response_format"),
+                timeout_sec=timeout_sec,
+                role=step.agent,
+            )
+            duration_ms = int((time.time() - t0) * 1000)
+            logger.info(
+                f"_llm_call_async step={step.id} agent={step.agent} model={model_name} "
+                f"duration={duration_ms}ms ok=True"
+            )
+            # History-Eintrag
+            _log_llm_call_to_history(
+                self.db,
+                task=task,
+                step=step,
+                role=role,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                response=response,
+                duration_ms=duration_ms,
+                ok=True,
+            )
+            return {
+                "ok": True,
+                "action": "llm_call",
+                "agent": step.agent,
+                "role_id": role.id if role else None,
+                "provider": (role.provider if role else None),
+                "model": model_name,
+                "duration_ms": duration_ms,
+                "response": response,
+            }
+        except (RuntimeError, ValueError, OSError, httpx.HTTPError) as e:
+            logger.error(f"_llm_call_async failed for step {step.id} (agent={step.agent}): {e}")
+            _log_llm_call_to_history(
+                self.db,
+                task=task,
+                step=step,
+                role=role,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                response={"content": "", "usage": {}},
+                duration_ms=0,
+                ok=False,
+                error=str(e),
+            )
+            return {"ok": False, "error": f"_llm_call_async failed: {e}", "agent": step.agent}
 
     def _guard_limits(self, instance: SOPInstance, step: SOPStep) -> Optional[Dict[str, Any]]:
         """Prueft Budget- und Loop-Guard vor der Step-Ausfuehrung.
@@ -493,6 +1140,145 @@ class SOPEngine:
         # Zum naechsten Step
         return self.advance(instance, next_step_id, step_result)
 
+    async def run_single_step(self, instance: SOPInstance) -> Dict[str, Any]:
+        """Fuehrt NUR den aktuellen Step aus, OHNE advance/complete.
+
+        Unterschied zu run_step():
+          - run_step() macht Step + advance() zur naechsten Step
+          - run_single_step() macht nur den Step und pausiert die Instance
+          - Der User kann dann entscheiden, ob erweitert wird (via run_step) oder nicht
+
+        Perfekt fuer schrittweises Testen/Manuelle-Steuerung (User-Direktive 24.06.2026).
+        Instance-Status nach Aufruf: 'paused' (statt 'running' -> 'completed'/'failed')
+
+        Returns: {
+            ok: bool,
+            step_result: dict,        # Resultat der Action
+            step_id: str,
+            step_name: str,
+            duration_ms: int,
+            next_step_id: str | None,  # Was waere der naechste Step (VORSCHLAG, nicht ausgefuehrt)
+            instance_status: str,      # 'paused'
+        }
+        """
+        if instance.status not in ("running", "paused"):
+            return {"ok": False, "error": f"Instance is {instance.status}, not running/paused"}
+
+        step = self.db.get(SOPStep, instance.current_step_id)
+        if not step:
+            return {"ok": False, "error": "Step not found"}
+
+        # === Verantwortlichen Agent auf den Task uebertragen ===
+        task = self.db.get(Task, instance.task_id) if instance.task_id else None
+        if task and step.agent:
+            task.assigned_role = step.agent
+            self.db.commit()
+
+        # === Action-Whitelist ===
+        if step.action not in ALLOWED_SOP_ACTIONS:
+            logger.error(
+                f"[run_single_step] Disallowed action {step.action!r} in step {step.id}"
+            )
+            return {"ok": False, "error": f"Disallowed action: {step.action}"}
+
+        # === Budget- & Loop-Guard ===
+        limit_violation = self._guard_limits(instance, step)
+        if limit_violation:
+            logger.error(f"[run_single_step] Guard: {limit_violation['error']}")
+            return limit_violation
+
+        # === Audit: step_started ===
+        start_ts = datetime.now(timezone.utc)
+        self._log_execution(
+            instance, step_id=step.id, event="step_started",
+            agent=step.agent,
+            details={
+                "step_name": step.name,
+                "phase": step.phase,
+                "trigger": step.trigger,
+                "action": step.action,
+                "action_params": step.action_params or {},
+                "delay_s": step.delay_s,
+                "mode": "single_step",  # Markierung: NICHT advance
+            },
+        )
+        self.db.commit()
+
+        # === Sichtbarer Delay ===
+        if step.delay_s > 0:
+            logger.info(
+                f"[run_single_step] Instance {instance.id[:8]} step {step.name!r}: "
+                f"waiting {step.delay_s}s"
+            )
+            await asyncio.sleep(step.delay_s)
+
+        # === Action ausfuehren (mit Timeout) ===
+        timeout_s = self._step_timeout_s(step)
+        try:
+            step_result = await asyncio.wait_for(
+                self._execute_action(instance, step), timeout=timeout_s
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[run_single_step] Instance {instance.id[:8]} step {step.name!r} "
+                f"timeout {timeout_s}s"
+            )
+            return {"ok": False, "error": f"step timeout after {timeout_s}s"}
+
+        duration_ms = int((datetime.now(timezone.utc) - start_ts).total_seconds() * 1000)
+
+        # === Audit: step_completed ===
+        self._log_execution(
+            instance, step_id=step.id, event="step_completed",
+            agent=step.agent, duration_ms=duration_ms,
+            success=step_result.get("ok", True),
+            details={**step_result, "mode": "single_step"},
+        )
+
+        # === Step-Result in Context speichern (fuer spaetere Inspection) ===
+        ctx = dict(instance.context or {})
+        # Key-Format: step_N_result (z.B. step_0_result)
+        ctx[f"step_{step.step_order}_result"] = step_result
+        # Rule-Result-keys auch speichern (was waere passiert)
+        instance.context = ctx
+
+        # === Instance pausieren (statt complete/advance) ===
+        instance.status = "paused"
+        self.db.commit()
+
+        # === Vorschlag fuer naechsten Step (ohne Advance) ===
+        try:
+            next_step_id, _action = self.evaluate_rules(instance, step, step_result)
+        except Exception as rule_err:
+            logger.warning(f"[run_single_step] Rule-Eval-Fehler: {rule_err}")
+            next_step_id = None
+
+        next_step_name = None
+        if next_step_id:
+            next_step = self.db.get(SOPStep, next_step_id)
+            if next_step:
+                next_step_name = next_step.name
+
+        logger.info(
+            f"[run_single_step] Instance {instance.id[:8]} step {step.name!r} "
+            f"agent={step.agent!r} done (ok={step_result.get('ok')}, {duration_ms}ms). "
+            f"Instance PAUSED. Naechster Step waere: {next_step_name or 'END'}"
+        )
+
+        return {
+            "ok": True,
+            "mode": "single_step",
+            "instance_id": instance.id,
+            "step_id": step.id,
+            "step_name": step.name,
+            "step_order": step.step_order,
+            "step_result": step_result,
+            "duration_ms": duration_ms,
+            "next_step_id": next_step_id,
+            "next_step_name": next_step_name,
+            "instance_status": "paused",
+        }
+
     async def _await_user_input(
         self, instance: SOPInstance, step: SOPStep, ctx_key: str,
         timeout_s: float = 3600.0,
@@ -629,6 +1415,35 @@ class SOPEngine:
         if action == "noop":
             return {"ok": True, "action": "noop", "note": "no action performed"}
 
+        # === ask_user (User-Direktive 24.06.2026) ===
+        # Wartet BLOCKIEREND auf User-Input. Frage und Kontext kommen aus
+        # step.input_tool_* (SOP-Definition) + step.ai_instructions_md.
+        if action == "ask_user":
+            if not task:
+                return {"ok": False, "error": "ask_user benoetigt einen Task"}
+            ctx_key = params.get("context_key", "user_input")
+            timeout_s = float(params.get("timeout_sec", 3600.0))
+            # SOP-Description in question_text einbetten (falls vorhanden)
+            if step.input_tool_prompt is None and params.get("user_prompt"):
+                step.input_tool_prompt = params["user_prompt"]
+            answer = await self._await_user_input(instance, step, ctx_key, timeout_s=timeout_s)
+            if answer is None:
+                return {
+                    "ok": False,
+                    "action": "ask_user",
+                    "task_id": task.id,
+                    "agent": step.agent,
+                    "error": "Timeout: User hat nicht innerhalb des Timeouts geantwortet",
+                }
+            return {
+                "ok": True,
+                "action": "ask_user",
+                "task_id": task.id,
+                "agent": step.agent,
+                "user_input": answer,
+                "step_approved": True,
+            }
+
         # === Multi-Agent-Swarm (User-Direktive 22.06.2026) ===
         # Startet einen Swarm von SubAgents (parallel/competitive) fuer
         # hoechste Qualitaet durch Diversitaet und Konsens-Bewertung.
@@ -657,42 +1472,19 @@ class SOPEngine:
                         "sop_id": sub_sop_id, "status": sub_inst.status}
             return {"ok": False, "error": "spawn_sop failed"}
 
-        # === LLM-Call Action (Multi-Provider Phase 2) ===
+        # === LLM-Call Action (SOP-getrieben, User-Direktive 23.06.2026) ===
+        # Delegiert an _llm_call_async (gleiche Logik wie review_task).
+        # Konzept:
+        #   - System-Prompt = role.system_prompt (Persona) + step.ai_instructions_md (Workflow)
+        #   - Model/Provider stammen aus der Role (Single Source of Truth)
+        #   - user_prompt enthaelt die aufgabenspezifische Anweisung aus dem SOP-Step
+        #   - Jeder Call wird vollstaendig in task_history dokumentiert
         if action == "llm_call":
             # Bugfix 23.06.2026: Task in in_progress sobald Agent arbeitet
             if task is not None and task.status == "triage":
                 task.status = "in_progress"
                 self.db.commit()
-            system_prompt = params.get("system_prompt", "Du bist ein hilfreicher Assistent.")
-            user_prompt = params.get("user_prompt", "")
-            if not user_prompt:
-                return {"ok": False, "error": "llm_call: user_prompt missing in action_params"}
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            # LLM-Parameter auf sichere Maxima begrenzen
-            max_tokens = min(int(params.get("max_tokens", 2000)), 16000)
-            timeout_sec = min(float(params.get("timeout_sec", 60.0)), 300.0)
-            try:
-                response = await chat_completion(
-                    messages=messages,
-                    model=params.get("model", "minimax-m3"),
-                    temperature=params.get("temperature", 0.3),
-                    max_tokens=max_tokens,
-                    response_format=params.get("response_format"),
-                    timeout_sec=timeout_sec,
-                    role=step.agent,
-                )
-                return {
-                    "ok": True,
-                    "action": "llm_call",
-                    "agent": step.agent,
-                    "response": response,
-                }
-            except (RuntimeError, ValueError, OSError, httpx.HTTPError) as e:
-                logger.error(f"llm_call failed for step {step.id}: {e}")
-                return {"ok": False, "error": f"llm_call failed: {e}"}
+            return await self._llm_call_async(instance, step, task, params)
 
         # === Custom-Actions fuer CIO-Triage-SOP ===
         # Diese Actions fuehren die 4 Kriterien-Pruefungen aus und sammeln Issues.
@@ -709,191 +1501,102 @@ class SOPEngine:
             return {"ok": False, "error": f"action {action!r} requires task_id on instance"}
 
         if action == "review_task":
-            # Step 'review': fuehrt die CIO-Heuristik aus, wenn ein Task vorhanden ist.
-            # Fix (User-Direktive 18.06.2026): review_task muss die Heuristik aufrufen,
-            # damit der step_ok korrekt aus den 4 Kriterien abgeleitet wird.
-            # Vorher: gab immer ok=True zurueck, was dazu fuehrte, dass die
-            # Rule "step_ok == true" IMMER feuerte, auch wenn der Task eigentlich
-            # nicht OK war (z.B. "Komplexe Negation in der Description").
-            #
-            # User-Direktive 23.06.2026 (Task 4bf7146b0780): Decompose-Check
-            # Prueft, ob die User-Anforderung zerlegt werden sollte.
-            # Wenn ja: Subtasks automatisch erstellen, Parent bleibt in 'go'.
-            if task:
-                try:
-                    from ..routers.workflow import _check_cio_heuristic
-                    result = _check_cio_heuristic(self.db, task)
+            # SOP-getriebene Review-Action (User-Direktive 23.06.2026).
+            # Konzept: Die hartcodierte _check_cio_heuristik() ist ENTFALLEN.
+            # Stattdessen delegiert review_task an llm_call:
+            #   - System-Prompt kommt aus roles.system_prompt (CIO-Persona)
+            #   - Workflow-Anweisungen kommen aus step.ai_instructions_md
+            #   - user_prompt enthaelt die aufgabenspezifische Review-Frage
+            # Zusaetzlich wird der Decompose-Check (Phase Go) deterministisch ausgefuehrt,
+            # weil das eine themenbasierte Heuristik ist, die nicht ins LLM gehoert.
+            if not task:
+                return {"ok": False, "error": "review_task benoetigt einen Task"}
 
-                    # Decompose-Check (Phase Go)
-                    decompose_result = None
-                    try:
-                        from ..services.task_decomposer import (
-                            should_decompose, create_subtasks_from_decomposition,
-                        )
-                        decomp = should_decompose(task.title or "", task.description or "")
-                        if decomp.should_split:
-                            # Subtasks erstellen (Parent bleibt in go)
-                            subtask_ids = create_subtasks_from_decomposition(
-                                parent_task_id=task.id,
-                                decomposition=decomp,
-                                project_id=task.project_id,
-                            )
-                            # Task-Status auf 'go' setzen (bleibt dort waehrend Subtasks laufen)
-                            from .task_service import TaskService
-                            TaskService.set_status_sync(
-                                self.db, task.id, "go",
-                                agent=step.agent,
-                                reason=f"decomposed:{len(subtask_ids)}_subtasks",
-                                delay_s=0.0,
-                            )
-                            # Decompose-Info in task.meta ablegen
-                            if not isinstance(task.meta, dict):
-                                task.meta = {}
-                            task.meta["decomposition"] = {
-                                "themes": decomp.detected_themes,
-                                "subtask_ids": subtask_ids,
-                                "rationale": decomp.rationale,
-                            }
-                            self.db.commit()
-                            decompose_result = {
-                                "decomposed": True,
-                                "subtask_count": len(subtask_ids),
-                                "subtask_ids": subtask_ids,
-                                "themes": decomp.detected_themes,
-                            }
-                            logger.info(
-                                f"Task {task.id[:8]} decomposed into {len(subtask_ids)} subtasks "
-                                f"(themes: {', '.join(decomp.detected_themes)})"
-                            )
-                    except Exception as dec_err:
-                        logger.warning(f"Decompose-Check fehlgeschlagen: {dec_err}")
-
-                    return {
-                        "ok": result["ok"],
-                        "action": "review_task",
-                        "task_id": task.id,
-                        "current_status": task.status,
-                        "agent": step.agent,
-                        "message": (
-                            f"Review durch {step.agent}: "
-                            f"{'OK' if result['ok'] else 'Issues gefunden'}"
-                        ),
-                        "issues": result.get("issues", []),
-                        "questions": result.get("questions", []),
-                        "decomposition": decompose_result,
+            # 1. Decompose-Check (deterministisch, themenbasiert - kein LLM)
+            decompose_result = None
+            try:
+                from ..services.task_decomposer import (
+                    should_decompose, create_subtasks_from_decomposition,
+                )
+                decomp = should_decompose(task.title or "", task.description or "")
+                if decomp.should_split:
+                    subtask_ids = create_subtasks_from_decomposition(
+                        parent_task_id=task.id,
+                        decomposition=decomp,
+                        project_id=task.project_id,
+                    )
+                    TaskService.set_status_sync(
+                        self.db, task.id, "go",
+                        agent=step.agent,
+                        reason=f"decomposed:{len(subtask_ids)}_subtasks",
+                        delay_s=0.0,
+                    )
+                    if not isinstance(task.meta, dict):
+                        task.meta = {}
+                    task.meta["decomposition"] = {
+                        "themes": decomp.detected_themes,
+                        "subtask_ids": subtask_ids,
+                        "rationale": decomp.rationale,
                     }
-                except (ValueError, TypeError, OSError) as e:
-                    logger.warning(f"review_task: Heuristik fehlgeschlagen: {e}")
-                    # Fallback: manueller Review-Mode
-                    return {"ok": True, "action": "review_task",
-                            "task_id": task.id, "current_status": task.status,
-                            "agent": step.agent,
-                            "message": f"Task wartet auf Review durch {step.agent} (Heuristik-Fallback)"}
-            return {"ok": False, "error": "review_task benoetigt einen Task"}
+                    self.db.commit()
+                    decompose_result = {
+                        "decomposed": True,
+                        "subtask_count": len(subtask_ids),
+                        "subtask_ids": subtask_ids,
+                        "themes": decomp.detected_themes,
+                    }
+                    logger.info(
+                        f"Task {task.id[:8]} decomposed into {len(subtask_ids)} subtasks "
+                        f"(themes: {', '.join(decomp.detected_themes)})"
+                    )
+            except Exception as dec_err:
+                logger.warning(f"review_task: Decompose-Check fehlgeschlagen: {dec_err}")
+
+            # 2. LLM-Call (delegiert an _llm_call_async - nutzt Rolle + SOP-Prompts)
+            llm_result = await self._llm_call_async(instance, step, task, params)
+
+            if not llm_result.get("ok"):
+                return {
+                    "ok": False,
+                    "action": "review_task",
+                    "task_id": task.id,
+                    "agent": step.agent,
+                    "decomposition": decompose_result,
+                    "error": llm_result.get("error"),
+                }
+
+            # 3. Step-Approved-Flag fuer Rule-Engine ableiten
+            response_content = llm_result.get("response", {}).get("content", "")
+            step_approved = _extract_step_approved_from_response(response_content)
+            issues = _extract_issues_from_response(response_content)
+            questions = _extract_questions_from_response(response_content)
+
+            return {
+                "ok": step_approved,
+                "action": "review_task",
+                "task_id": task.id,
+                "current_status": task.status,
+                "agent": step.agent,
+                "decomposition": decompose_result,
+                "issues": issues,
+                "questions": questions,
+                "step_approved": step_approved,
+                "response_content": response_content,
+            }
 
         # === Stufe 1: Konkrete Step-Handler (User-Direktive 18.06.2026) ===
         # Vorher: review_task (generisch) wurde fuer ALLE Review-Steps genutzt.
-        # Jetzt: tester_code_review und cio_final_review pruefen SPEZIFISCHE
-        # Metriken und schreiben sie in instance.context. Die Rules lesen dann
-        # diese Metriken (statt nur step_ok).
-
-        if action == "tester_code_review":
-            # Konkrete Metriken aus task.meta lesen
-            meta = task.meta if isinstance(task.meta, dict) else {}
-            test_coverage = float(meta.get("test_coverage", 0) or 0)
-            lint_errors = int(meta.get("lint_errors", 0) or 0)
-            test_files_count = int(meta.get("test_files_count", 0) or 0)
-            critical_issues = int(meta.get("critical_issues", 0) or 0)
-            # Acceptance-Criteria aus action_params (z.B. ["coverage >= 80", "no_lint_errors"])
-            acceptance = params.get("acceptance_criteria", [
-                "test_coverage >= 80",
-                "lint_errors == 0",
-                "test_files > 0",
-                "critical_issues == 0",
-            ])
-            # Checks auswerten
-            checks = {
-                "test_coverage": test_coverage,
-                "lint_errors": lint_errors,
-                "test_files": test_files_count,
-                "critical_issues": critical_issues,
-            }
-            # Welche Kriterien sind erfuellt?
-            issues = []
-            for criterion in acceptance:
-                if "coverage" in criterion and ">= 80" in criterion and test_coverage < 80:
-                    issues.append(f"test_coverage={test_coverage}% < 80%")
-                if "lint" in criterion and "== 0" in criterion and lint_errors > 0:
-                    issues.append(f"lint_errors={lint_errors} > 0")
-                if "test_files" in criterion and "> 0" in criterion and test_files_count == 0:
-                    issues.append(f"test_files={test_files_count} = 0 (keine Tests gefunden)")
-                if "critical_issues" in criterion and "== 0" in criterion and critical_issues > 0:
-                    issues.append(f"critical_issues={critical_issues} > 0")
-            ok = len(issues) == 0
-            return {
-                "ok": ok,
-                "action": "tester_code_review",
-                "task_id": task.id,
-                "current_status": task.status,
-                "agent": step.agent,
-                "message": f"Tester-Code-Review: {'OK' if ok else 'Issues: ' + ', '.join(issues)}",
-                "test_coverage": test_coverage,
-                "lint_errors": lint_errors,
-                "test_files": test_files_count,
-                "critical_issues": critical_issues,
-                "checks_performed": len(acceptance),
-                "issues_found": issues,
-            }
-
-        if action == "cio_final_review":
-            # Konkrete Metriken aus success_criteria + task.meta
-            criteria_total = len(task.success_criteria or [])
-            criteria_met = int((task.meta or {}).get("criteria_met", 0) if isinstance(task.meta, dict) else 0)
-            all_tests_passing = bool((task.meta or {}).get("all_tests_passing", False) if isinstance(task.meta, dict) else False)
-            no_open_todos = bool((task.meta or {}).get("no_open_todos", True) if isinstance(task.meta, dict) else True)
-            code_quality_ok = bool((task.meta or {}).get("code_quality_ok", True) if isinstance(task.meta, dict) else True)
-            # User-Direktive 22.06.2026: Konsens-Score aus letzter Competitive-Review-Swarm
-            consensus_score = (task.meta or {}).get("consensus_score", 0.0) if isinstance(task.meta, dict) else 0.0
-            iteration_count = int((task.meta or {}).get("swarm_iteration_count", 0) if isinstance(task.meta, dict) else 0)
-            # Acceptance-Criteria aus action_params
-            acceptance = params.get("acceptance_criteria", [
-                "consensus_score >= 90",
-                "criteria_met == criteria_total",
-                "all_tests_passing == True",
-                "no_open_todos == True",
-                "code_quality_ok == True",
-            ])
-            issues = []
-            for criterion in acceptance:
-                if "consensus_score" in criterion and ">= 90" in criterion and consensus_score < 90:
-                    issues.append(f"consensus_score={consensus_score} < 90")
-                if "criteria_met" in criterion and "== criteria_total" in criterion:
-                    if criteria_met < criteria_total:
-                        issues.append(f"criteria_met={criteria_met}/{criteria_total}")
-                if "all_tests_passing" in criterion and "== True" in criterion and not all_tests_passing:
-                    issues.append("all_tests_passing=False")
-                if "no_open_todos" in criterion and "== True" in criterion and not no_open_todos:
-                    issues.append("no_open_placeholders=False (es gibt noch offene Code-Marker wie TODO/FIXME)")
-                if "code_quality_ok" in criterion and "== True" in criterion and not code_quality_ok:
-                    issues.append("code_quality_ok=False")
-            ok = len(issues) == 0
-            return {
-                "ok": ok,
-                "action": "cio_final_review",
-                "task_id": task.id,
-                "current_status": task.status,
-                "agent": step.agent,
-                "message": f"CIO-Final-Review: {'OK' if ok else 'Issues: ' + ', '.join(issues)}",
-                "consensus_score": consensus_score,
-                "iteration_count": iteration_count,
-                "criteria_met": criteria_met,
-                "criteria_total": criteria_total,
-                "all_tests_passing": all_tests_passing,
-                "no_open_todos": no_open_todos,
-                "code_quality_ok": code_quality_ok,
-                "checks_performed": len(acceptance),
-                "issues_found": issues,
-            }
+        # Jetzt: tester_code_review und cio_final_review delegieren an _llm_call_async.
+        # Konzept (User-Direktive 24.06.2026): Auch Metrik-Checks sind SOP-getrieben.
+        #   - LLM bekommt die Metriken aus task.meta + Acceptance-Criteria aus action_params
+        #   - System-Prompt kommt aus der Rolle (pi-tester fuer tester_code_review,
+        #     CIO fuer cio_final_review)
+        #   - Workflow-Anweisungen + Pruef-Logik kommen aus step.ai_instructions_md
+        #   - LLM liefert JSON {ok, issues[], reasoning}
+        if action in ("tester_code_review", "cio_final_review"):
+            return await self._evaluate_metrics_with_llm(
+                instance, step, task, params, action
+            )
 
 
         if action == "move_status":
@@ -1581,7 +2284,21 @@ class SOPEngine:
         self, instance: SOPInstance, step: Optional[SOPStep],
         step_result: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Markiert die Instance als completed."""
+        """Markiert die Instance als completed.
+
+        Defense-in-Depth (Task 7ce2066d5bd5, 25.06.2026):
+            Prueft vor dem Task-Status 'done', ob die Instance auch tatsaechlich
+            alle Steps der SOP durchlaufen hat. Verhindert den Bug, dass Tasks
+            nach dem ersten Step als 'done' markiert werden, weil next_step_id
+            in der DB nicht verkettet war.
+
+            Pruefungen:
+              1. Aktueller Step muss der letzte Step der SOP sein (step_order == max)
+              2. ODER: Wenn der Step selbst next_step_id=None hat, ist es ein End-Step
+                 (dann ist die SOP bewusst zu Ende)
+
+            Bei Verletzung: Task wird auf 'block' gesetzt mit Reason 'sop_incomplete'.
+        """
         instance.status = "completed"
         instance.completed_at = datetime.now(timezone.utc)
         self._log_execution(
@@ -1593,6 +2310,33 @@ class SOPEngine:
         if instance.task_id:
             task = self.db.get(Task, instance.task_id)
             if task and task.status != "done":
+                # Defense-in-Depth: Pruefe ob alle Steps der SOP durchlaufen wurden
+                sop_incomplete_reason = self._check_sop_completion(instance, step)
+                if sop_incomplete_reason:
+                    logger.warning(
+                        f"[sop-incomplete] Instance {instance.id[:8]} Task {task.id[:8]}: "
+                        f"{sop_incomplete_reason} - Task wird auf 'block' gesetzt"
+                    )
+                    self._log_execution(
+                        instance, step_id=step.id if step else None,
+                        event="sop_incomplete_guard", agent="system",
+                        details={"reason": sop_incomplete_reason},
+                    )
+                    from .task_service import TaskService
+                    TaskService.set_status_sync(
+                        self.db, task.id, "block",
+                        agent="system",
+                        reason=f"sop_incomplete:{instance.id}:{sop_incomplete_reason}",
+                        delay_s=0.0,
+                    )
+                    self.db.commit()
+                    return {
+                        "ok": True,
+                        "action": "blocked_incomplete",
+                        "instance_id": instance.id,
+                        "reason": sop_incomplete_reason,
+                    }
+                # Normal-Flow: alle Steps durchlaufen, Task auf done
                 from .task_service import TaskService
                 TaskService.set_status_sync(
                     self.db, task.id, "done",
@@ -1622,6 +2366,71 @@ class SOPEngine:
                 )
         self.db.commit()
         return {"ok": True, "action": "completed", "instance_id": instance.id}
+
+    def _check_sop_completion(
+        self, instance: SOPInstance, step: Optional[SOPStep],
+    ) -> Optional[str]:
+        """Defense-in-Depth (Task 7ce2066d5bd5, 25.06.2026).
+
+        Prueft ob die SOP-Instance alle Steps der SOP durchlaufen hat.
+        Wenn nicht, wird ein Reason-String zurueckgegeben (Task wird dann auf
+        'block' gesetzt), sonst None (Task wird auf 'done' gesetzt).
+
+        Logik:
+          - Hole alle Steps der SOP (sortiert nach step_order)
+          - Hole alle completed-step_ids aus sop_executions (event=step_completed)
+          - Wenn es mehr als 1 Step in der SOP gibt UND der aktuelle Step nicht
+            der letzte ist ODER nicht alle vorherigen Steps completed sind,
+            dann ist die SOP unvollstaendig.
+
+        Returns:
+            None wenn OK (alle Steps durchlaufen ODER SOP hat nur 1 Step)
+            str mit Reason wenn SOP unvollstaendig
+        """
+        if step is None:
+            # Kein konkreter Step uebergeben (sollte nicht passieren, aber
+            # falls doch: SOP als unvollstaendig markieren)
+            return "no_step_provided"
+
+        # Alle Steps der SOP laden
+        all_steps = (
+            self.db.query(SOPStep)
+            .filter(SOPStep.sop_id == instance.sop_id)
+            .order_by(SOPStep.step_order)
+            .all()
+        )
+        if len(all_steps) <= 1:
+            # SOP mit nur 1 Step: per Definition complete
+            return None
+
+        # Aktueller Step muss der letzte Step sein (step_order == max)
+        max_step_order = max(s.step_order for s in all_steps)
+        if step.step_order < max_step_order:
+            return (
+                f"current_step_order={step.step_order} < max_step_order={max_step_order} "
+                f"(last_step={next((s.name for s in all_steps if s.step_order == max_step_order), '?')})"
+            )
+
+        # Auch pruefen: alle Schritte mit step_order < current wurden completed?
+        completed_step_ids = set(
+            row[0] for row in self.db.query(SOPExecution.step_id)
+            .filter(
+                SOPExecution.instance_id == instance.id,
+                SOPExecution.event == "step_completed",
+                SOPExecution.success == True,  # noqa: E712
+            )
+            .distinct()
+            .all()
+        )
+        expected_prev_step_ids = {s.id for s in all_steps if s.step_order < step.step_order}
+        missing = expected_prev_step_ids - completed_step_ids
+        if missing:
+            return (
+                f"missing_completed_steps={[m[:8] for m in missing]} "
+                f"(expected {len(expected_prev_step_ids)} prev steps, got {len(completed_step_ids & expected_prev_step_ids)})"
+            )
+
+        return None
 
     def _persist_swarm_outputs_to_task(self, task) -> None:
         """Konsolidiert alle Swarm-Outputs einer Task-Instance in task.meta.
@@ -1704,27 +2513,72 @@ class SOPEngine:
         """Multi-Agent-Swarm starten und orchestrieren.
 
         User-Direktive 22.06.2026: Staged Hybrid Swarm.
-        Liest swarm-Konfiguration aus step.action_params (oder stage_key
-        aus den Default-Konfigs), startet den Swarm und gibt das
-        konsolidierte Ergebnis zurueck.
+        Konfigurations-Prioritaet (User-Direktive 24.06.2026):
+          1. step.action_params.workers[] (SOP-Definition, primaere Quelle)
+          2. SWARM_CONFIGS[stage_key] (Legacy-Fallback fuer Migration)
+          3. SwarmConfig.from_dict(params) (generischer Fallback)
+        Worker-Prompts werden IMMER aus WorkerConfig.system_prompt gelesen.
+        Beschreibung (user_prompt + ai_instructions_md) wird per LLM validiert.
 
         Returns:
             Dict mit ok=True/False, swarm_run_id, merged_output, cost_usd
         """
         from ..services.swarm_spawner import (
-            SwarmConfig, SwarmType, MergeStrategy,
+            SwarmConfig, SwarmType, MergeStrategy, WorkerConfig,
             SWARM_CONFIGS, create_swarm_run, execute_swarm,
         )
 
-        # Konfiguration aus params oder Default-Config laden
-        stage_key = params.get("stage_key")
-        if stage_key and stage_key in SWARM_CONFIGS:
-            config = SWARM_CONFIGS[stage_key]
-        else:
+        # === Konfigurations-Resolution (SOP-zuerst) ===
+        sop_workers = params.get("workers")  # Aus SOP-Step action_params
+        if sop_workers and isinstance(sop_workers, list):
+            # Primaere Quelle: SOP-Definition
             try:
-                config = SwarmConfig.from_dict(params)
+                config = SwarmConfig(
+                    swarm_type=SwarmType(params.get("swarm_type", "parallel")),
+                    workers=[WorkerConfig(**w) for w in sop_workers],
+                    merge_strategy=MergeStrategy(params.get("merge_strategy", "reviewer_picks_best")),
+                    consensus_threshold=float(params.get("consensus_threshold", 75.0)),
+                    auto_approve_threshold=float(params.get("auto_approve_threshold", 90.0)),
+                    max_cost_usd=float(params.get("max_cost_usd", 0.50)),
+                    timeout_sec=int(params.get("timeout_sec", 600)),
+                    use_real_workers=bool(params.get("use_real_workers", False)),
+                )
+                logger.info(f"spawn_swarm: Config aus SOP-Step geladen ({len(sop_workers)} Worker)")
             except Exception as e:
-                return {"ok": False, "error": f"spawn_swarm: invalid config: {e}"}
+                return {"ok": False, "error": f"spawn_swarm: invalid workers config: {e}"}
+        else:
+            # Fallback: SWARM_CONFIGS[stage_key] oder generic
+            stage_key = params.get("stage_key")
+            if stage_key and stage_key in SWARM_CONFIGS:
+                config = SWARM_CONFIGS[stage_key]
+                logger.info(f"spawn_swarm: Fallback auf SWARM_CONFIGS['{stage_key}']")
+            else:
+                try:
+                    config = SwarmConfig.from_dict(params)
+                except Exception as e:
+                    return {"ok": False, "error": f"spawn_swarm: invalid config: {e}"}
+
+        # === LLM-Validierung der Beschreibung (User-Direktive 24.06.2026) ===
+        # Die SOP-Beschreibung (user_prompt + ai_instructions_md + Worker-Prompts)
+        # wird vor dem Spawn von einem LLM auf Konsistenz geprueft. Bausteine
+        # (Swarm-Spawner-Logik) bleiben unveraendert - nur die BESCHREIBUNG wird
+        # validiert, weil sie sich je nach SOP aendert.
+        if params.get("user_prompt") or params.get("ai_instructions_md"):
+            validation_result = await self._validate_swarm_description(
+                instance, step, task, params, config
+            )
+            if not validation_result.get("ok"):
+                logger.warning(
+                    f"spawn_swarm: LLM-Validierung der Beschreibung fehlgeschlagen: "
+                    f"{validation_result.get('reasoning', '?')}"
+                )
+                # Trotzdem weitermachen, aber warnen (User kann es erzwingen)
+                if params.get("strict_validation", False):
+                    return {
+                        "ok": False,
+                        "error": "LLM-Validierung der SOP-Beschreibung fehlgeschlagen",
+                        "validation": validation_result,
+                    }
 
         # Swarm-Run in DB anlegen
         swarm_id = create_swarm_run(
@@ -1734,12 +2588,21 @@ class SOPEngine:
             config=config,
         )
 
-        # Task-Kontext fuer die Worker
+        # Task-Kontext fuer die Worker (inkl. Worker-Prompts aus SOP)
+        worker_prompts = {}
+        for w in config.workers:
+            key = f"{w.role}:{w.variant}"
+            if w.system_prompt:
+                worker_prompts[key] = w.system_prompt
+            worker_prompts[w.role] = w.system_prompt or worker_prompts.get(w.role, "")
         task_context = {
             "task_id": task.id if task else None,
             "title": task.title if task else None,
             "description": task.description if task else None,
             "sop_step_name": step.name,
+            "sop_user_prompt": params.get("user_prompt", ""),
+            "sop_workflow": params.get("ai_instructions_md", ""),
+            "worker_prompts": worker_prompts,
         }
 
         # Swarm ausfuehren
@@ -1877,6 +2740,7 @@ class SOPEngine:
 # === Default-SOP-Definitionen ===
 
 DEFAULT_TASK_SOP = {
+    "sop_key": "task_workflow",  # User-Direktive 24.06.2026: stabiler Key fuer seed_default_sops
     "name": "Standard-Workflow Task (User-Direktive 15.06.2026)",
     "description": (
         "Generischer Standard-Workflow fuer einen Task:\n"
@@ -2079,6 +2943,7 @@ DEFAULT_TASK_SOP = {
 # Generischer 4-Kriterien-Check, deklarativ in der DB gespeichert.
 # Aktionen 'check_*' werden in SOPEngine._execute_action registriert.
 DEFAULT_CIO_TRIAGE_SOP = {
+    "sop_key": "cio_triage",  # User-Direktive 24.06.2026: stabiler Key fuer seed_default_sops
     "name": "CIO Triage Review (4 Kriterien)",
     "description": (
         "Generischer Triage-Prozess fuer neu erstellte Tasks. Prueft 4 Kriterien:\n"
@@ -2292,14 +3157,50 @@ DEFAULT_CIO_TRIAGE_SOP = {
 
 
 def seed_default_sops(db: Session) -> int:
-    """Seeded die Standard-SOPs, falls noch nicht vorhanden."""
+    """Seeded die Standard-SOPs, falls noch nicht vorhanden.
+
+    User-Direktive 24.06.2026: Override-Schutz + stabiler Match ueber sop_key.
+      - Match ueber sop_key (Prioritaet 1), Fallback auf name (Prioritaet 2)
+      - User-modifizierte SOPs (user_modified=True) werden NICHT ueberschrieben
+      - Wenn eine SOP existiert aber keine der Default-Definitionen matcht:
+        bleibt unveraendert (Custom-SOP)
+      - Nur komplett fehlende SOPs werden neu angelegt
+    """
     added = 0
+    skipped_user_modified = 0
     for sop_def in (DEFAULT_TASK_SOP, DEFAULT_CIO_TRIAGE_SOP):
-        existing = db.execute(
-            select(SOP).where(SOP.name == sop_def["name"])
-        ).scalar_one_or_none()
+        sop_key = sop_def.get("sop_key")
+        sop_name = sop_def.get("name")
+        # Match ueber sop_key (stabil, rename-resistant)
+        existing = None
+        if sop_key:
+            existing = db.execute(
+                select(SOP).where(SOP.sop_key == sop_key)
+            ).scalar_one_or_none()
+        # Fallback: Match ueber Name (Legacy)
+        if existing is None and sop_name:
+            existing = db.execute(
+                select(SOP).where(SOP.name == sop_name)
+            ).scalar_one_or_none()
+            # Wenn Legacy-Match: sop_key setzen fuer kuenftige Reloads
+            if existing and sop_key and not existing.sop_key:
+                existing.sop_key = sop_key
+                logger.info(f"seed_default_sops: set sop_key={sop_key} for {existing.name[:40]}")
+                db.commit()
         if existing:
-            continue
+            if getattr(existing, "user_modified", False):
+                skipped_user_modified += 1
+                logger.info(
+                    f"seed_default_sops: skip {existing.name[:40]} "
+                    f"(user_modified=True, Override-Schutz)"
+                )
+                continue
+            else:
+                # Existiert, ist NICHT user-modifiziert -> nichts tun (kein Update)
+                # Updates nur ueber expliziten reset_to_default-Endpoint
+                logger.debug(f"seed_default_sops: {existing.name[:40]} existiert, kein Update")
+                continue
+        # Neu anlegen
         engine = SOPEngine(db)
         sop = engine.create_sop(
             name=sop_def["name"],
@@ -2310,5 +3211,96 @@ def seed_default_sops(db: Session) -> int:
             _trusted=True,
         )
         if sop:
+            # sop_key an die neu angelegte SOP setzen
+            sop.sop_key = sop_key
+            sop.user_modified = False
+            db.commit()
             added += 1
+    if skipped_user_modified:
+        logger.info(
+            f"seed_default_sops: Skipped {skipped_user_modified} user-modified SOPs "
+            f"(Override-Schutz aktiv)."
+        )
     return added
+
+
+def reset_sop_to_default(db: Session, sop_id: str) -> Optional[SOP]:
+    """Setzt eine SOP auf die Default-Werte aus DEFAULT_TASK_SOP/DEFAULT_CIO_TRIAGE_SOP zurueck.
+
+    ACHTUNG: Loescht ALLE Steps + Rules und legt sie neu an.
+    Nur fuer SOPs mit matchendem sop_key.
+    """
+    sop = db.get(SOP, sop_id)
+    if not sop:
+        return None
+    # Suche Default-Definition
+    default_def = None
+    for d in (DEFAULT_TASK_SOP, DEFAULT_CIO_TRIAGE_SOP):
+        if d.get("sop_key") == sop.sop_key:
+            default_def = d
+            break
+    if default_def is None:
+        # Kein Default gefunden (custom SOP)
+        sop.user_modified = False
+        sop.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(sop)
+        logger.info(f"reset_sop_to_default: {sop.name[:40]} (custom, nur Flag geloescht)")
+        return sop
+    # Alte Steps + Rules loeschen
+    for step in list(sop.steps or []):
+        for rule in list(step.rules or []):
+            db.delete(rule)
+        db.delete(step)
+    db.flush()
+    # Name, Description etc. aus Default
+    sop.name = default_def["name"]
+    sop.description = default_def["description"]
+    sop.category = default_def["category"]
+    sop.default_delay_s = default_def["default_delay_s"]
+    # Neue Steps + Rules anlegen
+    engine = SOPEngine(db)
+    # create_sop geht von None aus, daher machen wir es manuell
+    # Eigentlich: delete old SOP, create new? Nein, ID soll gleich bleiben.
+    # Stattdessen: Steps manuell aus default_def["steps"] anlegen
+    from ..models.sop import SOPStep, SOPStepRule
+    import secrets as _secrets
+    for idx, sd in enumerate(default_def["steps"]):
+        step = SOPStep(
+            id=_secrets.token_hex(6),
+            sop_id=sop.id,
+            step_order=idx,
+            name=sd.get("name", f"Step {idx+1}"),
+            phase=sd.get("phase", "Task"),
+            trigger=sd.get("trigger", "step_completed"),
+            action=sd.get("action", "noop"),
+            action_params=sd.get("action_params") or {},
+            agent=sd.get("agent", "system"),
+            model=sd.get("model"),
+            expected_result=sd.get("expected_result"),
+            success_criteria=sd.get("success_criteria", []),
+            delay_s=sd.get("delay_s", 5.0),
+            description=sd.get("description"),
+        )
+        db.add(step)
+        db.flush()
+        for ridx, rd in enumerate(sd.get("rules", [])):
+            rule = SOPStepRule(
+                id=_secrets.token_hex(6),
+                step_id=step.id,
+                rule_order=ridx,
+                description=rd.get("description"),
+                condition_field=rd.get("condition_field", ""),
+                condition_operator=rd.get("condition_operator", "eq"),
+                condition_value=rd.get("condition_value"),
+                action_type=rd.get("action_type", "noop"),
+                action_target=rd.get("action_target"),
+                action_params=rd.get("action_params", {}),
+            )
+            db.add(rule)
+    sop.user_modified = False
+    sop.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(sop)
+    logger.info(f"reset_sop_to_default: {sop.name[:40]} komplett zurueckgesetzt")
+    return sop

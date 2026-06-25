@@ -140,7 +140,7 @@ DEFAULT_ROLES = [
     {
         "id": "role-cio", "name": "CIO", "role_type": "org", "emoji": "🏗️",
         "description": "Technische Infrastruktur, Architektur, Security und GitHub-Backup.",
-        "provider": "ollama", "model": "gemma4:12b",
+        "provider": "minimax-direct", "model": "minimax-m3",
         "system_prompt": (
             "## Aufgabe\n"
             "Du bist CIO — verantwortlich für technische Infrastruktur, Security, Architektur und GitHub-Backup. "
@@ -165,7 +165,7 @@ DEFAULT_ROLES = [
     {
         "id": "role-cmo", "name": "CMO", "role_type": "org", "emoji": "📢",
         "description": "Marketing, Branding, Kommunikation und Positionierung.",
-        "provider": "ollama", "model": "gemma4:12b",
+        "provider": "minimax-direct", "model": "minimax-m3",
         "system_prompt": (
             "## Aufgabe\n"
             "Du bist CMO — verantwortlich für Marketing, Branding, Kommunikation und Positionierung. "
@@ -186,7 +186,7 @@ DEFAULT_ROLES = [
     {
         "id": "role-cfo", "name": "CFO", "role_type": "org", "emoji": "💰",
         "description": "Kosten, Budget, ROI und Ressourcen-Optimierung.",
-        "provider": "ollama", "model": "gemma4:12b",
+        "provider": "minimax-direct", "model": "minimax-m3",
         "system_prompt": (
             "## Aufgabe\n"
             "Du bist CFO — verantwortlich für Finanzplanung, Kostenanalyse und Ressourcen-Optimierung. "
@@ -235,23 +235,34 @@ class RoleService:
     def seed_defaults(db: Session) -> int:
         """Initialisiert die Default-Rollen, falls noch nicht vorhanden.
 
-        Idempotent: Existierende Rollen werden in-place aktualisiert
-        (emoji, system_prompt, tool_whitelist, timeout_sec, fresh_context).
-        Nur description/provider/model werden nicht ueberschrieben, falls
-        der User sie manuell geaendert hat (kein Override-Schutz in v2.0-rc,
-        wird in v2.1 mit audit-trail nachgeruestet).
+        Idempotent + User-Override-Schutz (User-Direktive 24.06.2026):
+          - Existierende Rollen mit user_modified=True werden NICHT ueberschrieben
+          - Existierende Rollen mit user_modified=False werden mit Defaults aktualisiert
+          - Nur neue Rollen werden angelegt
+          - provider/model werden fuer NICHT-user-modifizierte Rollen aktualisiert
+            (z.B. Provider-Migration: CIO: minimax → ollama)
         """
         added = 0
         updated = 0
+        skipped_user_modified = 0
         for rd in DEFAULT_ROLES:
             existing = db.execute(
                 select(Role).where(Role.name == rd["name"])
             ).scalar_one_or_none()
             if existing is None:
                 r = Role(**rd)
+                r.user_modified = False  # Neue Default-Rolle ist NICHT user-modified
                 db.add(r)
                 added += 1
             else:
+                # USER-OVERRIDE-SCHUTZ: Wenn der User die Rolle manuell geaendert hat,
+                # NICHT ueberschreiben. Verhindert Datenverlust beim Reload.
+                if getattr(existing, "user_modified", False):
+                    skipped_user_modified += 1
+                    logger.debug(
+                        f"seed_defaults: skip {existing.name} (user_modified=True, Override-Schutz)"
+                    )
+                    continue
                 # Update Felder, die als Default gepflegt werden.
                 # provider/model werden mit aktualisiert, damit
                 # Provider-Migrationen (z.B. CIO: minimax → ollama) sicher greifen.
@@ -272,6 +283,10 @@ class RoleService:
             logger.info(f"Seeded {added} new default roles.")
         if updated:
             logger.info(f"Updated {updated} default roles (emoji/system_prompt/etc.).")
+        if skipped_user_modified:
+            logger.info(
+                f"Skipped {skipped_user_modified} user-modified roles (Override-Schutz aktiv)."
+            )
         return added
 
     @staticmethod
@@ -293,4 +308,41 @@ class RoleService:
         r.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(r)
+        return r
+
+    @staticmethod
+    def reset_to_default(db: Session, role_id: str) -> Optional[Role]:
+        """Setzt eine Rolle auf die Default-Werte aus DEFAULT_ROLES zurueck.
+
+        Loescht das user_modified-Flag, damit seed_defaults() sie wieder
+        bei jedem Startup aktualisieren kann.
+        """
+        r = db.get(Role, role_id)
+        if not r:
+            return None
+        # Suche Default-Definition
+        default_def = None
+        for rd in DEFAULT_ROLES:
+            if rd.get("name") == r.name:
+                default_def = rd
+                break
+        if default_def is None:
+            # Keine Default-Definition gefunden (custom role)
+            # Einfach das Flag loeschen
+            r.user_modified = False
+            r.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(r)
+            return r
+        # Felder aus Default ueberschreiben (ausser ID, created_at)
+        for key, value in default_def.items():
+            if key in ("id", "created_at", "name"):
+                continue
+            if hasattr(r, key):
+                setattr(r, key, value)
+        r.user_modified = False
+        r.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(r)
+        logger.info(f"reset_to_default: Rolle '{r.name}' auf Defaults zurueckgesetzt")
         return r

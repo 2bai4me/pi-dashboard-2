@@ -40,9 +40,14 @@ class TaskService:
     @staticmethod
     def list_tasks(db: Session, project_id: Optional[str] = None,
                    status: Optional[str] = None,
+                   limit: Optional[int] = None,
+                   offset: int = 0,
                    with_history: bool = False,
                    with_tokens: bool = False) -> List[Task]:
         """Listet Tasks OHNE history/token_usages (default, schnell).
+
+        Performance-Fix (User-Direktive 24.06.2026): limit/offset werden
+        DIREKT in SQL uebergeben (vorher: alle Tasks geladen + Python-Slice).
 
         Fuer History oder Token-Usage: with_history=True / with_tokens=True
         (nutzt joinedload + selectinload fuer N+1-Vermeidung).
@@ -57,6 +62,10 @@ class TaskService:
             stmt = stmt.options(selectinload(Task.history_entries))
         if with_tokens:
             stmt = stmt.options(selectinload(Task.token_usages))
+        if offset:
+            stmt = stmt.offset(offset)
+        if limit:
+            stmt = stmt.limit(limit)
         return list(db.execute(stmt).scalars())
 
     @staticmethod
@@ -69,7 +78,8 @@ class TaskService:
                    priority: int = 1, category: str = "new_request",
                    parent_id: Optional[str] = None,
                    assigned_role: Optional[str] = None,
-                   success_criteria: Optional[List[str]] = None) -> Task:
+                   success_criteria: Optional[List[str]] = None,
+                   component_id: Optional[int] = None) -> Task:
         """Erstellt einen neuen Task.
 
         Standard-Defaults (User-Direktive 15.06.2026, Skill kanban-operator):
@@ -119,6 +129,7 @@ class TaskService:
             tags=[],
             success_criteria=combined_criteria,
             meta={},
+            component_id=component_id,  # User-Direktive 24.06.2026: Component-Routing
         )
         db.add(t)
         db.flush()
@@ -493,11 +504,41 @@ class TaskService:
 
     @staticmethod
     def delete_task(db: Session, task_id: str) -> bool:
-        t = db.get(Task, task_id)
+        """Loescht einen Task inklusive aller Sub-Tasks (User-Direktive 24.06.2026).
+
+        Returns:
+            True wenn geloescht, False wenn nicht gefunden.
+        """
+        from app.models.task import Task as TaskModel
+        t = db.get(TaskModel, task_id)
         if not t:
             return False
+
+        # === Sub-Tasks rekursiv loeschen (User-Direktive 24.06.2026) ===
+        # Verhindert "verwaiste" Sub-Tasks in der DB.
+        # depth-first, damit eine tiefe Hierarchie korrekt aufgeloest wird.
+        def _delete_with_subtasks(task_id_to_delete: str) -> int:
+            """Loescht einen Task + alle direkten Sub-Tasks. Gibt Anzahl zurueck."""
+            sub_count = 0
+            sub_tasks = db.execute(
+                select(TaskModel).where(TaskModel.parent_id == task_id_to_delete)
+            ).scalars().all()
+            for st in sub_tasks:
+                sub_count += _delete_with_subtasks(st.id) + 1
+                db.delete(st)
+            return sub_count
+
+        deleted_sub_count = _delete_with_subtasks(task_id)
+
+        # History-Eintrag auf dem Parent-Task (BEVOR er geloescht wird)
+        # wird uebersprungen, weil der Task gleich weg ist — History waere verwaist.
+        # Stattdessen: History-Eintraege der Sub-Tasks werden via Cascade geloescht (falls FK).
+
         db.delete(t)
         db.commit()
+        logger.info(
+            f"Task {task_id} geloescht (inkl. {deleted_sub_count} Sub-Tasks)"
+        )
         return True
 
     @staticmethod

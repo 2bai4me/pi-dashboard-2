@@ -146,7 +146,9 @@ def create_subtasks_from_decomposition(
     import json
     from datetime import datetime, timezone
 
-    db_path = os.environ.get("PI_DB_PATH", "database/pi_dashboard.db")
+    # CLEANUP-AUDIT 23.06.2026: Zentraler Helper (relativer Pfad brach bei wechselndem CWD).
+    from ..utils.db_path import resolve_db_path
+    db_path = resolve_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -160,6 +162,22 @@ def create_subtasks_from_decomposition(
 
     created_ids = []
     now = datetime.now(timezone.utc).isoformat()
+
+    # === Decompose-Loop-Schutz (User-Direktive 24.06.2026, BUG-FIX) ===
+    # Wenn der Parent-Task bereits Sub-Tasks hat, NICHT nochmal Sub-Tasks erstellen.
+    # Das verhindert die exponentielle Explosion (1 -> 5 -> 25 -> 125 -> ...).
+    # Beim ersten Decompose werden die Sub-Tasks erstellt; bei weiteren Aufrufen
+    # werden die existierenden Sub-Tasks zurueckgegeben.
+    cur.execute(
+        "SELECT id FROM tasks WHERE parent_id = ?",
+        (parent_task_id,),
+    )
+    existing_sub_ids = [row[0] for row in cur.fetchall()]
+    if existing_sub_ids:
+        # Bereits decomposiert -> idempotent return
+        conn.close()
+        return existing_sub_ids
+
     for st in decomposition.proposed_subtasks:
         subtask_id = secrets.token_hex(6)
         cur.execute("""INSERT INTO tasks
@@ -173,9 +191,10 @@ def create_subtasks_from_decomposition(
                      st.get("priority", 50), "new_request",
                      0, 0, 0, 0, 0, 0))
         # History-Eintrag mit Rationale
+        # FIX 23.06.2026 (Task 80685d4b080f): tokens_in/tokens_out/cost_usd sind NOT NULL
         cur.execute("""INSERT INTO task_history
-                       (task_id, event, agent, details)
-                       VALUES (?, ?, ?, ?)""",
+                       (task_id, event, agent, details, tokens_in, tokens_out, cost_usd)
+                       VALUES (?, ?, ?, ?, 0, 0, 0)""",
                     (subtask_id, "subtask_created_from_decomposition",
                      "CIO",
                      json.dumps({
