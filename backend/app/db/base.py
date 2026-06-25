@@ -16,9 +16,15 @@ class Base(DeclarativeBase):
 
 # Engine-Setup
 # SQLite braucht check_same_thread=False für FastAPI (Multi-Thread)
+# CLEANUP-AUDIT 23.06.2026: WAL-Mode + busy_timeout=30s verhindern
+# "database is locked"-Fehler bei konkurrierenden Writes (Auto-Triage-Operator + POST).
 connect_args = {}
 if settings.DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
+    connect_args = {
+        "check_same_thread": False,
+        # 30s Timeout: SQLite wartet bei Lock-Konflikt statt sofort HTTP 500 zu werfen.
+        "timeout": 30.0,
+    }
 
 engine = create_engine(
     settings.DATABASE_URL,
@@ -29,6 +35,35 @@ engine = create_engine(
     # PostgreSQL-spezifisch (kein Effekt auf SQLite)
     pool_pre_ping=True,
 )
+
+# CLEANUP-AUDIT 23.06.2026: Event-Listener registrieren BEVOR Connections genutzt werden.
+# Aktiviert WAL-Mode + busy_timeout fuer JEDE neue SQLite-Connection im Pool.
+from sqlalchemy import event  # noqa: E402
+
+@event.listens_for(engine, "connect", once=False)
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    """Aktiviert WAL-Mode (Write-Ahead-Log) und setzt busy_timeout.
+
+    WAL erlaubt:
+    - Mehrere Reader parallel (kein Lock fuer SELECT)
+    - 1 Writer ohne andere zu blockieren
+    - Bessere Crash-Recovery
+
+    busy_timeout: Wie lange SQLite auf freien Lock wartet (in Sekunden).
+    """
+    try:
+        cursor = dbapi_connection.cursor()
+        # WAL-Mode: Write-Ahead-Log statt Rollback-Journal
+        cursor.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout in MS (30000ms = 30s)
+        cursor.execute("PRAGMA busy_timeout=30000")
+        # Synchronous=NORMAL: Etwas unsicherer als FULL, aber viel schneller
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+    except Exception as e:
+        # Bei Fehler: nicht crashen, loggen
+        import logging
+        logging.getLogger("pi-dashboard-2.db").warning(f"PRAGMA-Setup fehlgeschlagen: {e}")
 
 # Session-Factory
 SessionLocal = sessionmaker(

@@ -68,7 +68,12 @@ class ProjectRead(ProjectBase):
     project_number: Optional[str] = None  # User-Direktive 23.06.2026, Task 260326669e82
     task_count: int = 0
     tasks_done: int = 0
+    tasks_cancelled: int = 0  # FIX 23.06.2026 (Task dad90780eb76)
     tasks_in_progress: int = 0
+    # === FIX 23.06.2026 (Task dad90780eb76): tasks_open field ===
+    # Anzahl der offenen Tasks (nicht done, nicht cancelled).
+    # Frontend-Kachel zeigt prominent die Anzahl offener Tasks.
+    tasks_open: int = 0
     total_cost_usd: float = 0.0
 
     model_config = ConfigDict(from_attributes=True)

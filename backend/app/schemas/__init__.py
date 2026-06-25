@@ -25,8 +25,7 @@ from .agent_question import (
 from .sop_action import (
     ALLOWED_ACTIONS,
     ACTION_PARAM_SCHEMAS,
-    SetStatusActionParams,
-    AskUserActionParams,
+    MoveStatusActionParams,
     LLMCallActionParams,
     SpawnSopActionParams,
 )
@@ -54,8 +53,7 @@ __all__ = [
     # SOP-Actions
     "ALLOWED_ACTIONS",
     "ACTION_PARAM_SCHEMAS",
-    "SetStatusActionParams",
-    "AskUserActionParams",
+    "MoveStatusActionParams",
     "LLMCallActionParams",
     "SpawnSopActionParams",
 ]

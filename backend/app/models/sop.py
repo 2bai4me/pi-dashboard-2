@@ -55,6 +55,17 @@ class SOP(Base):
     category: Mapped[str] = mapped_column(String(64), default="task", nullable=False, index=True)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
+    # === SOP-Key (User-Direktive 24.06.2026) ===
+    # Eindeutiger, stabiler Key fuer den Match bei seed_default_sops().
+    # Bleibt unveraendert, auch wenn der User die SOP umbenennt.
+    # Default-SOPs haben Keys wie "task_workflow", "cio_triage".
+    sop_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+
+    # === User-Modification-Flag (User-Direktive 24.06.2026) ===
+    # Wenn True: Der User hat die SOP manuell geaendert.
+    # seed_default_sops() ueberschreibt sie NICHT mehr beim Startup.
+    user_modified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     # === Hierarchie (Sub-SOPs) ===
     parent_sop_id: Mapped[Optional[str]] = mapped_column(
         String(32), ForeignKey("sops.id", ondelete="SET NULL")
@@ -169,6 +180,10 @@ class SOPStep(Base):
     # Beispiele: "CIO", "pi-coder", "pi-tester", "pi-reviewer", "pi-fixer",
     #            "CEO-digital", "system", "user"
 
+    # === LLM-Modell fuer diesen Step (Optional, default: MiniMax M3) ===
+    model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Beispiele: "minimax-direct/minimax-m3", "ollama/gemma3:12b"
+
     # === Erwartetes Ergebnis ===
     expected_result: Mapped[Optional[str]] = mapped_column(Text)
     success_criteria: Mapped[Optional[list]] = mapped_column(JSONType, default=list)
@@ -262,6 +277,7 @@ class SOPStep(Base):
             "action": self.action,
             "action_params": self.action_params or {},
             "agent": self.agent,
+            "model": self.model,
             "expected_result": self.expected_result,
             "success_criteria": self.success_criteria or [],
             "next_step_id": self.next_step_id,

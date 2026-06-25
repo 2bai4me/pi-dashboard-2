@@ -14,6 +14,9 @@ from .improvement import Weakness, WeaknessAnalysis
 from .agent_question import AgentQuestion, AgentQuestionAttachment
 from .board_operator import BoardOperator
 from .provider_credential import ProviderCredential
+from .service_repo import ExternalServiceRepo
+from .project_info import ProjectInfoEntry
+from .project_component import ProjectComponent
 
 __all__ = [
     "Project",
@@ -40,4 +43,6 @@ __all__ = [
     "AgentQuestionAttachment",
     "BoardOperator",
     "ProviderCredential",
+    "ExternalServiceRepo",
+    "ProjectInfoEntry",
 ]

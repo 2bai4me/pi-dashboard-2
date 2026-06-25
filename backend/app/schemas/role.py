@@ -19,6 +19,7 @@ class RoleBase(BaseModel):
     timeout_sec: int = 300
     fresh_context: bool = True
     estimated_savings_usd: Decimal = Decimal("0")
+    user_modified: bool = False  # User-Direktive 24.06.2026: Override-Schutz
 
 
 class RoleCreate(RoleBase):
@@ -35,6 +36,7 @@ class RoleUpdate(BaseModel):
     timeout_sec: Optional[int] = None
     fresh_context: Optional[bool] = None
     estimated_savings_usd: Optional[Decimal] = None
+    user_modified: Optional[bool] = None  # Kann explizit zurueckgesetzt werden
 
 
 class RoleRead(RoleBase):

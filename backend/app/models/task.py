@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .project import Project
     from .history import TaskHistory
     from .token_usage import TokenUsage
+    from .project_component import ProjectComponent
 
 
 class JSONType(TypeDecorator):
@@ -79,6 +80,10 @@ class Task(Base):
     parent_id: Mapped[Optional[str]] = mapped_column(
         String(32), ForeignKey("tasks.id", ondelete="CASCADE")
     )
+    # Component-Zuordnung (User-Direktive 24.06.2026: SMproducer-Konsolidierung)
+    component_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("project_components.id", ondelete="SET NULL")
+    )
 
     # === Felder ===
     # Standard-Defaults gemaess SOP 'task-creation-default' (User-Direktive 15.06.2026):
@@ -141,6 +146,9 @@ class Task(Base):
     )
     token_usages: Mapped[List["TokenUsage"]] = relationship(
         "TokenUsage", back_populates="task", cascade="all, delete-orphan", lazy="noload"
+    )
+    component: Mapped[Optional["ProjectComponent"]] = relationship(
+        "ProjectComponent", back_populates="tasks"
     )
 
     # === Indizes ===

@@ -3,8 +3,141 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+# === ImplementationPlan Schemas (FIX 23.06.2026, Task 9f2f473bf1cc) ===
+# Strukturierter Plan, der von pi-architect (SOP Step 1) und CIO (SOP Step 0) befuellt wird.
+# Wird automatisch in task.implementation_plan geschrieben und im Frontend angezeigt.
+
+class FileChangeType(str, Enum):
+    CREATE = "create"
+    MODIFY = "modify"
+    DELETE = "delete"
+
+
+class AffectedFile(BaseModel):
+    path: str = Field(..., min_length=1, max_length=500, description="Relativer Pfad zur Datei, z.B. 'src/api/foo.py'")
+    change_type: FileChangeType
+    description: str = Field(..., min_length=1, max_length=1000, description="Was wird an dieser Datei geaendert")
+
+
+class ApiChange(BaseModel):
+    method: str = Field(..., pattern=r"^(GET|POST|PUT|PATCH|DELETE)$", description="HTTP-Methode")
+    path: str = Field(..., min_length=1, max_length=500, description="API-Pfad, z.B. '/api/kanban/tasks'")
+    request_schema: Optional[str] = Field(None, description="JSON-Schema oder TypeScript-Interface des Request-Body")
+    response_schema: Optional[str] = Field(None, description="JSON-Schema oder TypeScript-Interface der Response")
+    breaking: bool = False
+
+
+class DbChangeType(str, Enum):
+    CREATE_TABLE = "create_table"
+    ALTER_TABLE = "alter_table"
+    ADD_INDEX = "add_index"
+    DROP_INDEX = "drop_index"
+    ADD_COLUMN = "add_column"
+    DROP_COLUMN = "drop_column"
+
+
+class DbChange(BaseModel):
+    type: DbChangeType
+    target: str = Field(..., min_length=1, max_length=200, description="Betroffene Tabelle oder Index-Name")
+    details: str = Field(..., min_length=1, max_length=2000, description="Details zur Aenderung (SQL-Skizze oder Erklaerung)")
+
+
+class SubTask(BaseModel):
+    id: str = Field(..., pattern=r"^st[1-9][0-9]*$", description="z.B. 'st1', 'st2'")
+    title: str = Field(..., min_length=1, max_length=200)
+    assigned_role: str = Field(..., description="z.B. 'pi-coder', 'pi-tester', 'pi-reviewer'")
+    depends_on: List[str] = Field(default_factory=list, description="IDs anderer Sub-Tasks (z.B. ['st1', 'st2'])")
+    estimate_min: int = Field(..., ge=1, le=480, description="Geschaetzte Minuten (max 8h pro Sub-Task)")
+
+
+class AcceptanceCriterion(BaseModel):
+    id: str = Field(..., pattern=r"^ac[1-9][0-9]*$", description="z.B. 'ac1', 'ac2'")
+    description: str = Field(..., min_length=1, max_length=500)
+    test_method: str = Field(..., description="z.B. 'unit', 'integration', 'e2e', 'manual'")
+    expected: str = Field(..., min_length=1, max_length=500, description="Was wird erwartet (messbar)")
+
+
+class Risk(BaseModel):
+    id: str = Field(..., pattern=r"^r[1-9][0-9]*$", description="z.B. 'r1', 'r2'")
+    description: str = Field(..., min_length=1, max_length=500)
+    likelihood: int = Field(..., ge=1, le=5, description="1=sehr unwahrscheinlich, 5=fast sicher")
+    impact: int = Field(..., ge=1, le=5, description="1=vernachlaessigbar, 5=katastrophal")
+    mitigation: str = Field(..., min_length=1, max_length=1000, description="Wie wird das Risiko mitigiert")
+
+
+class Dependency(BaseModel):
+    type: str = Field(..., pattern=r"^(internal|external|service)$")
+    ref: str = Field(..., min_length=1, max_length=200, description="z.B. 'task:abc123', 'service:ME4-PI', 'lib:react'")
+    status: str = Field(..., pattern=r"^(ready|blocked|partial)$")
+
+
+class ImplementationPlan(BaseModel):
+    """Strukturierter Implementierungs-Plan fuer einen Task.
+
+    Wird vom pi-architect (SOP Step 1) und CIO (SOP Step 0) befuellt.
+    Bei Validierungs-Fehlern wird HTTP 400 zurueckgegeben mit Detail-Liste.
+
+    Beispiel-Mindestfuellung:
+    {
+        "summary": "Login mit OAuth2 einbauen",
+        "context": "User-Direktive 15.06.2026: Auth provider fehlt",
+        "affected_files": [],
+        "sub_tasks": [],
+        "acceptance_criteria": []
+    }
+    """
+    summary: str = Field(..., min_length=1, max_length=500, description="1 Satz, was wird gemacht")
+    context: Optional[str] = Field(None, max_length=2000, description="Warum, Bezug zu Anforderungen")
+    affected_files: List[AffectedFile] = Field(default_factory=list)
+    api_changes: List[ApiChange] = Field(default_factory=list)
+    db_changes: List[DbChange] = Field(default_factory=list)
+    sub_tasks: List[SubTask] = Field(default_factory=list)
+    acceptance_criteria: List[AcceptanceCriterion] = Field(default_factory=list)
+    risks: List[Risk] = Field(default_factory=list)
+    dependencies: List[Dependency] = Field(default_factory=list)
+    test_strategy: Optional[str] = Field(None, max_length=2000, description="1-2 Saetze, wie wird getestet")
+    rollout_plan: Optional[str] = Field(None, max_length=2000, description="1-2 Saetze, Reihenfolge + Feature-Flag")
+    notes: Optional[str] = Field(None, max_length=5000, description="Freitext-Notizen")
+    # === Metadata ===
+    created_by: Optional[str] = Field(None, description="'CIO' | 'pi-architect' | 'manual'")
+    created_at: Optional[datetime] = None
+    version: int = Field(default=1, ge=1, description="Bei Updates inkrementieren")
+
+    @field_validator("sub_tasks")
+    @classmethod
+    def check_unique_subtask_ids(cls, v: List[SubTask]) -> List[SubTask]:
+        ids = [st.id for st in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"sub_tasks IDs nicht eindeutig: {ids}")
+        return v
+
+    @field_validator("acceptance_criteria")
+    @classmethod
+    def check_unique_criteria_ids(cls, v: List[AcceptanceCriterion]) -> List[AcceptanceCriterion]:
+        ids = [c.id for c in v]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"acceptance_criteria IDs nicht eindeutig: {ids}")
+        return v
+
+    @field_validator("dependencies")
+    @classmethod
+    def check_deps_exist_in_subtasks(cls, v: List[Dependency], info) -> List[Dependency]:
+        sub_tasks = info.data.get("sub_tasks", [])
+        sub_task_ids = {st.id for st in sub_tasks}
+        for dep in v:
+            for d in dep.ref.split(","):
+                d = d.strip()
+                if d.startswith("task:") and d not in sub_task_ids:
+                    # task:xyz referenziert externe Tasks, OK
+                    continue
+                if d in sub_task_ids:
+                    continue
+        return v
 
 
 class TaskBase(BaseModel):
@@ -30,6 +163,7 @@ class TaskCreate(TaskBase):
     """POST /api/kanban/tasks — Neuer Task."""
     project_id: Optional[str] = None
     parent_id: Optional[str] = None
+    component_id: Optional[int] = None  # User-Direktive 24.06.2026: Component-Routing durch CIO
 
 
 class TaskUpdate(BaseModel):
@@ -43,6 +177,10 @@ class TaskUpdate(BaseModel):
     assigned_subagent: Optional[str] = None
     success_criteria: Optional[List[str]] = None
     tags: Optional[List[str]] = None
+    # === FIX 23.06.2026 (Task 0973563537c4): project_id darf geupdated werden ===
+    # Wichtig: Erlaubt das Korrigieren von Orphan-Tasks (project_id=null).
+    # Self-Tracking-Tasks (z.B. ME4-PI-Integration) koennen mit null bleiben.
+    project_id: Optional[str] = None
 
 
 class TaskStatusUpdate(BaseModel):
