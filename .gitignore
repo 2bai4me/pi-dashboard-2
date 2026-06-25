@@ -88,3 +88,27 @@ $RECYCLE.BIN/
 # ──── Alembic ─────────────────────────────────────────────────
 # alembic.ini wird committed, aber lokale Migration-Logs nicht
 *.log.lck
+
+# ──── Backend-spezifisch (lokal, nicht im Repo) ────────────
+# Backend-Datenbanken separat von frontend/database/ ausschließen
+backend/database/
+# Eigene Python-Environments (falls nicht schon durch .venv/ abgedeckt)
+backend/venv/
+backend/env/
+# Temporäre Cleanup-Scripts am Backend-Root (gehören in scripts/ wenn dauerhaft)
+backend/cleanup_*.py
+backend/consolidate_*.py
+backend/restructure_*.py
+backend/seed_*.py
+
+# ──── UI-Screenshots & Audit-Berichte (lokal, nicht im Repo) ──
+# Screenshots sind UI-Snapshots, gehören in docs/screenshots/ oder Wiki
+screenshot_*.png
+# Audit-Report ist eine lokale, temporäre Code-Analyse
+audit_report.md
+
+# ──── Neue Microservices (noch nicht integriert, eigene Repos) ──
+# voice_gateway und voice_communicator sind eigenständige Services
+# Sobald integriert: hier entfernen
+voice_gateway/
+voice_communicator/
