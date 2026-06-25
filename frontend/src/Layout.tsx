@@ -34,7 +34,8 @@ import { useDevSettings } from "./DevSettingsContext";
 const NAV_ITEMS = [
   { section: "Overview", items: [
     { to: "/status", label: "Status", icon: LayoutDashboard },
-    { to: "/system", label: "System", icon: Server },
+    // === FIX 23.06.2026 (Task 0df77cb1865e): System-Eintrag entfernt ===
+    // System ist jetzt in Status.tsx integriert (System-Health, SOP-Logs)
     { to: "/idee", label: "Idee", icon: Lightbulb },
     { to: "/kanban", label: "Projekte", icon: LayoutDashboard },
     { to: "/sops", label: "SOP", icon: BookOpen },
@@ -81,21 +82,23 @@ function DevRolloverTooltip() {
   useEffect(() => {
     if (!showElementRollover) return;
 
-    function getName(target: HTMLElement): string | null {
-      const el = target.closest("[data-name], [data-route], [data-label]") as HTMLElement | null;
+    function getName(target: EventTarget | null): string | null {
+      if (!target || !(target instanceof HTMLElement)) return null;
+      const el = target.closest<HTMLElement>("[data-name], [data-route], [data-label]");
       if (!el) return null;
       return el.dataset.name || el.dataset.route || el.dataset.label || null;
     }
 
     function onMouseOver(e: MouseEvent) {
-      const text = getName(e.target as HTMLElement);
+      const text = getName(e.target);
       if (text) {
         setTooltip((prev) => ({ ...prev, text, visible: true }));
       }
     }
 
     function onMouseOut(e: MouseEvent) {
-      const text = getName(e.relatedTarget as HTMLElement);
+      // FIX 23.06.2026: e.relatedTarget kann null sein (Cursor verlaesst Fenster)
+      const text = getName(e.relatedTarget);
       if (!text) {
         setTooltip((prev) => ({ ...prev, visible: false }));
       } else {

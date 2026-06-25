@@ -1,18 +1,17 @@
-// SubAgents.tsx - Konfiguration der Sub-Agenten (API-Key/Provider + Rollenbeschreibung pro Rolle)
+// SubAgents.tsx - Konfiguration der Sub-Agenten
 //
-// User-Direktive 18.06.2026: Sub-Agenten sollen konfigurierbar sein mit
-// Modell pro Rolle. Standard ist ollama/gemma4:12b.
-//
-// User-Direktive 20.06.2026: Jede Rolle hat eine editierbare Beschreibung
-// (Aufgabe / Worauf achten / Ergebnis-Rückgabe), die als system_prompt gespeichert wird.
-//
-// User-Direktive 20.06.2026 (Neuordnung): Pro Rolle wird ein API-Key/Provider
-// aus der zentralen API-Key-Verwaltung gewählt. Provider-Profile entfallen.
+// Vereinfachtes UI (User-Direktive 22.06.2026):
+//   * Pro Karte genau ein "Bearbeiten"-Button
+//   * Alle Felder koennen gleichzeitig editiert und in einem Aufruf gespeichert werden
+//   * "Abbrechen" macht alle Aenderungen rueckgaengig
 
-import { useState, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Bot, Save, RefreshCw, AlertCircle, Cpu, FileText, Edit2, X, Key } from "lucide-react";
+import { Bot, Save, RefreshCw, AlertCircle, FileText, X, Key, Pencil, Workflow, Server, Trash2 } from "lucide-react";
 import { api } from "../api";
+import { useAvailableModels } from "../hooks/useAvailableModels";
+import { PageId } from "../components/PageId";
+import { PAGE_IDS } from "../pageIds";
 
 interface ProviderCredential {
   id: string;
@@ -26,6 +25,7 @@ interface ProviderCredential {
 
 interface AgentConfig {
   name: string;
+  display_name?: string | null;
   role_id: string;
   role_type?: string;
   is_subagent: boolean;
@@ -37,23 +37,57 @@ interface AgentConfig {
   emoji?: string;
   system_prompt?: string;
   description?: string;
+  assigned_sop_id?: string | null;
 }
 
-const PRESET_MODELS = [
-  { value: "ollama/gemma4:12b", label: "gemma4:12b (lokal, Standard)" },
-  { value: "ollama/qwen3:4b", label: "qwen3:4b (lokal, klein)" },
-  { value: "ollama/llama3.1:8b", label: "llama3.1:8b (lokal, mittel)" },
-  { value: "minimax-m3", label: "minimax-m3 (cloud)" },
-];
+interface EditState {
+  display_name: string;
+  sop_id: string;
+  model: string;
+  provider: string;
+  api_key_id: string;
+  system_prompt: string;
+}
+
+function emptyEdit(): EditState {
+  return {
+    display_name: "",
+    sop_id: "",
+    model: "",
+    provider: "",
+    api_key_id: "",
+    system_prompt: "",
+  };
+}
+
+function buildEdit(c: AgentConfig): EditState {
+  // BUG-FIX 24.06.2026: Wenn das model-Feld in der DB ein Credential-ID-Praefix hat
+  // (z.B. "d3ab3944:minimax-m3" durch einen frueheren Bug), beim Bearbeiten das reine
+  // Model ableiten, damit das Dropdown den richtigen Eintrag anzeigt.
+  let model = c.model || "";
+  let provider = c.provider || "";
+  if (model.includes(":")) {
+    // Format "<credential_id>:<model>" -> nur model behalten
+    const parts = model.split(":", 1);
+    model = model.substring(parts[0].length + 1);
+  }
+  return {
+    display_name: c.display_name || "",
+    sop_id: c.assigned_sop_id || "",
+    model: model,
+    provider: provider,
+    api_key_id: c.api_key_id || "",
+    system_prompt: c.system_prompt || "",
+  };
+}
 
 export default function SubAgents() {
   const queryClient = useQueryClient();
   const [editingRole, setEditingRole] = useState<string | null>(null);
-  const [editModel, setEditModel] = useState("");
-  const [editProvider, setEditProvider] = useState("");
-  const [editApiKeyId, setEditApiKeyId] = useState<string | "">("");
-  const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
-  const [editPromptText, setEditPromptText] = useState("");
+  const [editState, setEditState] = useState<EditState>(emptyEdit());
+  // === FIX 23.06.2026 (BUG 488cff11bbe8): User-Feedback bei Save-Erfolg/-Fehler ===
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const { data: configs, isLoading, error } = useQuery({
     queryKey: ["subagent-configs"],
@@ -66,90 +100,151 @@ export default function SubAgents() {
     queryFn: () => api.listProviderCredentials(),
   });
 
+  const { data: sopsData } = useQuery({
+    queryKey: ["sops"],
+    queryFn: () => api.listSops(),
+  });
+
   const credentials: ProviderCredential[] = useMemo(() => {
     return (credentialsData as any)?.items || (Array.isArray(credentialsData) ? credentialsData : []);
   }, [credentialsData]);
 
-  const activeCredentials = useMemo(() => credentials.filter((c) => c.is_active !== false), [credentials]);
+  const activeCredentials = useMemo(
+    () => credentials.filter((c) => c.is_active !== false),
+    [credentials]
+  );
 
-  const updateMutation = useMutation({
-    mutationFn: ({
-      roleName,
-      model,
-      provider,
-      api_key_id,
-    }: {
-      roleName: string;
-      model: string;
-      provider?: string;
-      api_key_id?: string | null;
-    }) => api.subagents.updateModel(roleName, model, provider, api_key_id),
+  const availableSops: Array<{ id: string; name: string; description?: string; category?: string }> = useMemo(() => {
+    const list = (sopsData as any)?.items || (Array.isArray(sopsData) ? sopsData : []);
+    return list;
+  }, [sopsData]);
+
+  // Modelle aus Models-Seite (echte Credentials + zentrale Default-Provider)
+  const availableModels = useAvailableModels();
+
+  // === FIX 23.06.2026 (BUG 488cff11bbe8): Pro Feld ein eigener PATCH-Call ===
+  // Vorher: ein einzelner PATCH /api/subagents/{role}/config mit allen Feldern
+  // Problem: dieser Endpoint existiert nicht im Backend -> Felder wurden stillschweigend ignoriert
+  // Loesung: fuer jedes geaenderte Feld den entsprechenden spezifischen PATCH-Endpoint aufrufen
+  const configMutation = useMutation({
+    mutationFn: async ({ roleName, patch }: { roleName: string; patch: Partial<EditState> }) => {
+      const calls: Promise<any>[] = []
+      const callLog: string[] = []
+      // Display-Name
+      if (patch.display_name !== undefined) {
+        calls.push(api.subagents.updateName(roleName, patch.display_name || ""))
+        callLog.push("name")
+      }
+      // System-Prompt
+      if (patch.system_prompt !== undefined) {
+        calls.push(api.subagents.updatePrompt(roleName, patch.system_prompt || ""))
+        callLog.push("prompt")
+      }
+      // SOP-ID
+      if (patch.sop_id !== undefined) {
+        calls.push(api.subagents.updateSop(roleName, patch.sop_id || null))
+        callLog.push("sop")
+      }
+      // Model + Provider + API-Key-Id (ein gemeinsamer PATCH)
+      if (patch.model !== undefined || patch.provider !== undefined || patch.api_key_id !== undefined) {
+        calls.push(
+          api.subagents.updateModel(
+            roleName,
+            patch.model || "",
+            patch.provider,
+            patch.api_key_id
+          )
+        )
+        callLog.push("model")
+      }
+      // Sequentiell ausfuehren, damit Fehler frueh sichtbar werden
+      const results: any[] = []
+      for (const c of calls) {
+        results.push(await c)
+      }
+      return { calls: callLog, results }
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["subagent-configs"] })
+      setEditingRole(null)
+      setSaveMessage(`Gespeichert: ${data.calls.join(", ")}`)
+      setTimeout(() => setSaveMessage(null), 3000)
+    },
+    onError: (e: any) => {
+      setSaveError(`Speichern fehlgeschlagen: ${e?.message || String(e)}`)
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (roleName: string) => api.subagents.delete(roleName),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["subagent-configs"] });
       setEditingRole(null);
     },
   });
 
-  const promptMutation = useMutation({
-    mutationFn: ({ roleName, systemPrompt }: { roleName: string; systemPrompt: string }) =>
-      api.subagents.updatePrompt(roleName, systemPrompt),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["subagent-configs"] });
-      setEditingPrompt(null);
-    },
-  });
-
-  const startEdit = (config: AgentConfig) => {
-    setEditingRole(config.name);
-    setEditModel(config.model || "");
-    setEditProvider(config.provider || "");
-    setEditApiKeyId(config.api_key_id || "");
-  };
-
-  const cancelEdit = () => {
-    setEditingRole(null);
-    setEditModel("");
-    setEditProvider("");
-    setEditApiKeyId("");
-  };
-
-  const selectedCredential = useMemo(() => {
-    if (!editApiKeyId) return null;
-    return credentials.find((c) => c.id === editApiKeyId) || null;
-  }, [editApiKeyId, credentials]);
-
-  const handleCredentialChange = (id: string) => {
-    setEditApiKeyId(id);
-    const cred = credentials.find((c) => c.id === id);
-    if (cred) {
-      setEditProvider(cred.provider);
-      setEditModel(cred.model);
+  function handleDelete(c: AgentConfig) {
+    if (deleteMutation.isPending) return;
+    const shown = c.display_name && c.display_name.trim() ? c.display_name : c.name;
+    const ok = window.confirm(
+      `Sub-Agent "${shown}" (${c.name}) wirklich loeschen?\n\n` +
+      `Hinweis: Historische Tasks und Token-Eintraege behalten den Rollennamen, ` +
+      `aber Modell/Provider/Prompt gehen verloren. Diese Aktion ist nicht widerrufbar.`
+    );
+    if (ok) {
+      deleteMutation.mutate(c.name);
     }
-  };
+  }
 
-  const saveEdit = (roleName: string) => {
-    if (!editModel) return;
-    updateMutation.mutate({
-      roleName,
-      model: editModel,
-      provider: editProvider || undefined,
-      api_key_id: editApiKeyId || null,
-    });
-  };
+  function startEdit(c: AgentConfig) {
+    setEditingRole(c.name);
+    setEditState(buildEdit(c));
+  }
 
-  const startEditPrompt = (config: AgentConfig) => {
-    setEditingPrompt(config.name);
-    setEditPromptText(config.system_prompt || "");
-  };
+  function cancelEdit() {
+    setEditingRole(null);
+    setEditState(emptyEdit());
+  }
 
-  const cancelEditPrompt = () => {
-    setEditingPrompt(null);
-    setEditPromptText("");
-  };
+  function saveEdit(c: AgentConfig) {
+    const original = buildEdit(c);
+    const patch: Partial<EditState> = {};
+    if (editState.display_name !== original.display_name) patch.display_name = editState.display_name;
+    if (editState.sop_id !== original.sop_id) patch.sop_id = editState.sop_id || null;
+    if (editState.model !== original.model) patch.model = editState.model || null;
+    if (editState.provider !== original.provider) patch.provider = editState.provider || null;
+    if (editState.api_key_id !== original.api_key_id) patch.api_key_id = editState.api_key_id || null;
+    if (editState.system_prompt !== original.system_prompt) patch.system_prompt = editState.system_prompt;
 
-  const savePrompt = (roleName: string) => {
-    promptMutation.mutate({ roleName, systemPrompt: editPromptText });
-  };
+    // Wenn ein Credential automatisch verknuepft wurde, Model/Provider daraus uebernehmen
+    if (editState.api_key_id) {
+      const cred = credentials.find((x) => x.id === editState.api_key_id);
+      if (cred) {
+        patch.model = cred.model;
+        patch.provider = cred.provider;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      // Nichts geaendert -> nur schliessen
+      setEditingRole(null);
+      return;
+    }
+    configMutation.mutate({ roleName: c.name, patch });
+  }
+
+  function updateField<K extends keyof EditState>(field: K, value: EditState[K]) {
+    setEditState((prev) => ({ ...prev, [field]: value }));
+  }
+
+  function handleCredentialChange(id: string) {
+    const cred = credentials.find((x) => x.id === id);
+    updateField("api_key_id", id);
+    if (cred) {
+      updateField("model", cred.model);
+      updateField("provider", cred.provider);
+    }
+  }
 
   if (isLoading) {
     return (
@@ -170,10 +265,18 @@ export default function SubAgents() {
   const subagents = (configs || []).filter((c: AgentConfig) => c.is_subagent);
   const cLevel = (configs || []).filter((c: AgentConfig) => !c.is_subagent);
 
+  function sopNameFor(id?: string | null): string {
+    if (!id) return "Keiner";
+    const sop = availableSops.find((s) => s.id === id);
+    return sop ? sop.name : id;
+  }
+
   function renderAgentCard(c: AgentConfig, cLevelBadge?: boolean) {
-    const isEditingModel = editingRole === c.name;
-    const isEditingPrompt = editingPrompt === c.name;
+    const isEditing = editingRole === c.name;
     const linkedCredential = credentials.find((cred) => cred.id === c.api_key_id);
+    const shownName = c.display_name && c.display_name.trim() ? c.display_name : c.name;
+    const hasCustomName = !!(c.display_name && c.display_name.trim());
+
     return (
       <div
         key={c.name}
@@ -186,151 +289,160 @@ export default function SubAgents() {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 18 }}>{c.emoji || "🤖"}</span>
-            <strong style={{ fontSize: 13 }}>{c.name}</strong>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
+            <span style={{ fontSize: 18, flexShrink: 0 }}>{c.emoji || "🤖"}</span>
+            <strong style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {shownName}
+            </strong>
+            {hasCustomName && (
+              <code
+                style={{
+                  fontSize: 10,
+                  color: "var(--color-hermes-text-secondary)",
+                  background: "var(--color-hermes-muted)",
+                  padding: "1px 4px",
+                  borderRadius: 3,
+                }}
+                title="Technischer Rollen-Identifier (intern, nicht ändern)"
+              >
+                {c.name}
+              </code>
+            )}
             {cLevelBadge && <span className="badge" style={{ fontSize: 9 }}>C-Level</span>}
           </div>
-          <div style={{ display: "flex", gap: 6 }}>
-            {!isEditingModel && (
-              <button className="btn btn-sm" onClick={() => startEdit(c)} title="Provider/API-Key ändern">
-                <Key size={12} /> Provider
+          {!isEditing && (
+            <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+              <button
+                className="btn btn-sm btn-danger"
+                onClick={() => handleDelete(c)}
+                disabled={deleteMutation.isPending}
+                title="Sub-Agent loeschen (unwiderruflich)"
+              >
+                <Trash2 size={12} /> Loeschen
               </button>
-            )}
-            {!isEditingPrompt && (
-              <button className="btn btn-sm" onClick={() => startEditPrompt(c)} title="Rollenbeschreibung bearbeiten">
-                <FileText size={12} /> Beschreibung
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={() => startEdit(c)}
+                title="Rolle bearbeiten"
+              >
+                <Pencil size={12} /> Bearbeiten
               </button>
-            )}
-          </div>
+            </div>
+          )}
         </div>
 
-        {isEditingModel ? (
-          <div>
-            <label style={{ display: "block", fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 4 }}>
-              API-Key / Credential (optional)
-            </label>
-            <select
-              className="select"
-              value={editApiKeyId}
-              onChange={(e) => handleCredentialChange(e.target.value)}
-              style={{ width: "100%", marginBottom: 8 }}
-            >
-              <option value="">Manuell / Kein API-Key</option>
-              {activeCredentials.map((cred) => (
-                <option key={cred.id} value={cred.id}>
-                  {cred.label} ({cred.provider} / {cred.model})
-                </option>
-              ))}
-              {editApiKeyId && !activeCredentials.find((c) => c.id === editApiKeyId) && (
-                <option value={editApiKeyId}>Unbekanntes Credential</option>
-              )}
-            </select>
+        {isEditing ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <FieldRow label="Anzeigename" hint={`Leer = technischer Name "${c.name}"`}>
+              <input
+                className="input"
+                value={editState.display_name}
+                onChange={(e) => updateField("display_name", e.target.value)}
+                placeholder={c.name}
+                style={{ width: "100%" }}
+              />
+            </FieldRow>
 
-            {selectedCredential && (
-              <div
-                style={{
-                  fontSize: 11,
-                  color: "var(--color-hermes-text-secondary)",
-                  marginBottom: 10,
-                  padding: 8,
-                  background: "var(--color-hermes-muted)",
-                  borderRadius: 4,
+            <FieldRow label="Modell" hint="Auswahl aus Models-Seite (echte Credentials + Standard-Provider)">
+              <select
+                className="select"
+                value={editState.model}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  // BUG-FIX 24.06.2026: Credential-Format "id:model" vs Default-Format "provider/model"
+                  // auseinanderhalten, damit model nicht "<id>:minimax-m3" wird.
+                  // 1) Suche zuerst nach Credential (Format: "<id>:<model>")
+                  const cred = credentials.find((x) => `${x.id}:${x.model}` === raw);
+                  if (cred) {
+                    // Credential gewaehlt: model = reines model, api_key_id = credential.id
+                    updateField("model", cred.model);
+                    updateField("provider", cred.provider);
+                    updateField("api_key_id", cred.id);
+                  } else {
+                    // Default-Modell (Format: "<provider>/<model>")
+                    // Nur model-Feld setzen, KEIN api_key_id (sonst falsche Verknuepfung)
+                    const m = raw.includes("/") ? raw.split("/").slice(1).join("/") : raw;
+                    const provider = raw.includes("/") ? raw.split("/")[0] : "";
+                    updateField("model", m);
+                    if (provider) updateField("provider", provider);
+                    updateField("api_key_id", "");
+                  }
                 }}
+                style={{ width: "100%" }}
               >
-                Provider/Modell werden aus dem API-Key übernommen:
-                <br />
-                <strong>{selectedCredential.provider}</strong> / <code>{selectedCredential.model}</code>
-              </div>
-            )}
+                <option value="">— Modell waehlen —</option>
+                {availableModels.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </FieldRow>
 
-            <label style={{ display: "block", fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 4 }}>
-              Modell
-            </label>
-            <select
-              className="select"
-              value={editModel}
-              onChange={(e) => setEditModel(e.target.value)}
-              style={{ width: "100%", marginBottom: 8 }}
-              disabled={!!selectedCredential}
-            >
-              {PRESET_MODELS.map((m) => (
-                <option key={m.value} value={m.value}>{m.label}</option>
-              ))}
-              {!PRESET_MODELS.find((m) => m.value === editModel) && editModel && (
-                <option value={editModel}>{editModel}</option>
-              )}
-            </select>
-            <label style={{ display: "block", fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 4 }}>
-              Provider (optional, wird automatisch erkannt)
-            </label>
-            <input
-              className="input"
-              value={editProvider}
-              onChange={(e) => setEditProvider(e.target.value)}
-              placeholder="ollama / minimax-direct / ..."
-              style={{ width: "100%", marginBottom: 10 }}
-              disabled={!!selectedCredential}
-            />
-            <div style={{ display: "flex", gap: 6 }}>
-              <button
-                className="btn btn-sm btn-primary"
-                onClick={() => saveEdit(c.name)}
-                disabled={updateMutation.isPending}
+            <FieldRow label="SOP (rein informativ)">
+              <select
+                className="select"
+                value={editState.sop_id}
+                onChange={(e) => updateField("sop_id", e.target.value)}
+                style={{ width: "100%" }}
               >
-                <Save size={12} /> Speichern
+                <option value="">— Kein SOP —</option>
+                {availableSops.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}{s.category ? ` (${s.category})` : ""}
+                  </option>
+                ))}
+              </select>
+            </FieldRow>
+
+            <FieldRow label="Rollenbeschreibung (System-Prompt)">
+              <textarea
+                className="input"
+                value={editState.system_prompt}
+                onChange={(e) => updateField("system_prompt", e.target.value)}
+                rows={8}
+                style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 12, resize: "vertical" }}
+              />
+            </FieldRow>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4 }}>
+              <button type="button" className="btn" onClick={cancelEdit} disabled={configMutation.isPending}>
+                <X size={12} /> Abbrechen
               </button>
-              <button className="btn btn-sm" onClick={cancelEdit}>Abbrechen</button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => { setSaveError(null); setSaveMessage(null); saveEdit(c); }}
+                disabled={configMutation.isPending}
+              >
+                <Save size={12} /> {configMutation.isPending ? "Speichern..." : "Speichern"}
+              </button>
             </div>
-            {updateMutation.isError && (
-              <div style={{ marginTop: 8, color: "var(--color-hermes-danger)", fontSize: 11 }}>
-                Fehler: {String(updateMutation.error)}
+            {saveError && (
+              <div style={{ color: "var(--color-hermes-danger)", fontSize: 11, marginTop: 6, padding: 6, background: "rgba(220,38,38,0.1)", borderRadius: 4 }}>
+                {saveError}
               </div>
             )}
-          </div>
-        ) : isEditingPrompt ? (
-          <div>
-            <label style={{ display: "block", fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 4 }}>
-              Rollenbeschreibung (Aufgabe / Worauf achten / Ergebnis-Rückgabe)
-            </label>
-            <textarea
-              className="input"
-              value={editPromptText}
-              onChange={(e) => setEditPromptText(e.target.value)}
-              rows={12}
-              style={{ width: "100%", marginBottom: 10, fontFamily: "var(--font-mono)", fontSize: 12 }}
-            />
-            <div style={{ display: "flex", gap: 6 }}>
-              <button
-                className="btn btn-sm btn-primary"
-                onClick={() => savePrompt(c.name)}
-                disabled={promptMutation.isPending}
-              >
-                <Save size={12} /> Speichern
-              </button>
-              <button className="btn btn-sm" onClick={cancelEditPrompt}>Abbrechen</button>
-            </div>
-            {promptMutation.isError && (
-              <div style={{ marginTop: 8, color: "var(--color-hermes-danger)", fontSize: 11 }}>
-                Fehler: {String(promptMutation.error)}
+            {saveMessage && !saveError && (
+              <div style={{ color: "var(--color-hermes-accent)", fontSize: 11, marginTop: 6, padding: 6, background: "rgba(46,160,67,0.1)", borderRadius: 4 }}>
+                {saveMessage}
+              </div>
+            )}
+            {configMutation.isError && (
+              <div style={{ color: "var(--color-hermes-danger)", fontSize: 11 }}>
+                Fehler: {String(configMutation.error)}
               </div>
             )}
           </div>
         ) : (
           <div>
-            <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 4 }}>Modell</div>
-            <code style={{ fontSize: 12, background: "var(--color-hermes-bg)", padding: "2px 6px", borderRadius: 3 }}>
-              {c.model || "(nicht gesetzt)"}
-            </code>
+            <Row label="Modell" value={c.model || "(nicht gesetzt)"} />
             {c.default_model && c.model !== c.default_model && (
-              <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginTop: 4 }}>
+              <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginTop: 2, marginLeft: 0 }}>
                 Standard: <code>{c.default_model}</code>
               </div>
             )}
-
-            <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginTop: 10, marginBottom: 4 }}>Provider</div>
-            <code style={{ fontSize: 12 }}>{c.provider || "—"}</code>
-
+            <Row label="Provider" value={c.provider || "—"} />
             <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginTop: 10, marginBottom: 4 }}>
               API-Key / Credential
             </div>
@@ -344,12 +456,20 @@ export default function SubAgents() {
               <span style={{ fontSize: 12, color: "var(--color-hermes-text-secondary)" }}>Manuell / Kein API-Key</span>
             )}
 
-            <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginTop: 10, marginBottom: 4 }}>Tools</div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-              {c.tools.map((tool) => (
-                <span key={tool} className="badge" style={{ fontSize: 10 }}>{tool}</span>
-              ))}
+            <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginTop: 10, marginBottom: 4 }}>
+              SOP (informativ)
             </div>
+            {c.assigned_sop_id ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <Workflow size={12} color="var(--color-hermes-accent-blue)" />
+                <span style={{ fontSize: 12 }}>{sopNameFor(c.assigned_sop_id)}</span>
+                <code style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>
+                  {c.assigned_sop_id.slice(0, 8)}
+                </code>
+              </div>
+            ) : (
+              <span style={{ fontSize: 12, color: "var(--color-hermes-text-secondary)" }}>Keiner</span>
+            )}
 
             <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginTop: 12, marginBottom: 4 }}>
               Rollenbeschreibung
@@ -385,13 +505,13 @@ export default function SubAgents() {
           <Bot size={20} />
           Sub-Agent Konfiguration
         </h2>
+        <PageId id={PAGE_IDS.SUB_AGENTS} />
         <p style={{ color: "var(--color-hermes-text-secondary)", fontSize: 12, margin: 0 }}>
-          Jede Rolle hat einen API-Key/Provider und eine editierbare Rollenbeschreibung.
-          Änderungen werden sofort in der DB gespeichert und beim nächsten Sub-Agent-Aufruf verwendet.
+          Jede Rolle hat einen API-Key/Provider, einen optionalen SOP-Verweis und eine editierbare Rollenbeschreibung.
+          Alle Felder koennen gemeinsam ueber "Bearbeiten" geaendert und mit "Speichern" gespeichert werden.
         </p>
       </div>
 
-      {/* Sub-Agenten Sektion */}
       <h3 style={{ fontSize: 14, marginTop: 20, marginBottom: 10, color: "var(--color-hermes-text-secondary)" }}>
         Sub-Agenten (Worker)
       </h3>
@@ -399,13 +519,47 @@ export default function SubAgents() {
         {subagents.map((c: AgentConfig) => renderAgentCard(c))}
       </div>
 
-      {/* C-Level Rollen Sektion */}
       <h3 style={{ fontSize: 14, marginTop: 30, marginBottom: 10, color: "var(--color-hermes-text-secondary)" }}>
         C-Level Rollen (CIO, CEO-digital, etc.)
       </h3>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(420px, 1fr))", gap: 12 }}>
         {cLevel.map((c: AgentConfig) => renderAgentCard(c, true))}
       </div>
+    </div>
+  );
+}
+
+function FieldRow({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginBottom: 2 }}>
+        <label style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>
+          {label}
+        </label>
+        {hint && (
+          <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", opacity: 0.7 }}>
+            {hint}
+          </span>
+        )}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 2 }}>{label}</div>
+      <code style={{ fontSize: 12 }}>{value}</code>
     </div>
   );
 }

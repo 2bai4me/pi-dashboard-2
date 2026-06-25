@@ -11,6 +11,8 @@ import { api } from "../api"
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
 import { Search, X, Copy, CheckCircle2, Filter, ListChecks } from "lucide-react"
 import { TaskDetailPanel } from "../components/TaskDetailPanel"
+import { PageId } from "../components/PageId"
+import { PAGE_IDS } from "../pageIds"
 
 export default function Cost() {
   const [days, setDays] = useState(30)
@@ -93,6 +95,7 @@ export default function Cost() {
     <div>
       <div className="page-header">
         <h1>Cost & Usage</h1>
+        <PageId id={PAGE_IDS.COST} />
         <p>Token-Kosten & API-Aufrufe — letzte {days} Tage</p>
       </div>
 

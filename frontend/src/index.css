@@ -315,6 +315,11 @@ textarea.input {
   color: var(--color-hermes-text-secondary);
 }
 
+.badge-purple {
+  background: rgba(163, 113, 247, 0.15);
+  color: #a371f7;
+}
+
 /* ─── Status Dot ──────────────────────────────────────────────────── */
 .status-dot {
   display: inline-block;

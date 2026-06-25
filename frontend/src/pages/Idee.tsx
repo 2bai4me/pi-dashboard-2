@@ -41,12 +41,23 @@ export default function Idee() {
   })
   const ideas: Idea[] = (ideasData as any) || []
 
-  // Wenn keine Idee gewaehlt UND Liste nicht leer: erste Idee waehlen
-  useEffect(() => {
-    if (!selectedIdeaId && ideas.length > 0) {
-      setSelectedIdeaId(ideas[0].id)
-    }
-  }, [ideas, selectedIdeaId])
+  // Ideen sortiert nach updated_at DESC (neueste zuerst) - wird in der Uebersicht verwendet
+  const sortedIdeas = [...ideas].sort((a, b) => {
+    const ua = a.updated_at || a.created_at || ""
+    const ub = b.updated_at || b.created_at || ""
+    return ub.localeCompare(ua)
+  })
+
+  // FIX 23.06.2026 (User-Bug: "Klick auf Idee fuehrt direkt in Unterverzeichnis"):
+  // selectedIdeaId wird NUR aus der URL uebernommen (initialIdeaId), NICHT automatisch
+  // auf die erste Idee gesetzt. So fuehrt Klick auf "Idee" im Navigator zur Uebersicht.
+  // Um eine Idee zu oeffnen, muss explizit ?id=... in der URL sein ODER eine Idee
+  // angeklickt werden.
+  //
+  // URL-Modi:
+  // - /idee (kein id) -> Uebersicht (Liste + Neu-Button)
+  // - /idee?id=idea-xyz -> Detail-View dieser Idee
+  // - /idee?new -> Neue-Idee-Formular
 
   function setTabAndUrl(t: IdeeTab) {
     setTab(t)
@@ -68,7 +79,27 @@ export default function Idee() {
   }
 
   // Uebersicht (Liste + Neu-Button)
+  // FIX 23.06.2026: Bei Initial-Load KEINE Uebersicht zeigen (Flash vermeiden).
+  // Erst wenn Daten geladen sind UND entweder selectedIdeaId gesetzt ODER Liste leer.
   if (!selectedIdeaId && !showNewForm) {
+    // Waehrend des Initial-Loadings: nichts rendern (kein Flash)
+    if (isLoading) {
+      return (
+        <div>
+          <div className="page-header">
+            <div className="workspace-header">
+              <Lightbulb size={20} color="var(--color-hermes-accent)" />
+              <h1>Idee</h1>
+            </div>
+            <p>Brainstorming & Requirements — der kreative Bereich vor der Umsetzung.</p>
+          </div>
+          <div className="card" style={{ textAlign: "center", color: "var(--color-hermes-text-secondary)" }}>
+            Lade Ideen...
+          </div>
+        </div>
+      )
+    }
+    // Keine Ideas vorhanden: Uebersicht zeigen mit "Neu"-Button
     return (
       <div>
         <div className="page-header">
@@ -96,7 +127,7 @@ export default function Idee() {
           </div>
         ) : (
           <div className="card-grid">
-            {ideas.map((idea) => (
+            {sortedIdeas.map((idea) => (
               <div
                 key={idea.id}
                 className="project-card"
@@ -260,11 +291,15 @@ function IdeaEditor({ idea, activeTab, onTabChange, onBack, onDeleted }: {
 
   const saveMut = useMutation({
     mutationFn: async () => {
+      // FIX 23.06.2026 (User-Bug: "Speichern funktioniert nicht"):
+      // Vorher: status="saved" wurde gesetzt, dadurch wurde die Idee aus der
+      // Default-Liste (status="draft") gefiltert und war unsichtbar.
+      // Jetzt: status bleibt unveraendert, nur brainstorm/requirements werden aktualisiert.
       return (api as any).ideas.update(idea.id, {
         title: idea.title,
         brainstorm,
         requirements,
-        status: "saved",
+        // status: NICHT aendern - Idee bleibt in der Liste sichtbar
       })
     },
     onSuccess: () => {

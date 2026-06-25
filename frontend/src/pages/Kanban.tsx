@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { api } from "../api"
 import { KANBAN_PHASES } from "../constants/kanban"
+import { PageId } from "../components/PageId"
+import { PAGE_IDS } from "../pageIds"
 import {
   Plus, Search, ChevronDown, ChevronRight, CheckCircle2, ListChecks,
   Filter, BarChart3, ClipboardList, ListTodo, AlertCircle, FolderKanban,
@@ -16,6 +18,8 @@ import { BoardModeSwitcher } from "../components/BoardModeSwitcher"
 import { NewTaskModal } from "../components/NewTaskModal"
 import { CioTriageSection } from "../components/CioTriageSection"
 import { TaskDetailPanel } from "../components/TaskDetailPanel"
+import GrillMeButton from "../components/GrillMeButton"
+import ProjectInfoButton from "../components/ProjectInfoButton"
 import { UserInputForm } from "../components/UserInputForm"
 
 type ProjectTab = "brainstorm" | "requirements" | "tasks" | "board" | "kpis" | "braindev"
@@ -129,6 +133,7 @@ function ProjectList({ projects, onSelect, onNew }: { projects: any[]; onSelect:
           <FolderKanban size={20} color="var(--color-hermes-accent-blue)" />
           <h1>Projekte</h1>
         </div>
+        <PageId id={PAGE_IDS.KANBAN} />
         <p>Projekt-Management mit Brainstorming, Anforderungen, Tasks & Board</p>
       </div>
 
@@ -164,7 +169,21 @@ function ProjectList({ projects, onSelect, onNew }: { projects: any[]; onSelect:
               <div className="project-card-desc">{p.description || "(keine Beschreibung)"}</div>
               <div className="project-card-meta">
                 <span className="badge badge-gray">{p.category}</span>
-                <span>· {p.task_count || 0} Tasks</span>
+                {/* FIX 23.06.2026 (Task dad90780eb76): Offene Tasks prominent anzeigen */}
+                <span
+                  style={{
+                    fontWeight: (p.tasks_open || 0) > 0 ? 700 : 400,
+                    color: (p.tasks_open || 0) > 0 ? "var(--color-hermes-accent)" : "var(--color-hermes-text-secondary)",
+                  }}
+                  title={`${p.tasks_open || 0} offene Tasks (nicht done, nicht cancelled) von ${p.task_count || 0} total`}
+                >
+                  · {p.tasks_open || 0} offen / {p.task_count || 0} total
+                </span>
+                {p.tasks_done > 0 && (
+                  <span style={{ color: "var(--color-hermes-text-secondary)", fontSize: 11 }}>
+                    ({p.tasks_done} done)
+                  </span>
+                )}
                 <span>· ${(p.total_cost_usd || 0).toFixed(4)}</span>
               </div>
               <div className="project-card-meta" style={{ marginTop: 6, fontSize: 10 }}>
@@ -344,6 +363,7 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
       {tab === "board" && (
         <BoardView
           projectId={project.id}
+          projectName={project.name}
           onSelectTask={setSelectedTaskId}
           onUserInputClick={(taskId) => setUserInputTaskId(taskId)}
         />
@@ -389,18 +409,74 @@ function ProjectWorkspace({ project, onBack, onNewProject, initialTaskId }: { pr
   )
 }
 
+// ─────────────── Model-Helper (User-Direktive 25.06.2026) ───────────────
+// Normalisiert verschiedene Modell-String-Formate zu einem einheitlichen Modell-Namen:
+//   "minimax/minimax-m3"        -> "minimax-m3"
+//   "minimax-direct/minimax-m3" -> "minimax-m3"
+//   "minimax-m3"                -> "minimax-m3" (unveraendert)
+// Wird fuer das Modell-Badge auf Task-Kacheln benutzt (pricing_snapshot, meta.code_agent,
+// subagent_readiness haben unterschiedliche Formate).
+function normalizeModel(raw: string | null | undefined): string | null {
+  if (!raw) return null
+  const parts = raw.split(/[/-]/)
+  const model = parts[parts.length - 1].trim()
+  return model || null
+}
+
+// Holt das Modell aus der ersten verfuegbaren Quelle (Prioritaet: live > snapshot).
+// Vermeidet Race-Condition zwischen Worker-Loop (setzt meta.code_agent nach Popen)
+// und Frontend-Polling (alle 3s): pricing_snapshot ist bei auto_claim schon da.
+function getTaskModel(task: any): string | null {
+  const raw =
+    task?.subagent_readiness?.model ||
+    task?.meta?.code_agent?.model ||
+    task?.pricing_snapshot?.model ||
+    null
+  return normalizeModel(raw)
+}
+
 // ─────────────── Board View (5-Spalten) ───────────────
-function BoardView({ projectId, onSelectTask, onUserInputClick }: {
+function BoardView({ projectId, projectName, onSelectTask, onUserInputClick }: {
   projectId: string
+  projectName?: string
   onSelectTask: (id: string) => void
   onUserInputClick: (id: string) => void
 }) {
   const qc = useQueryClient()
   const [showNewTask, setShowNewTask] = useState(false)
+  // === Archiv-Button (User-Direktive 24.06.2026) ===
+  const [showArchiveConfirm, setShowArchiveConfirm] = useState(false)
+  const [archiveResult, setArchiveResult] = useState<any>(null)
+  const archiveMut = useMutation({
+    mutationFn: () => api.archiveDoneTasks({
+      keep_last_n_done: 10,
+      keep_last_n_cancelled: 10,
+      archive_older_than_days: 1.0,
+    }),
+    onSuccess: (data) => {
+      setArchiveResult(data)
+      // Tasks-Liste invalidieren -> neue Daten vom Backend
+      qc.invalidateQueries({ queryKey: ["tasks"] })
+      qc.invalidateQueries({ queryKey: ["projects"] })
+      qc.invalidateQueries({ queryKey: ["archive-stats"] })
+    },
+  })
+  const archiveStatsQuery = useQuery({
+    queryKey: ["archive-stats"],
+    queryFn: () => api.getArchiveStats(),
+    refetchInterval: 30000,
+  })
+
   const { data: tasksData } = useQuery({
-    queryKey: ["tasks", projectId],
-    queryFn: () => api.listTasks({ project_id: projectId, limit: 500 }),
-    refetchInterval: 3000, // Fallback-Polling alle 3s (SSE ist primärer Realtime-Channel)
+    queryKey: ["tasks", projectId, "active"],
+    // Performance (User-Direktive 24.06.2026): nur aktive Tasks + letzte 10 done
+    queryFn: () => api.listTasks({
+      project_id: projectId,
+      limit: 500,
+      active_only: true,
+      include_recent_done: 10,
+    }),
+    refetchInterval: 3000,
     refetchOnWindowFocus: true,
   })
   const tasks: any[] = (tasksData as any)?.items || []
@@ -547,6 +623,31 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
     return out
   }, [tasksByStatus, searchText, prioOrder])
 
+  // FIX 23.06.2026 (Task 1285e61f2cd9): Bestimmte Spalten auf max. Anzahl Tasks limitieren,
+  // neueste oben (updated_at DESC). Bei > Limit: +N weitere (mit Link zu Vollansicht).
+  // User-Direktive 24.06.2026: Auch GO-Spalte auf 10 limitieren (gleiche Logik wie DONE).
+  const COLUMN_LIMITS: Record<string, number> = {
+    go: 10,
+    done: 10,
+  }
+  const limitedColumns = useMemo(() => {
+    const result: Record<string, { visible: any[]; total: number; hidden: number }> = {}
+    for (const [colKey, limit] of Object.entries(COLUMN_LIMITS)) {
+      const all = visibleTasksByStatus[colKey] || []
+      const sorted = [...all].sort((a: any, b: any) => {
+        const ua = a.updated_at || a.created_at || ""
+        const ub = b.updated_at || b.created_at || ""
+        return ub.localeCompare(ua)
+      })
+      result[colKey] = {
+        visible: sorted.slice(0, limit),
+        total: all.length,
+        hidden: Math.max(0, all.length - limit),
+      }
+    }
+    return result
+  }, [visibleTasksByStatus])
+
   return (
     <div>
       <div className="triage-bar">
@@ -606,7 +707,22 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
           <Plus size={12} /> New Task
         </button>
 
+        {/* Grill-Me Button (User-Direktive 24.06.2026) */}
+        {projectId && (
+          <GrillMeButton
+            projectId={projectId}
+            projectName={projectName || projectId}
+          />
+        )}
+
         <div className="triage-bar-right">
+          {/* Info-Button neben Volltextsuche (User-Direktive 24.06.2026) */}
+          {projectId && (
+            <ProjectInfoButton
+              projectId={projectId}
+              projectName={projectName || projectId}
+            />
+          )}
           <div style={{ position: "relative" }}>
             <Search size={12} style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)", color: "var(--color-hermes-text-secondary)" }} />
             <input
@@ -636,8 +752,131 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
           >
             <Filter size={12} /> Filter
           </button>
+          {/* Archiv-Button (User-Direktive 24.06.2026) */}
+          <button
+            className="btn btn-sm"
+            onClick={() => setShowArchiveConfirm(true)}
+            title={`Done + cancelled aelter als 1 Tag ins Archiv verschieben${
+              archiveStatsQuery.data
+                ? ` (Archiv: ${archiveStatsQuery.data.total_tasks} Tasks)`
+                : ""
+            }`}
+            style={{ marginLeft: 4 }}
+          >
+            📦 Archiv
+          </button>
         </div>
       </div>
+
+      {/* === Archiv-Confirm-Modal (User-Direktive 24.06.2026) === */}
+      {showArchiveConfirm && (
+        <div
+          onClick={() => !archiveMut.isPending && setShowArchiveConfirm(false)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 10000, padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "var(--color-hermes-surface)",
+              borderRadius: 8, border: "1px solid var(--color-hermes-accent-orange)",
+              width: "min(500px, 95vw)", padding: 20,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <div style={{ fontSize: 32 }}>📦</div>
+              <h3 style={{ margin: 0, fontSize: 16 }}>Tasks ins Archiv verschieben?</h3>
+            </div>
+            <div style={{ fontSize: 12, color: "var(--color-hermes-text)", marginBottom: 16, lineHeight: 1.5 }}>
+              <p style={{ margin: "0 0 8px 0" }}>
+                <strong>Done</strong> und <strong>cancelled</strong> Tasks,
+                die aelter als <strong>1 Tag</strong> sind, werden in die Archiv-DB
+                <code style={{ fontSize: 10, background: "rgba(0,0,0,0.2)", padding: "1px 4px", borderRadius: 3, marginLeft: 4 }}>
+                  pi_dashboard_archive.db
+                </code> verschoben.
+              </p>
+              <p style={{ margin: "0 0 8px 0" }}>
+                Die <strong>letzten 10 done</strong> und <strong>letzten 10 cancelled</strong>
+                bleiben in der operativen DB fuer die UI-Anzeige erhalten.
+              </p>
+              {archiveStatsQuery.data && (
+                <p style={{ margin: 0, padding: 8, background: "rgba(124,58,237,0.08)", borderRadius: 4, fontSize: 11 }}>
+                  <strong>Archiv-DB aktuell:</strong> {archiveStatsQuery.data.total_tasks} Tasks,
+                  {" "}{archiveStatsQuery.data.total_history} History-Eintraege
+                  ({archiveStatsQuery.data.size_mb} MB)
+                </p>
+              )}
+              {archiveResult && (
+                <div style={{ marginTop: 12, padding: 10, background: "rgba(46,160,67,0.15)", border: "1px solid var(--color-hermes-accent)", borderRadius: 4 }}>
+                  <div style={{ fontWeight: 600, color: "var(--color-hermes-accent)", marginBottom: 4 }}>
+                    ✅ Archivierung abgeschlossen
+                  </div>
+                  <div style={{ fontSize: 11 }}>
+                    <strong>{archiveResult.done_archived || 0}</strong> done + {" "}
+                    <strong>{archiveResult.cancelled_archived || 0}</strong> cancelled archiviert,
+                    {" "}{archiveResult.history_moved || 0} History-Eintraege verschoben
+                    {archiveResult.errors?.length > 0 && (
+                      <div style={{ color: "var(--color-hermes-danger)", marginTop: 4 }}>
+                        ⚠ {archiveResult.errors.length} Fehler aufgetreten
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                className="btn"
+                onClick={() => {
+                  setShowArchiveConfirm(false)
+                  setArchiveResult(null)
+                }}
+                disabled={archiveMut.isPending}
+              >
+                {archiveResult ? "Schliessen" : "Abbrechen"}
+              </button>
+              {!archiveResult && (
+                <button
+                  className="btn"
+                  onClick={async () => {
+                    // Dry-Run zuerst zeigen
+                    const dry = await fetch(
+                      `${window.location.protocol}//${window.location.hostname}:9220/api/kanban/tasks/archive?keep_last_n_done=10&keep_last_n_cancelled=10&archive_older_than_days=1.0&dry_run=true`,
+                      { headers: { 'Content-Type': 'application/json' } }
+                    ).then(r => r.json()).catch(() => null)
+                    if (dry) {
+                      setArchiveResult({
+                        dry_run: true,
+                        ...dry,
+                      })
+                    }
+                  }}
+                  disabled={archiveMut.isPending}
+                  title="Nur zaehlen, nicht archivieren"
+                >
+                  🔍 Vorschau
+                </button>
+              )}
+              {!archiveResult && (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => archiveMut.mutate()}
+                  disabled={archiveMut.isPending}
+                  style={{ background: "var(--color-hermes-accent-orange)", color: "#fff", fontWeight: 600 }}
+                >
+                  {archiveMut.isPending
+                    ? "⏳ Archiviere..."
+                    : "📦 Jetzt archivieren"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="board" ref={boardRef}>
         {visibleColumns.length === 0 ? (
@@ -646,12 +885,22 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
           </div>
         ) : (
           visibleColumns.map((col) => {
-            const colTasks = visibleTasksByStatus[col.key]
+            // FIX 23.06.2026 (Task 1285e61f2cd9): Bestimmte Spalten auf max. N Tasks limitieren
+            // User-Direktive 24.06.2026: Auch GO-Spalte (gleiche Logik wie DONE)
+            const limit = COLUMN_LIMITS[col.key]
+            const limited = limit ? limitedColumns[col.key] : null
+            const colTasks = limited ? limited.visible : (visibleTasksByStatus[col.key] || [])
+            const colCount = limited ? limited.total : colTasks.length
+            const isLimitedCol = !!limited
             return (
               <div key={col.key} className="board-column">
                 <div className={`board-column-header ${col.key}`}>
                   <span>{col.label}</span>
-                  <span className="board-column-count">{colTasks.length}</span>
+                  <span className="board-column-count">
+                    {isLimitedCol && limited!.hidden > 0
+                      ? `${colTasks.length} / ${colCount}`
+                      : colCount}
+                  </span>
                 </div>
                 <div
                   className="board-column-body"
@@ -679,6 +928,19 @@ function BoardView({ projectId, onSelectTask, onUserInputClick }: {
                         onUserInputClick={() => onUserInputClick(t.id)}
                       />
                     ))
+                  )}
+                  {/* FIX 23.06.2026 (Task 1285e61f2cd9): +N weitere Anzeige */}
+                  {isLimitedCol && limited!.hidden > 0 && (
+                    <div
+                      style={{
+                        fontSize: 10, color: "var(--color-hermes-text-secondary)",
+                        textAlign: "center", padding: "6px 4px", marginTop: 4,
+                        borderTop: "1px dashed var(--color-hermes-border)",
+                      }}
+                      title={`Insgesamt ${limited!.total} ${col.label}-Tasks`}
+                    >
+                      + {limited!.hidden} weitere (siehe Filter "Status = {col.key}")
+                    </div>
                   )}
                 </div>
               </div>
@@ -783,9 +1045,9 @@ function TaskCard({ task, onClick, onUserInputClick }: {
       )}
       <div className="meta">
         {task.assigned_role && <span className="badge badge-blue">💻 {task.assigned_role}</span>}
-        {(task.subagent_readiness?.model || task.meta?.code_agent?.model) && (
-          <span className="badge badge-purple" title="Modell, mit dem der Task bearbeitet wird">
-            🤖 {(task.subagent_readiness?.model || task.meta?.code_agent?.model)}
+        {getTaskModel(task) && (
+          <span className="badge badge-purple" title="Modell, mit dem der Task bearbeitet wird (Fallback-Kette: subagent_readiness -> meta.code_agent -> pricing_snapshot)">
+            🤖 {getTaskModel(task)}
           </span>
         )}
         {task.level && <span className="badge badge-gray">Level {task.level}</span>}

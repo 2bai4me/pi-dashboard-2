@@ -728,6 +728,40 @@ function BpmnView({ sopId }: { sopId: string }) {
   const [showAiSupportDesigner, setShowAiSupportDesigner] = useState(false)
   // AddStep-Modal (User-Direktive 17.06.2026)
   const [showAddStep, setShowAddStep] = useState(false)
+  // BPMN-aus-Beschreibung-Regenerierung (User-Direktive 25.06.2026)
+  const [regenerateStatus, setRegenerateStatus] = useState<
+    null | { kind: "running" } | { kind: "done"; saved: boolean; model: string; rawLength: number; stepCount: number } | { kind: "error"; message: string }
+  >(null)
+  const qc = useQueryClient()
+  const regenerateMut = useMutation({
+    mutationFn: () => api.regenerateBpmnFromDescription(sopId),
+    onSuccess: (res: any) => {
+      if (res?.ok) {
+        setRegenerateStatus({
+          kind: "done",
+          saved: !!res.saved,
+          model: res.model || "?",
+          rawLength: res.raw_length || 0,
+          stepCount: res.step_count || 0,
+        })
+        // BPMN-Cache invalidieren -> Viewer rendert automatisch neu
+        qc.invalidateQueries({ queryKey: ["sop-bpmn", sopId] })
+      } else {
+        setRegenerateStatus({
+          kind: "error",
+          message: res?.validation?.error || "LLM-Antwort war kein gültiges BPMN-XML",
+        })
+      }
+    },
+    onError: (e: any) => {
+      setRegenerateStatus({ kind: "error", message: String(e?.message || e) })
+    },
+  })
+  function handleRegenerateClick() {
+    if (regenerateMut.isPending) return
+    setRegenerateStatus({ kind: "running" })
+    regenerateMut.mutate()
+  }
 
   // BPMN-Viewer rendern + Click-Handler
   useEffect(() => {
@@ -1060,6 +1094,32 @@ function BpmnView({ sopId }: { sopId: string }) {
         >
           <Download size={12} /> XML
         </a>
+        {/* BPMN aus Beschreibung regenerieren (User-Direktive 25.06.2026) — LLM leitet aus SOP-/Step-Description neues BPMN-XML ab */}
+        <button
+          className="btn btn-sm"
+          onClick={handleRegenerateClick}
+          disabled={regenerateMut.isPending || steps.length === 0}
+          title={
+            steps.length === 0
+              ? "Keine Steps vorhanden — BPMN kann nicht aus Beschreibung regeneriert werden"
+              : "LLM (minimax-m3) leitet aus der SOP-Beschreibung und allen Step-Beschreibungen ein neues BPMN-XML ab und speichert es in der SOP"
+          }
+          style={{
+            background: "linear-gradient(135deg, #f59e0b 0%, #ef4444 100%)",
+            color: "#fff",
+            fontWeight: 600,
+            opacity: regenerateMut.isPending || steps.length === 0 ? 0.6 : 1,
+          }}
+        >
+          {regenerateMut.isPending ? (
+            <>
+              <span style={{ display: "inline-block", width: 10, height: 10, border: "2px solid #fff", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+              {" Regeneriere…"}
+            </>
+          ) : (
+            <>🔄 Aus Beschreibung regenerieren</>
+          )}
+        </button>
         {/* KI-Support-Designer (User-Direktive 16.06.2026) — links neben XML */}
         <button
           className="btn btn-sm"
@@ -1075,6 +1135,84 @@ function BpmnView({ sopId }: { sopId: string }) {
       {renderError && (
         <div className="card" style={{ borderLeft: "3px solid var(--color-hermes-danger)", marginBottom: 8, fontSize: 12, color: "var(--color-hermes-danger)" }}>
           ⚠ Render-Fehler: {renderError}
+        </div>
+      )}
+
+      {/* === BPMN-Regenerate-Status (User-Direktive 25.06.2026) === */}
+      {regenerateStatus && (
+        <div
+          className="card"
+          style={{
+            borderLeft:
+              regenerateStatus.kind === "error"
+                ? "3px solid var(--color-hermes-danger)"
+                : regenerateStatus.kind === "running"
+                ? "3px solid var(--color-hermes-accent-blue)"
+                : "3px solid #2ea043",
+            marginBottom: 8,
+            fontSize: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "6px 10px",
+            background:
+              regenerateStatus.kind === "error"
+                ? "rgba(248, 81, 73, 0.06)"
+                : regenerateStatus.kind === "running"
+                ? "rgba(88, 166, 255, 0.06)"
+                : "rgba(46, 160, 67, 0.06)",
+          }}
+        >
+          {regenerateStatus.kind === "running" && (
+            <>
+              <span style={{ display: "inline-block", width: 12, height: 12, border: "2px solid var(--color-hermes-accent-blue)", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+              <span>
+                <strong>LLM generiert BPMN aus Beschreibung…</strong>{" "}
+                <span style={{ color: "var(--color-hermes-text-secondary)" }}>
+                  Die SOP- und Step-Beschreibungen werden an die KI geschickt, das Ergebnis ersetzt die bisherige BPMN-Darstellung.
+                </span>
+              </span>
+            </>
+          )}
+          {regenerateStatus.kind === "done" && (
+            <>
+              <span style={{ color: "#2ea043", fontSize: 14 }}>✓</span>
+              <span>
+                <strong>BPMN neu aus Beschreibung generiert.</strong>{" "}
+                <span style={{ color: "var(--color-hermes-text-secondary)" }}>
+                  {regenerateStatus.saved
+                    ? "In SOP gespeichert."
+                    : "Nicht gespeichert (ungültiges XML)."}
+                  {" "}Modell: {regenerateStatus.model} · {regenerateStatus.stepCount} Steps · {regenerateStatus.rawLength} Zeichen LLM-Output.
+                </span>
+              </span>
+              <button
+                className="btn btn-sm"
+                onClick={() => setRegenerateStatus(null)}
+                title="Hinweis schließen"
+                style={{ marginLeft: "auto", padding: "0 6px", fontSize: 14 }}
+              >
+                ×
+              </button>
+            </>
+          )}
+          {regenerateStatus.kind === "error" && (
+            <>
+              <span style={{ color: "var(--color-hermes-danger)", fontSize: 14 }}>⚠</span>
+              <span>
+                <strong>Regenerierung fehlgeschlagen:</strong>{" "}
+                <span style={{ color: "var(--color-hermes-text-secondary)" }}>{regenerateStatus.message}</span>
+              </span>
+              <button
+                className="btn btn-sm"
+                onClick={() => setRegenerateStatus(null)}
+                title="Hinweis schließen"
+                style={{ marginLeft: "auto", padding: "0 6px", fontSize: 14 }}
+              >
+                ×
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -1519,12 +1657,13 @@ function AiSupportDesignerModal({
 }) {
   const qc = useQueryClient()
   const tts = useTTSContext()
-  // Standard: ollama/gemma4:12b (lokal, User-Direktive 16.06.2026 — Cloud-API nicht erlaubt fuer KI-Support Designer)
-  const [model, setModel] = useState<string>("ollama/gemma4:12b")
+  // Standard: minimax M3 (User-Direktive 24.06.2026 — minimax-m3 als Standard-Modell)
+  const [model, setModel] = useState<string>("minimax-direct/minimax-m3")
   const [aiMd, setAiMd] = useState<string>(initialMd || "")
   const [chatInput, setChatInput] = useState<string>("")
-  const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; content: string }>>([])
+  const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; content: string; issues?: any[] }>>([])
   const [evaluating, setEvaluating] = useState(false)
+  const [reviewing, setReviewing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [showPreview, setShowPreview] = useState(true)
@@ -1573,6 +1712,63 @@ function AiSupportDesignerModal({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault()
       sendMessage()
+    }
+  }
+
+  // === KI-Pruefung (User-Direktive 24.06.2026) ===
+  // Prueft die aktuelle Anweisung auf Redundanz, Widersprueche und OpenBrain-Verstoesse.
+  // Ergebnis wird im Chat-Bereich links angezeigt.
+  async function runReview() {
+    if (!aiMd.trim()) {
+      setError("Zuerst KI-Anweisung generieren — kein MD-Text vorhanden.")
+      return
+    }
+    setError(null)
+    setReviewing(true)
+    try {
+      const result = await api.aiStepReview(sopId, step.id, aiMd, model)
+      // Issues in den Chat schreiben (links)
+      const issues = result.issues || []
+      const summary = result.summary || "Pruefung abgeschlossen."
+      const checkedAt = result.checked_at ? new Date(result.checked_at).toLocaleString("de-DE") : ""
+      const checkInfo = `(${result.openbrain_rules_checked || 0} OpenBrain-Regeln gepruft, ${result.checked_dimensions?.join(", ") || "alle Dimensionen"})${checkedAt ? " · " + checkedAt : ""}`
+
+      if (result.ok && issues.length === 0) {
+        // OK: positives Feedback
+        setChatHistory([
+          ...chatHistory,
+          { role: "assistant", content: `✅ **Pruefung OK** — ${summary}\n\n_${checkInfo}_` },
+        ])
+      } else {
+        // Issues gefunden: strukturiert anzeigen
+        const issuesText = issues.map((issue: any, i: number) => {
+          const sevBadge = issue.severity === "must" ? "🔴 MUST" :
+                           issue.severity === "should" ? "🟠 SHOULD" :
+                           "🟡 MAY"
+          const typeLabel = issue.type === "redundancy" ? "Redundanz" :
+                            issue.type === "contradiction" ? "Widerspruch" :
+                            "OpenBrain-Versto\u00df"
+          return `**${i + 1}. ${typeLabel}** [${sevBadge}]
+📍 _${issue.location || "unbekannt"}_
+⚠️ **Problem:** ${issue.problem}
+💡 **L\u00f6sungsvorschlag:** ${issue.suggestion}${issue.rule_ref ? `\n📜 **Regel:** \`${issue.rule_ref}\`` : ""}`
+        }).join("\n\n---\n\n")
+        setChatHistory([
+          ...chatHistory,
+          {
+            role: "assistant",
+            content: `🔍 **KI-Pruefung: ${issues.length} Issue${issues.length > 1 ? "s" : ""} gefunden**\n\n${summary}\n\n${issuesText}\n\n---\n_${checkInfo}_`,
+          },
+        ])
+      }
+    } catch (e: any) {
+      setError(`KI-Pruefung fehlgeschlagen: ${e.message || e}`)
+      setChatHistory([
+        ...chatHistory,
+        { role: "assistant", content: `⚠ KI-Pruefung fehlgeschlagen: ${e.message || e}` },
+      ])
+    } finally {
+      setReviewing(false)
     }
   }
 
@@ -1934,6 +2130,20 @@ function AiSupportDesignerModal({
               </span>
               <div style={{ flex: 1 }} />
               <button className="btn btn-sm" onClick={onClose}>Abbrechen</button>
+              <button
+                className="btn btn-sm"
+                onClick={runReview}
+                disabled={!aiMd || reviewing}
+                title="KI-Pruefung: Redundanz, Widersprueche, OpenBrain-Compliance (Ergebnis erscheint im Chat links)"
+                style={{
+                  fontWeight: 600,
+                  background: reviewing ? "var(--color-hermes-bg-secondary)" : "linear-gradient(135deg, #f59e0b 0%, #ef4444 100%)",
+                  color: "#fff",
+                  border: "none",
+                }}
+              >
+                {reviewing ? "🔍 Pruefe..." : "🔍 KI überprüfung"}
+              </button>
               <button
                 className="btn btn-sm btn-primary"
                 onClick={onApplyAndSave}

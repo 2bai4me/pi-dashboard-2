@@ -42,40 +42,110 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState(false)
   const [manualTitle, setManualTitle] = useState("")
+  const [manualDescription, setManualDescription] = useState("")
   const ideaRef = useRef<HTMLTextAreaElement | null>(null)
 
-  // Auto-Focus auf das Ideen-Feld
+  // === FIX 23.06.2026 (BUG bbd3a49a8f02): Draft-Save + ESC-Handler + Click-Outside-Fix ===
+  const DRAFT_KEY = `newtask-draft-${projectId}`
+  const hasUnsavedContent = () => idea.trim().length > 0 || manualTitle.trim().length > 0 || manualDescription.trim().length > 0
+
+  // Beim Mount: Draft wiederherstellen
   useEffect(() => {
+    try {
+      const draft = localStorage.getItem(DRAFT_KEY)
+      if (draft) {
+        const parsed = JSON.parse(draft)
+        if (parsed.idea) setIdea(parsed.idea)
+        if (parsed.manualTitle) setManualTitle(parsed.manualTitle)
+        if (parsed.manualDescription) setManualDescription(parsed.manualDescription)
+      }
+    } catch {}
     setTimeout(() => ideaRef.current?.focus(), 100)
   }, [])
 
+  // Bei jeder Aenderung: Draft speichern (debounced)
+  useEffect(() => {
+    if (!hasUnsavedContent()) return
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(DRAFT_KEY, JSON.stringify({ idea, manualTitle, manualDescription, ts: Date.now() }))
+      } catch {}
+    }, 500)
+    return () => clearTimeout(t)
+  }, [idea, manualTitle, manualDescription])
+
+  // ESC-Taste: mit Bestaetigung wenn was eingegeben wurde
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault()
+        e.stopPropagation()
+        if (hasUnsavedContent()) {
+          const ok = window.confirm("Eingaben verwerfen und Modal schliessen?")
+          if (!ok) return
+        }
+        try { localStorage.removeItem(DRAFT_KEY) } catch {}
+        onClose()
+      }
+    }
+    // capture: true damit wir VOR anderen Handlern dran sind
+    window.addEventListener("keydown", handler, true)
+    return () => window.removeEventListener("keydown", handler, true)
+  }, [idea, manualTitle, manualDescription, onClose])
+
   // === KI-Validierung (minimax-m3) ===
+  // === FIX 23.06.2026 (BUG d9ef8d477270): Besseres Error-Handling ===
+  // - Detaillierte Fehlermeldung (HTTP-Status + error-detail)
+  // - Bei Fehler: Fallback-Hinweis auf manuelle Eingabe
+  // - Loading-State sichtbar
   const validateMut = useMutation({
     mutationFn: () =>
       api.post("/api/kanban/tasks/validate-with-llm", {
-        title: idea.split("\n")[0].slice(0, 80) || "Neue Idee", // erste Zeile als vorlaeufiger Titel
-        description: idea,
-        category: "new_request",
-        priority: 50,
+        title: editing
+          ? manualTitle.slice(0, 80)
+          : idea.split("\n")[0].slice(0, 80) || "Neue Idee",
+        description: editing ? manualDescription : idea,
+        category: validation?.suggested_category || "new_request",
+        priority: validation?.suggested_priority || 50,
         project_id: projectId,
       }),
     onSuccess: (resp: any) => {
       setValidation(resp)
       setManualTitle(resp.suggested_title || "")
+      if (!editing) {
+        setManualDescription(idea)
+      }
+      setError(null)
     },
     onError: (e: any) => {
-      setError(`KI-Validierung fehlgeschlagen: ${e?.message || String(e)}`)
+      // Detail-Error aus der API-Response extrahieren
+      let detail = e?.message || String(e)
+      if (e?.detail) detail = e.detail
+      if (e?.status) detail = `HTTP ${e.status}: ${detail}`
+      setError(
+        `KI-Validierung fehlgeschlagen (${detail}). ` +
+        `Du kannst trotzdem manuell erstellen (klicke "Task erstellen" und editiere Titel/Beschreibung).`
+      )
     },
   })
 
   // === Task erstellen (mit den KI-verbesserten Werten) ===
+  // === FIX 23.06.2026 (BUG d9ef8d477270): Validierung + besseres Error-Handling ===
   const createMut = useMutation({
     mutationFn: () => {
       const v = validation
+      // Clientseitige Validierung VOR dem POST
+      const title = editing ? manualTitle : (v?.suggested_title || idea.split("\n")[0].slice(0, 80))
+      if (!title || !title.trim()) {
+        throw new Error("Titel darf nicht leer sein. Bitte KI generieren oder manuell eingeben.")
+      }
+      if (!projectId || !projectId.trim()) {
+        throw new Error("Kein Projekt ausgewaehlt. Bitte zuerst ein Projekt oeffnen.")
+      }
       return api.post("/api/kanban/tasks", {
         project_id: projectId,
-        title: editing ? manualTitle : (v?.suggested_title || idea.split("\n")[0].slice(0, 80)),
-        description: idea,
+        title: title.trim(),
+        description: editing ? manualDescription : idea,
         category: v?.suggested_category || "new_request",
         priority: v?.suggested_priority || 50,
         assigned_role: "pi-coder",
@@ -85,10 +155,15 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
       })
     },
     onSuccess: (resp: any) => {
+      // FIX 23.06.2026 (BUG bbd3a49a8f02): Draft loeschen bei Erfolg
+      try { localStorage.removeItem(DRAFT_KEY) } catch {}
       onCreated(resp.id || "")
     },
     onError: (e: any) => {
-      setError(`Task-Erstellung fehlgeschlagen: ${e?.message || String(e)}`)
+      let detail = e?.message || String(e)
+      if (e?.detail) detail = e.detail
+      if (e?.status) detail = `HTTP ${e.status}: ${detail}`
+      setError(`Task-Erstellung fehlgeschlagen: ${detail}`)
       setCreating(false)
     },
   })
@@ -100,8 +175,11 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
     }
     setError(null)
     setValidation(null)
+    setEditing(false)
     validateMut.mutate()
   }
+
+
 
   function handleCreate() {
     if (!validation && !idea.trim()) {
@@ -127,7 +205,19 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
         position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)",
         display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1100,
       }}
-      onClick={onClose}
+      // === FIX 23.06.2026 (BUG bbd3a49a8f02): Click-Outside nur bei echtem Klick ===
+      // Vorher: onClick={onClose} schloss auch bei Markieren+Copy (weil Maus-Bewegung als Click interpretiert)
+      // Jetzt: onMouseDown statt onClick, und Bestaetigung wenn was eingegeben wurde
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) {
+          if (hasUnsavedContent()) {
+            const ok = window.confirm("Eingaben verwerfen und Modal schliessen?")
+            if (!ok) return
+          }
+          try { localStorage.removeItem(DRAFT_KEY) } catch {}
+          onClose()
+        }
+      }}
     >
       <div
         style={{
@@ -137,6 +227,7 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
           maxHeight: "90vh", overflowY: "auto",
           boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
         }}
+        onMouseDown={(e) => e.stopPropagation()}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -149,9 +240,17 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
             </div>
           </div>
           <button
-            onClick={onClose}
+            onClick={() => {
+              // FIX 23.06.2026 (BUG bbd3a49a8f02): Bestaetigung wenn was eingegeben
+              if (hasUnsavedContent()) {
+                const ok = window.confirm("Eingaben verwerfen und Modal schliessen?")
+                if (!ok) return
+              }
+              try { localStorage.removeItem(DRAFT_KEY) } catch {}
+              onClose()
+            }}
             style={{ background: "transparent", border: "none", color: "#999", cursor: "pointer", padding: 4 }}
-            title="Schliessen"
+            title="Schliessen (ESC)"
           >
             <X size={18} />
           </button>
@@ -217,7 +316,14 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
             <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
               <button
                 className="btn btn-sm"
-                onClick={onClose}
+                onClick={() => {
+                  if (hasUnsavedContent()) {
+                    const ok = window.confirm("Eingaben verwerfen und Modal schliessen?")
+                    if (!ok) return
+                  }
+                  try { localStorage.removeItem(DRAFT_KEY) } catch {}
+                  onClose()
+                }}
                 disabled={validateMut.isPending}
                 style={{ fontSize: 13 }}
               >
@@ -297,7 +403,17 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
               <span><code style={{ fontSize: 11 }}>{validation.suggested_category || "new_request"}</code></span>
 
               <span style={{ color: "var(--color-hermes-text-secondary)" }}>Beschreibung:</span>
-              <span style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>{idea.slice(0, 200)}{idea.length > 200 ? "..." : ""}</span>
+              {editing ? (
+                <textarea
+                  className="input"
+                  value={manualDescription}
+                  onChange={(e) => setManualDescription(e.target.value)}
+                  rows={4}
+                  style={{ fontSize: 12, padding: "4px 8px", resize: "vertical" }}
+                />
+              ) : (
+                <span style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)" }}>{idea.slice(0, 200)}{idea.length > 200 ? "..." : ""}</span>
+              )}
 
               {validation.suggested_criteria && validation.suggested_criteria.length > 0 && (
                 <>
@@ -326,8 +442,28 @@ export function NewTaskModal({ projectId, onClose, onCreated }: NewTaskModalProp
                 disabled={createMut.isPending}
                 style={{ fontSize: 12 }}
               >
-                <Edit3 size={12} /> {editing ? "Fertig" : "Titel bearbeiten"}
+                <Edit3 size={12} /> {editing ? "Fertig" : "Titel & Auftrag bearbeiten"}
               </button>
+              {editing && (
+                <button
+                  className="btn btn-sm btn-primary"
+                  onClick={() => {
+                    validateMut.mutate()
+                  }}
+                  disabled={validateMut.isPending || !manualTitle.trim() || !manualDescription.trim()}
+                  style={{ fontSize: 12 }}
+                >
+                  {validateMut.isPending ? (
+                    <>
+                      <Loader2 size={12} className="spin" /> Bewertet...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles size={12} /> Mit neuem Input bewerten
+                    </>
+                  )}
+                </button>
+              )}
               <button
                 className="btn btn-sm btn-primary"
                 onClick={handleCreate}

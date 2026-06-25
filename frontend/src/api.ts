@@ -128,13 +128,24 @@ export const api = {
     return request<any>("GET", `/api/architecture-rules${qs ? "?" + qs : ""}`)
   },
 
-  // Tasks
-  listTasks: (params?: { project_id?: string; status?: string; limit?: number; offset?: number }) => {
+  // Tasks (User-Direktive 24.06.2026: Standard = aktive + letzte done)
+  listTasks: (params?: {
+    project_id?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+    active_only?: boolean;       // nur aktive Tasks (kein done, kein cancelled)
+    include_recent_done?: number;  // Anzahl der letzten done-Tasks (default 10)
+  }) => {
     const q = new URLSearchParams()
     if (params?.project_id) q.set("project_id", params.project_id)
     if (params?.status) q.set("status", params.status)
     if (params?.limit) q.set("limit", String(params.limit))
     if (params?.offset) q.set("offset", String(params.offset))
+    if (params?.active_only) q.set("active_only", "true")
+    if (params?.include_recent_done !== undefined) {
+      q.set("include_recent_done", String(params.include_recent_done))
+    }
     const qs = q.toString()
     return request<any>("GET", `/api/kanban/tasks${qs ? "?" + qs : ""}`)
   },
@@ -252,7 +263,7 @@ export const api = {
   getSop: (sopId: string) => request<any>("GET", `/api/sops/${sopId}`),
   createSop: (data: any) => request<any>("POST", "/api/sops", data),
   updateSop: (sopId: string, data: any) => request<any>("PUT", `/api/sops/${sopId}`, data),
-  updateSopStep: (sopId: string, stepId: string, data: { description?: string; expected_result?: string; ai_instructions_md?: string; agent?: string; model?: string }) =>
+  updateSopStep: (sopId: string, stepId: string, data: { description?: string; expected_result?: string; ai_instructions_md?: string; agent?: string; model?: string; phase?: string }) =>
     request<any>("PATCH", `/api/sops/${sopId}/steps/${stepId}`, data),
   createSopStep: (sopId: string, data: any) => request<any>("POST", `/api/sops/${sopId}/steps`, data),
   aiStepHelper: (sopId: string, stepId: string, userInput: string, model?: string) =>
@@ -271,10 +282,44 @@ export const api = {
     user_input: userInput, model, auto_save: autoSave,
     current_md: currentMd, conversation
   }),
+
+  // KI-Support-Designer: Pruefung (User-Direktive 24.06.2026)
+  // Prueft 3 Dimensionen: Redundanz, Widersprueche, OpenBrain-Compliance
+  // Liefert Issues mit Loesungsvorschlag pro Issue.
+  aiStepReview: (
+    sopId: string, stepId: string,
+    text: string, model?: string,
+    checkDimensions?: Array<"redundancy" | "contradiction" | "openbrain_compliance">
+  ) => request<any>("POST", `/api/sops/${sopId}/steps/${stepId}/ai-review`, {
+    text, model, check_dimensions: checkDimensions
+  }),
   deleteSop: (sopId: string) => request<any>("DELETE", `/api/sops/${sopId}`),
   getSopBpmn: (sopId: string) => request<any>("GET", `/api/sops/${sopId}/bpmn`),
   getSopUml: (sopId: string) => request<any>("GET", `/api/sops/${sopId}/uml`),
+  // BPMN-XML aus SOP-/Step-Beschreibungen (Freitext) per LLM regenerieren (User-Direktive 25.06.2026)
+  regenerateBpmnFromDescription: (sopId: string, opts?: { model?: string; save_to_sop?: boolean }) =>
+    request<any>("POST", `/api/sops/${sopId}/bpmn/regenerate-from-description`, {
+      model: opts?.model,
+      save_to_sop: opts?.save_to_sop ?? true,
+    }),
   seedDefaultSops: () => request<any>("POST", "/api/sops/seed-defaults", {}),
+
+  // === Archivierung (User-Direktive 24.06.2026) ===
+  archiveDoneTasks: (params?: {
+    keep_last_n_done?: number;
+    keep_last_n_cancelled?: number;
+    archive_older_than_days?: number;
+    dry_run?: boolean;
+  }) => {
+    const q = new URLSearchParams()
+    if (params?.keep_last_n_done !== undefined) q.set("keep_last_n_done", String(params.keep_last_n_done))
+    if (params?.keep_last_n_cancelled !== undefined) q.set("keep_last_n_cancelled", String(params.keep_last_n_cancelled))
+    if (params?.archive_older_than_days !== undefined) q.set("archive_older_than_days", String(params.archive_older_than_days))
+    if (params?.dry_run) q.set("dry_run", "true")
+    const qs = q.toString()
+    return request<any>("POST", `/api/kanban/tasks/archive${qs ? "?" + qs : ""}`)
+  },
+  getArchiveStats: () => request<any>("GET", "/api/kanban/tasks/archive/stats"),
 
   // SOP Instances
   startSopInstance: (sopId: string, data: any) =>

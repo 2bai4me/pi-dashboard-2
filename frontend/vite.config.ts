@@ -22,8 +22,8 @@ export default defineConfig({
         secure: false,
         // 60s Timeout fuer Connection-Establishment (LLM-Validierung braucht lange)
         timeout: 60000,
-        // 120s Timeout fuer Response (LLM-Validierung kann bis zu 30s dauern, plus Sicherheitspuffer)
-        proxyTimeout: 120000,
+        // 180s Timeout fuer Response (LLM-BPMN-Regenerate kann bis zu 2 Min dauern)
+        proxyTimeout: 180000,
         // Keep-Alive optimieren (User-Direktive 18.06.2026: Vite-Proxy-Saturation Fix)
         agent: false, // Node's default agent (Connection-Pooling)
         // Bypass-Funktion: SSE-Endpoints brauchen andere Settings
@@ -46,7 +46,7 @@ export default defineConfig({
               error: 'Backend-Proxy-Fehler',
               message: 'Backend auf Port 9220 nicht erreichbar oder Timeout',
               proxy: 'vite-dev-server',
-              hint: 'Pruefe: läuft uvicorn? Port 9220 offen?',
+              hint: 'Pruefe: laeuft uvicorn? Port 9220 offen?',
             }))
           }
         },

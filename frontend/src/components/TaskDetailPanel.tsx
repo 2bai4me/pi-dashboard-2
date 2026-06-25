@@ -12,6 +12,52 @@ import { CioTriageSection } from "./CioTriageSection"
 import { SpeakButton } from "./SpeakButton"
 import { PlanningSection } from "./PlanningSection"
 
+// FIX 23.06.2026 (Task 1285e61f2cd9): History-Eintraege als 1-Satz-Zusammenfassung
+// Format: "[Agent] hat [Action] [Result] in [Duration]"
+function summarizeHistoryEvent(h: any): string {
+  const d = h.details_mapped || h.details || {}
+  const success = h.success === false ? "fehlgeschlagen" : "erfolgreich"
+  switch (h.event) {
+    case "instance_started":
+      return `hat die SOP-Instance gestartet (SOP ${d.sop_id || "?"})`
+    case "step_started":
+      return `hat den Schritt "${d.action || h.event}" gestartet`
+    case "step_completed":
+      return `hat den Schritt "${d.action || h.event}" ${success} abgeschlossen${h.duration_ms ? ` in ${h.duration_ms}ms` : ""} — ${d.message || d.result || ""}`
+    case "step_failed":
+      return `ist im Schritt "${d.action || h.event}" fehlgeschlagen — ${d.error || d.message || "unbekannter Fehler"}`
+    case "step_advanced":
+      return `ist zum naechsten Schritt uebergegangen${d.next_step_id ? ` (${String(d.next_step_id).slice(0, 8)})` : ""}`
+    case "rule_evaluated":
+      return `hat die Regel "${d.rule || "?"}" ausgewertet: ${d.result || success}`
+    case "auto_claim":
+      return `wurde automatisch von ${h.agent} geclaimt`
+    case "task_created":
+      return `wurde angelegt von ${h.agent || "system"}`
+    case "task_updated":
+      return `wurde aktualisiert von ${h.agent || "system"}${d.field ? ` (${d.field})` : ""}`
+    case "task_deleted":
+      return `wurde geloescht von ${h.agent || "system"}`
+    case "task_status_changed":
+      return `Status wurde von "${d.from_status || d.from}" auf "${d.to_status || d.to}" geaendert`
+    case "task_priority_changed":
+      return `Prioritaet wurde auf ${d.new_priority || d.priority} geaendert`
+    case "sub_agent_spawned":
+      return `hat Sub-Agent ${d.role || "?"} gestartet (PID ${d.pid || "?"})`
+    case "sub_agent_spawn_failed":
+      return `konnte Sub-Agent nicht starten: ${d.error || "unbekannt"}`
+    case "sop_started":
+      return `hat die SOP gestartet (${d.sop_id || "?"})`
+    case "sop_completed":
+      return `hat die SOP ${d.sop_id || "?"} ${success} abgeschlossen`
+    default:
+      // Fallback: Action + Result aus details
+      const action = d.action || h.event
+      const result = d.message || d.result || d.error || d.status || success
+      return `hat "${action}" — Ergebnis: ${result}`
+  }
+}
+
 export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: string; projectName: string; onClose: () => void }) {
   const qc = useQueryClient()
   const { data: task } = useQuery({
@@ -78,7 +124,8 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
   })
 
   const deleteMut = useMutation({
-    mutationFn: () => api.wfReopen(taskId, "CEO", "Task zurueck in Triage — Standard-Workflow durchlaufen", true),
+    // User-Direktive 24.06.2026: Loescht Task + alle Sub-Tasks (Backend handled das)
+    mutationFn: () => api.deleteTask(taskId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] })
       qc.invalidateQueries({ queryKey: ["task", taskId] })
@@ -142,13 +189,76 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
           <button
             className="btn btn-sm btn-danger"
             onClick={() => setShowDeleteConfirm(true)}
-            title="Task wieder in Triage (Standard-Workflow durchlaufen)"
-            aria-label="Task wieder in Triage"
+            title="Task + alle Sub-Tasks dauerhaft loeschen (Bestaetigung erforderlich)"
+            aria-label="Task loeschen"
           >
-            <RotateCcw size={12} />
+            <Trash2 size={12} />
           </button>
         </div>
       </div>
+
+      {/* === MODAL: Loesch-Bestaetigung (User-Direktive 24.06.2026) === */}
+      {/* Eigener Modal-Dialog statt nur Section-Inline, damit er IMMER sichtbar ist */}
+      {showDeleteConfirm && task && (
+        <div
+          onClick={() => !deleteMut.isPending && setShowDeleteConfirm(false)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 10000, padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "var(--color-hermes-surface)",
+              borderRadius: 8, border: "2px solid var(--color-hermes-danger)",
+              width: "min(480px, 95vw)", padding: 20,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <div style={{ fontSize: 32 }}>🗑️</div>
+              <h3 style={{ margin: 0, fontSize: 16, color: "var(--color-hermes-danger)" }}>
+                Task endgültig löschen?
+              </h3>
+            </div>
+            <div style={{ fontSize: 12, color: "var(--color-hermes-text)", marginBottom: 16, lineHeight: 1.5 }}>
+              "<strong>{task.title}</strong>" wird <strong style={{ color: "var(--color-hermes-danger)" }}>ENDGÜLTIG</strong> aus der Datenbank gelöscht.
+              {subtasks.length > 0 && (
+                <div style={{ marginTop: 8, padding: 8, background: "rgba(220,38,38,0.1)", borderRadius: 4 }}>
+                  ⚠️ <strong style={{ color: "var(--color-hermes-danger)" }}>{subtasks.length} Sub-Task{subtasks.length > 1 ? "s" : ""}</strong> werden mitgelöscht.
+                </div>
+              )}
+              <div style={{ marginTop: 12, padding: 8, background: "rgba(220,38,38,0.15)", borderRadius: 4, color: "var(--color-hermes-danger)", fontWeight: 600 }}>
+                ⚠️ Diese Aktion ist NICHT widerrufbar.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                className="btn"
+                onClick={() => setShowDeleteConfirm(false)}
+                disabled={deleteMut.isPending}
+              >
+                Abbrechen
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={() => deleteMut.mutate()}
+                disabled={deleteMut.isPending}
+                style={{ background: "var(--color-hermes-danger)", color: "#fff", fontWeight: 600, padding: "8px 16px" }}
+              >
+                {deleteMut.isPending ? "⏳ Lösche..." : "🗑 Endgültig löschen"}
+              </button>
+            </div>
+            {deleteMut.isError && (
+              <div style={{ marginTop: 12, padding: 8, background: "rgba(220,38,38,0.15)", borderRadius: 4, color: "var(--color-hermes-danger)", fontSize: 11 }}>
+                ⚠ Fehler beim Löschen: {String((deleteMut.error as any)?.message || deleteMut.error)}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="detail-panel-body">
         {/* === CIO Triage Section (Schritt 0) — User-Direktive 16.06.2026 === */}
@@ -311,7 +421,7 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
             historyData?.history && historyData.history.length > 0 ? (
               <div onClick={(e) => e.stopPropagation()}>
                 <SpeakButton
-                  text={historyData.history.slice(0, 20).map((h: any) => `${h.event} von ${h.agent || "system"}`).join(". ")}
+                  text={historyData.history.slice(0, 20).map((h: any) => `${h.ts?.slice(11, 19) || "?"} ${h.agent || "system"}: ${summarizeHistoryEvent(h)}`).join(". ")}
                   label="History vorlesen"
                 />
               </div>
@@ -319,35 +429,71 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
           }
         >
           {historyData?.history && historyData.history.length > 0 ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {/* FIX 23.06.2026 (Task 1285e61f2cd9): History-Format "Wer · Wann · Ergebnis in 1 Satz" */}
               {historyData.history.slice(0, 20).map((h: any) => (
-                <div key={h.id} style={{ fontSize: 11, padding: "6px 8px", background: "var(--color-hermes-muted)", borderRadius: 4, borderLeft: "2px solid var(--color-hermes-accent-blue)" }}>
-                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                    <span style={{ fontWeight: 600 }}>{h.event}</span>
-                    <span style={{ color: "var(--color-hermes-text-secondary)" }}>· {h.agent || "system"}</span>
-                    <span style={{ color: "var(--color-hermes-text-secondary)", marginLeft: "auto" }}>
-                      {h.ts ? new Date(h.ts).toLocaleString("de-DE") : ""}
+                <div
+                  key={h.id}
+                  style={{
+                    fontSize: 11,
+                    padding: "5px 8px",
+                    background: "var(--color-hermes-muted)",
+                    borderRadius: 4,
+                    borderLeft: `2px solid ${(h.success === false) ? "var(--color-hermes-danger)" : "var(--color-hermes-accent-blue)"}`,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {/* Wann (HH:MM:SS) */}
+                  <span style={{ fontFamily: "monospace", color: "var(--color-hermes-text-secondary)", minWidth: 56 }}>
+                    {h.ts ? h.ts.slice(11, 19) : "—"}
+                  </span>
+                  {/* Wer (Agent) */}
+                  <span style={{ fontWeight: 600, color: "var(--color-hermes-accent-blue)", minWidth: 90 }}>
+                    {h.agent || "system"}
+                  </span>
+                  {/* Event-Name (klein) */}
+                  <span style={{ color: "var(--color-hermes-text-secondary)", fontSize: 10 }}>
+                    [{h.event}]
+                  </span>
+                  {/* Ergebnis in 1 Satz */}
+                  <span style={{ flex: 1, minWidth: 200 }}>
+                    {summarizeHistoryEvent(h)}
+                  </span>
+                  {/* Dauer (falls vorhanden) */}
+                  {h.duration_ms != null && (
+                    <span style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>
+                      {h.duration_ms}ms
                     </span>
-                  </div>
-                  {h.model && (
-                    <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>Model: {h.model}</div>
-                  )}
-                  {(h.tokens_in > 0 || h.tokens_out > 0) && (
-                    <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)" }}>
-                      Tokens: {h.tokens_in} in / {h.tokens_out} out · ${h.cost_usd?.toFixed(4) ?? "0.0000"}
-                    </div>
-                  )}
-                  {/* User-Direktive 18.06.2026: details_mapped zeigt 'GO' statt 'todo' */}
-                  {h.details_mapped && Object.keys(h.details_mapped).length > 0 && (
-                    <div style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", marginTop: 2 }}>
-                      {Object.entries(h.details_mapped)
-                        .filter(([k, v]) => ["from", "to", "from_status", "to_status", "old_status", "new_status"].includes(k))
-                        .map(([k, v]) => `${k}: ${v}`)
-                        .join(" · ")}
-                    </div>
                   )}
                 </div>
               ))}
+              {/* Detaillierte Details aufklappbar (Modell, Tokens, Status-Transition) */}
+              <details style={{ marginTop: 8 }}>
+                <summary style={{ fontSize: 10, color: "var(--color-hermes-text-secondary)", cursor: "pointer" }}>
+                  Detaillierte History-Daten anzeigen
+                </summary>
+                <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                  {historyData.history.slice(0, 20).map((h: any) => (
+                    <div key={"d-" + h.id} style={{ fontSize: 10, padding: "4px 6px", background: "rgba(0,0,0,0.2)", borderRadius: 3 }}>
+                      {h.model && <div>Model: {h.model}</div>}
+                      {(h.tokens_in > 0 || h.tokens_out > 0) && (
+                        <div>Tokens: {h.tokens_in} in / {h.tokens_out} out · ${h.cost_usd?.toFixed(4) ?? "0.0000"}</div>
+                      )}
+                      {h.details_mapped && Object.keys(h.details_mapped).length > 0 && (
+                        <div>
+                          {Object.entries(h.details_mapped)
+                            .filter(([k]) => ["from", "to", "from_status", "to_status", "old_status", "new_status", "message", "action", "result"].includes(k))
+                            .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`)
+                            .join(" · ")}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </details>
             </div>
           ) : (
             <div style={{ fontSize: 12, color: "var(--color-hermes-text-secondary)", fontStyle: "italic" }}>
@@ -416,22 +562,25 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
           tone="danger"
         >
           {showDeleteConfirm ? (
-            <div style={{ padding: 10, background: "rgba(255, 166, 43, 0.08)", border: "1px solid var(--color-hermes-accent-orange)", borderRadius: 6 }}>
-              <div style={{ fontSize: 12, marginBottom: 8, color: "var(--color-hermes-accent-orange)", fontWeight: 600 }}>
-                ↺ Task wieder in Triage?
+            <div style={{ padding: 10, background: "rgba(220, 38, 38, 0.08)", border: "1px solid var(--color-hermes-danger)", borderRadius: 6 }}>
+              <div style={{ fontSize: 12, marginBottom: 8, color: "var(--color-hermes-danger)", fontWeight: 600 }}>
+                🗑 Task + Sub-Tasks dauerhaft loeschen?
               </div>
               <div style={{ fontSize: 11, color: "var(--color-hermes-text-secondary)", marginBottom: 10 }}>
-                "<strong>{task.title}</strong>" wird NICHT gelöscht, sondern zurück in die <strong>Triage</strong> gestellt.
-                Der Auto-Operator bewertet ihn erneut nach dem <strong>Standard-Workflow</strong>.
-                History bleibt erhalten, Iteration-Counter wird zurückgesetzt.
+                "<strong>{task.title}</strong>" wird <strong>ENDGÜLTIG</strong> aus der DB gelöscht.
+                {subtasks.length > 0 && (
+                  <> <strong style={{ color: "var(--color-hermes-danger)" }}>{subtasks.length} Sub-Task{subtasks.length > 1 ? "s" : ""} werden mitgeloescht.</strong></>
+                )}
+                <br />
+                <span style={{ color: "var(--color-hermes-danger)" }}>Diese Aktion ist nicht widerrufbar.</span>
               </div>
               <div style={{ display: "flex", gap: 6 }}>
                 <button
-                  className="btn btn-sm btn-primary"
+                  className="btn btn-sm btn-danger"
                   onClick={() => deleteMut.mutate()}
                   disabled={deleteMut.isPending}
                 >
-                  {deleteMut.isPending ? "Wieder in Triage..." : "Ja, in Triage stellen"}
+                  {deleteMut.isPending ? "Loesche..." : "Endgueltig loeschen"}
                 </button>
                 <button
                   className="btn btn-sm"
@@ -447,7 +596,7 @@ export function TaskDetailPanel({ taskId, projectName, onClose }: { taskId: stri
               className="btn btn-sm btn-danger"
               onClick={() => setShowDeleteConfirm(true)}
             >
-              <Trash2 size={12} /> Task wieder in Triage
+              <Trash2 size={12} /> Task loeschen
             </button>
           )}
         </AccordionSection>
