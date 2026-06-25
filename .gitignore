@@ -71,6 +71,11 @@ test-results/
 *.db
 *.sqlite
 *.sqlite3
+# SQLite WAL-Mode-Files (Shared Memory + Write-Ahead Log)
+*.db-shm
+*.db-wal
+# Kompletter database/-Ordner: DBs, WAL-Files, Backups (auch JSON)
+database/
 database/*.db
 database/*.sqlite
 # Aber: Migration-Scripts + Schema-Dumps sind OK
@@ -112,3 +117,6 @@ audit_report.md
 # Sobald integriert: hier entfernen
 voice_gateway/
 voice_communicator/
+# TypeScript incremental build cache
+*.tsbuildinfo
+**/tsconfig.tsbuildinfo
